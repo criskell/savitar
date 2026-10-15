@@ -161,6 +161,81 @@ pub fn element_result(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotRefusal {
+    Shapeless(String),
+    Declined(String),
+}
+
+pub fn field_slot(
+    table: &mut TypeTable,
+    object: TypeId,
+    name: &str,
+) -> Result<TypeId, SlotRefusal> {
+    let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
+        return Err(SlotRefusal::Shapeless(format!(
+            "`{name}` is written on something with no declared shape"
+        )));
+    };
+    if let Some(field) = fields.iter().find(|field| field.name == name) {
+        if field.method {
+            return Err(SlotRefusal::Declined(format!(
+                "`{name}` is a method, and writing over a method is not lowered yet"
+            )));
+        }
+        if field.optional {
+            return Ok(table.optional(field.type_id));
+        }
+        return Ok(field.type_id);
+    }
+    Err(SlotRefusal::Declined(format!(
+        "the shape declares no field `{name}`"
+    )))
+}
+
+pub fn element_slot(table: &mut TypeTable, array: TypeId, index: TypeId) -> Result<TypeId, String> {
+    match table.kind(array).clone() {
+        TypeKind::Array(element) => {
+            if !is_numeric(table, index) {
+                return Err("an array is indexed by a number".to_string());
+            }
+            Ok(element)
+        }
+        TypeKind::ReadonlyArray(_) => {
+            Err("a readonly array admits no write to its elements".to_string())
+        }
+        TypeKind::Tuple { readonly: true, .. } => {
+            Err("a readonly tuple admits no write to its elements".to_string())
+        }
+        TypeKind::Tuple {
+            elements,
+            readonly: false,
+        } => {
+            let TypeKind::NumberLiteral(bits) = table.kind(index) else {
+                return Err(
+                    "a tuple is written only at an index the compiler knows exactly".to_string(),
+                );
+            };
+            let wanted = f64::from_bits(*bits);
+            elements
+                .iter()
+                .enumerate()
+                .find_map(|(position, &element)| (position as f64 == wanted).then_some(element))
+                .ok_or_else(|| "this index falls outside the tuple".to_string())
+        }
+        TypeKind::Object { indexes, .. } if !indexes.is_empty() => {
+            let matched = indexes.iter().find(|signature| {
+                signature.key == index || key_accepts(table, signature.key, index)
+            });
+            match matched {
+                Some(signature) => Ok(signature.value),
+                None => Err("no index signature accepts this key".to_string()),
+            }
+        }
+        _ => Err("this value has no element to write".to_string()),
+    }
+}
+
 fn key_accepts(table: &TypeTable, declared: TypeId, given: TypeId) -> bool {
     match table.kind(declared) {
         TypeKind::String => is_textual(table, given),

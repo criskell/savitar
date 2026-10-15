@@ -39,6 +39,12 @@ enum Flow {
     Returned,
 }
 
+enum Written<'target, 'source> {
+    Value(&'target Expression<'source>),
+    Combined(BinaryOp, &'target Expression<'source>),
+    Stepped(BinaryOp),
+}
+
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
@@ -296,93 +302,263 @@ impl Context<'_> {
         function: &mut Function,
         expression: &Expression<'_>,
     ) -> Result<(), Vec<Diagnostic>> {
-        use oxc_span::GetSpan;
         if let Expression::UpdateExpression(update) = expression {
-            let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument else {
-                return Err(vec![refuse(
-                    "unsupported-statement",
-                    update.span,
-                    "only `++` and `--` on a plain name are lowered yet",
-                )]);
-            };
-            let held = self.bound(id.name.as_str(), id.span)?;
             let op = if update.operator == UpdateOperator::Increment {
                 BinaryOp::Add
             } else {
                 BinaryOp::Subtract
             };
-            let one_type = table.number_literal(1.0);
-            let one = self.assign(
-                function,
-                one_type,
-                Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
-                update.span,
-            );
-            let stepped = self.combine(table, function, op, held, one, update.span)?;
-            self.scope.insert(id.name.to_string(), stepped);
-            return Ok(());
+            return match &update.argument {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    self.lower_name_write(table, function, id, Written::Stepped(op), update.span)
+                }
+                SimpleAssignmentTarget::StaticMemberExpression(member) => self.lower_field_write(
+                    table,
+                    function,
+                    member,
+                    Written::Stepped(op),
+                    update.span,
+                ),
+                SimpleAssignmentTarget::ComputedMemberExpression(member) => self
+                    .lower_element_write(
+                        table,
+                        function,
+                        member,
+                        Written::Stepped(op),
+                        update.span,
+                    ),
+                _ => Err(vec![refuse(
+                    "unsupported-statement",
+                    update.span,
+                    "only `++` and `--` on a name, a field or an element are lowered yet",
+                )]),
+            };
         }
 
         let Expression::AssignmentExpression(assignment) = expression else {
             self.lower_expression(table, function, expression)?;
             return Ok(());
         };
-        let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left else {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                assignment.span(),
-                "only assignment to a plain name is lowered yet",
-            )]);
-        };
-        let held = self.bound(id.name.as_str(), id.span)?;
-        let value = self.lower_expression(table, function, &assignment.right)?;
-        let stored = match assignment.operator {
-            AssignmentOperator::Assign => value,
-            AssignmentOperator::Addition => {
-                self.combine(table, function, BinaryOp::Add, held, value, assignment.span)?
-            }
-            AssignmentOperator::Subtraction => self.combine(
-                table,
-                function,
-                BinaryOp::Subtract,
-                held,
-                value,
-                assignment.span,
-            )?,
-            AssignmentOperator::Multiplication => self.combine(
-                table,
-                function,
-                BinaryOp::Multiply,
-                held,
-                value,
-                assignment.span,
-            )?,
-            AssignmentOperator::Division => self.combine(
-                table,
-                function,
-                BinaryOp::Divide,
-                held,
-                value,
-                assignment.span,
-            )?,
-            AssignmentOperator::Remainder => self.combine(
-                table,
-                function,
-                BinaryOp::Remainder,
-                held,
-                value,
-                assignment.span,
-            )?,
+        let written = match assignment.operator {
+            AssignmentOperator::Assign => Written::Value(&assignment.right),
             other => {
-                return Err(vec![refuse(
-                    "unsupported-operator",
-                    assignment.span,
-                    format!("the assignment `{}` is not lowered yet", other.as_str()),
-                )]);
+                let Some(op) = compound_op(other) else {
+                    return Err(vec![refuse(
+                        "unsupported-operator",
+                        assignment.span,
+                        format!("the assignment `{}` is not lowered yet", other.as_str()),
+                    )]);
+                };
+                Written::Combined(op, &assignment.right)
+            }
+        };
+        match &assignment.left {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.lower_name_write(table, function, id, written, assignment.span)
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.lower_field_write(table, function, member, written, assignment.span)
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                self.lower_element_write(table, function, member, written, assignment.span)
+            }
+            _ => Err(vec![refuse(
+                "unsupported-statement",
+                assignment.span,
+                "only assignment to a name, a field or an element is lowered yet",
+            )]),
+        }
+    }
+
+    fn lower_name_write(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        id: &oxc_ast::ast::IdentifierReference<'_>,
+        written: Written<'_, '_>,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let held = self.bound(id.name.as_str(), id.span)?;
+        let stored = match written {
+            Written::Value(expression) => self.lower_expression(table, function, expression)?,
+            Written::Combined(op, expression) => {
+                let value = self.lower_expression(table, function, expression)?;
+                self.combine(table, function, op, held, value, span)?
+            }
+            Written::Stepped(op) => {
+                let one = self.literal_one(table, function, span);
+                self.combine(table, function, op, held, one, span)?
             }
         };
         self.scope.insert(id.name.to_string(), stored);
         Ok(())
+    }
+
+    fn lower_field_write(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+        written: Written<'_, '_>,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let object = self.lower_expression(table, function, &member.object)?;
+        let name = member.property.name.to_string();
+        let slot = self.field_slot(table, function.type_of(object), &name, member)?;
+        let value = match written {
+            Written::Value(expression) => {
+                self.lower_expression_expecting(table, function, expression, Some(slot))?
+            }
+            Written::Combined(op, expression) => {
+                let held = self.read_field(table, function, object, &name, member)?;
+                let value = self.lower_expression(table, function, expression)?;
+                self.combine(table, function, op, held, value, span)?
+            }
+            Written::Stepped(op) => {
+                let held = self.read_field(table, function, object, &name, member)?;
+                let one = self.literal_one(table, function, span);
+                self.combine(table, function, op, held, one, span)?
+            }
+        };
+        let value = self.fitted(table, function, value, slot, span)?;
+        self.statements.push(Statement::WriteField {
+            object,
+            name,
+            value,
+            span: span_of(span),
+        });
+        Ok(())
+    }
+
+    fn lower_element_write(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        member: &oxc_ast::ast::ComputedMemberExpression<'_>,
+        written: Written<'_, '_>,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let array = self.lower_expression(table, function, &member.object)?;
+        let index = self.lower_expression(table, function, &member.expression)?;
+        let slot = types::element_slot(table, function.type_of(array), function.type_of(index))
+            .map_err(|reason| vec![refuse("unsupported-write", member.span, reason)])?;
+        let value = match written {
+            Written::Value(expression) => {
+                self.lower_expression_expecting(table, function, expression, Some(slot))?
+            }
+            Written::Combined(op, expression) => {
+                let held = self.read_element(table, function, array, index, member)?;
+                let value = self.lower_expression(table, function, expression)?;
+                self.combine(table, function, op, held, value, span)?
+            }
+            Written::Stepped(op) => {
+                let held = self.read_element(table, function, array, index, member)?;
+                let one = self.literal_one(table, function, span);
+                self.combine(table, function, op, held, one, span)?
+            }
+        };
+        let value = self.fitted(table, function, value, slot, span)?;
+        self.statements.push(Statement::WriteElement {
+            array,
+            index,
+            value,
+            span: span_of(span),
+        });
+        Ok(())
+    }
+
+    fn field_slot(
+        &self,
+        table: &mut TypeTable,
+        object: TypeId,
+        name: &str,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+    ) -> Result<TypeId, Vec<Diagnostic>> {
+        let shapeless = match types::field_slot(table, object, name) {
+            Ok(slot) => return Ok(slot),
+            Err(types::SlotRefusal::Declined(reason)) => {
+                return Err(vec![refuse("unsupported-write", member.span, reason)]);
+            }
+            Err(types::SlotRefusal::Shapeless(reason)) => reason,
+        };
+        match self.answer_at(table, member.property.span) {
+            Answer::Known(id) => Ok(id),
+            Answer::Unsupported(detail) => {
+                Err(vec![refuse("unsupported-type", member.span, detail)])
+            }
+            Answer::OutOfScope => Err(vec![refuse("unsupported-write", member.span, shapeless)]),
+        }
+    }
+
+    fn read_field(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        object: ValueId,
+        name: &str,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = self.member_type(table, function.type_of(object), name, member)?;
+        Ok(self.assign(
+            function,
+            ty,
+            Rvalue::ReadField {
+                object,
+                name: name.to_string(),
+            },
+            member.span,
+        ))
+    }
+
+    fn read_element(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        array: ValueId,
+        index: ValueId,
+        member: &oxc_ast::ast::ComputedMemberExpression<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = types::element_result(table, function.type_of(array), function.type_of(index))
+            .map_err(|reason| vec![refuse("unsupported-read", member.span, reason)])?;
+        Ok(self.assign(
+            function,
+            ty,
+            Rvalue::ReadElement { array, index },
+            member.span,
+        ))
+    }
+
+    fn fitted(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        slot: TypeId,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        if !savitar_types::assignable(table, function.type_of(value), slot) {
+            return Err(vec![refuse(
+                "unsupported-assignment",
+                span,
+                "Savitar cannot show this value fits the type the target holds",
+            )]);
+        }
+        Ok(self.coerced(function, table, value, slot, span))
+    }
+
+    fn literal_one(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        let ty = table.number_literal(1.0);
+        self.assign(
+            function,
+            ty,
+            Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
+            span,
+        )
     }
 
     fn lower_for_of(
@@ -1248,26 +1424,12 @@ impl Context<'_> {
             Expression::StaticMemberExpression(member) => {
                 let object = self.lower_expression(table, function, &member.object)?;
                 let name = member.property.name.to_string();
-                let ty = self.member_type(table, function.type_of(object), &name, member)?;
-                Ok(self.assign(
-                    function,
-                    ty,
-                    Rvalue::ReadField { object, name },
-                    member.span,
-                ))
+                self.read_field(table, function, object, &name, member)
             }
             Expression::ComputedMemberExpression(member) => {
                 let array = self.lower_expression(table, function, &member.object)?;
                 let index = self.lower_expression(table, function, &member.expression)?;
-                let ty =
-                    types::element_result(table, function.type_of(array), function.type_of(index))
-                        .map_err(|reason| vec![refuse("unsupported-read", member.span, reason)])?;
-                Ok(self.assign(
-                    function,
-                    ty,
-                    Rvalue::ReadElement { array, index },
-                    member.span,
-                ))
+                self.read_element(table, function, array, index, member)
             }
             Expression::ObjectExpression(object) => {
                 let mut values = Vec::with_capacity(object.properties.len());
@@ -1401,6 +1563,17 @@ fn binary_op(operator: BinaryOperator) -> Option<BinaryOp> {
         BinaryOperator::GreaterEqualThan => BinaryOp::GreaterOrEqual,
         BinaryOperator::StrictEquality => BinaryOp::StrictEqual,
         BinaryOperator::StrictInequality => BinaryOp::StrictNotEqual,
+        _ => return None,
+    })
+}
+
+fn compound_op(operator: AssignmentOperator) -> Option<BinaryOp> {
+    Some(match operator {
+        AssignmentOperator::Addition => BinaryOp::Add,
+        AssignmentOperator::Subtraction => BinaryOp::Subtract,
+        AssignmentOperator::Multiplication => BinaryOp::Multiply,
+        AssignmentOperator::Division => BinaryOp::Divide,
+        AssignmentOperator::Remainder => BinaryOp::Remainder,
         _ => return None,
     })
 }

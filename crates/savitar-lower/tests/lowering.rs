@@ -4,7 +4,7 @@ use savitar_diagnostics::{SourceFile, Span};
 use savitar_ir::{BinaryOp, Rvalue, Statement, Terminator, verify};
 use savitar_lower::lower;
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{Field, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, TypeKind, TypeTable};
 
 struct ByName {
     answers: RefCell<Vec<(String, Answer)>>,
@@ -1064,6 +1064,507 @@ fn a_member_no_one_can_type_is_refused() {
     assert!(report.functions.is_empty());
     assert!(
         report.diagnostics[0].message.contains("no declared shape"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+fn point_shape(table: &mut TypeTable) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+    }])
+}
+
+fn only_block(function: &savitar_ir::Function) -> &savitar_ir::Block {
+    function.block(function.entry().expect("a block"))
+}
+
+#[test]
+fn writing_a_field_the_shape_declares_lowers_to_a_field_write() {
+    let source = "function bump(point: Point): void {\n  point.x = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "x");
+    assert_eq!(function.type_of(*value), number);
+}
+
+#[test]
+fn writing_a_field_the_shape_does_not_declare_is_refused() {
+    let source = "function bump(point: Point): void {\n  point.z = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("no field `z`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_value_the_field_does_not_hold_is_refused() {
+    let source = "function bump(point: Point, label: string): void {\n  point.x = label;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let point = point_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("point", Answer::Known(point)),
+            ("label", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn writing_a_field_of_something_with_no_shape_asks_the_provider_for_the_slot() {
+    let source = "function bump(box: Box): void {\n  box.count = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boxed = table.intern(TypeKind::Unknown);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("box", Answer::Known(boxed)),
+            ("count", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "count");
+    assert_eq!(function.type_of(*value), number);
+}
+
+#[test]
+fn writing_a_field_no_one_can_type_is_refused() {
+    let source = "function bump(box: Box): void {\n  box.count = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let boxed = table.intern(TypeKind::Unknown);
+    let provider = ByName::new(source, vec![("box", Answer::Known(boxed))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("no declared shape"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_an_element_takes_the_element_type_not_the_optional_of_a_read() {
+    let source = "function fill(items: number[]): void {\n  items[0] = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![("items", Answer::Known(items))]);
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteElement { value, .. }) = only_block(function).statements.last() else {
+        panic!(
+            "expected an element write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(function.type_of(*value), number);
+    assert!(
+        !table.admits_undefined(function.type_of(*value)),
+        "a write takes the element type, while only a read may yield undefined"
+    );
+}
+
+#[test]
+fn writing_through_a_readonly_array_is_refused() {
+    let source = "function fill(items: readonly number[]): void {\n  items[0] = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(source, vec![("items", Answer::Known(items))]);
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("readonly array"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_through_an_index_signature_takes_the_value_the_signature_declares() {
+    let source =
+        "function fill(out: Record<string, number>, key: string): void {\n  out[key] = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![("out", Answer::Known(out)), ("key", Answer::Known(text))],
+    );
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteElement { value, .. }) = only_block(function).statements.last() else {
+        panic!(
+            "expected an element write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(function.type_of(*value), number);
+}
+
+#[test]
+fn writing_a_key_no_index_signature_accepts_is_refused() {
+    let source =
+        "function fill(out: Record<string, number>, at: number): void {\n  out[at] = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![("out", Answer::Known(out)), ("at", Answer::Known(number))],
+    );
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("no index signature"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_to_a_tuple_at_a_literal_index_takes_that_position() {
+    let source = "function set(pair: [number, string]): void {\n  pair[1] = \"ok\";\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(source, vec![("pair", Answer::Known(pair))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Some(Statement::WriteElement { value, .. }) = only_block(function).statements.last() else {
+        panic!(
+            "expected an element write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(function.type_of(*value), text);
+}
+
+#[test]
+fn writing_to_a_tuple_at_an_index_no_one_knows_is_refused() {
+    let source = "function set(pair: [number, string], at: number): void {\n  pair[at] = 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(
+        source,
+        vec![("pair", Answer::Known(pair)), ("at", Answer::Known(number))],
+    );
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+}
+
+#[test]
+fn writing_to_a_readonly_tuple_is_refused() {
+    let source = "function set(pair: readonly [number, string]): void {\n  pair[0] = 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], true);
+    let provider = ByName::new(source, vec![("pair", Answer::Known(pair))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("readonly tuple"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_past_the_end_of_a_tuple_is_refused() {
+    let source = "function set(pair: [number, string]): void {\n  pair[2] = 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(source, vec![("pair", Answer::Known(pair))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0].message.contains("outside the tuple"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_compound_write_to_a_field_reads_then_combines_then_writes() {
+    let source = "function bump(point: Point): void {\n  point.x += 1;\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let statements = &only_block(function).statements;
+    let read = statements
+        .iter()
+        .position(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::ReadField { .. },
+                    ..
+                }
+            )
+        })
+        .expect("the compound write should read the field first");
+    let combined = statements
+        .iter()
+        .position(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .expect("the compound write should add");
+    let written = statements
+        .iter()
+        .position(|statement| matches!(statement, Statement::WriteField { .. }))
+        .expect("the compound write should write the field");
+    assert!(read < combined && combined < written);
+}
+
+#[test]
+fn an_increment_of_a_field_steps_through_a_read_and_a_write() {
+    let source = "function bump(point: Point): void {\n  point.x++;\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let statements = &only_block(function).statements;
+    assert!(statements.iter().any(|statement| matches!(
+        statement,
+        Statement::Assign {
+            value: Rvalue::ReadField { .. },
+            ..
+        }
+    )));
+    assert!(matches!(
+        statements.last(),
+        Some(Statement::WriteField { .. })
+    ));
+}
+
+#[test]
+fn a_compound_write_to_an_element_is_refused_because_the_read_may_be_undefined() {
+    let source = "function bump(items: number[]): void {\n  items[0] += 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![("items", Answer::Known(items))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0].message.contains("two numbers"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn the_object_and_the_index_are_evaluated_before_the_value() {
+    let source = "function fill(items: number[]): void {\n  items[next()] = value();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::Array(number));
+    let giving_number = table.function(Vec::new(), number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("items", Answer::Known(items)),
+            ("next", Answer::Known(giving_number)),
+            ("value", Answer::Known(giving_number)),
+        ],
+    );
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let statements = &only_block(function).statements;
+    let position_of = |wanted: &str| {
+        statements
+            .iter()
+            .position(|statement| match statement {
+                Statement::Assign {
+                    value: Rvalue::Global(name),
+                    ..
+                } => name == wanted,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("`{wanted}` should be read as a global"))
+    };
+    assert!(position_of("next") < position_of("value"));
+    assert!(matches!(
+        statements.last(),
+        Some(Statement::WriteElement { .. })
+    ));
+}
+
+#[test]
+fn an_assignment_to_a_pattern_is_refused_rather_than_guessed() {
+    let source = "function take(point: Point): void {\n  [point.x] = [1];\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+}
+
+#[test]
+fn writing_a_field_an_index_signature_would_cover_is_still_refused() {
+    let source = "function fill(out: Record<string, number>): void {\n  out.hits = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+        }],
+    );
+    let provider = ByName::new(source, vec![("out", Answer::Known(out))]);
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("declares no field"),
         "{}",
         report.diagnostics[0].message
     );
