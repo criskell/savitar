@@ -7,5 +7,13 @@ name = "savitar-diagnostics"
 version = "0.0.1"
 
 [[package]]
+name = "savitar-typeinfo"
+version = "0.0.1"
+dependencies = [
+ "savitar-diagnostics",
+ "savitar-types",
+]
+
+[[package]]
 name = "savitar-types"
 version = "0.0.1"
