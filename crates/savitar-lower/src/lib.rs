@@ -37,6 +37,19 @@ type Scope = HashMap<String, ValueId>;
 enum Flow {
     Continues,
     Returned,
+    Broke,
+}
+
+impl Flow {
+    const fn continues(self) -> bool {
+        matches!(self, Self::Continues)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Breakable {
+    Switch(BlockId),
+    Loop,
 }
 
 enum Written<'target, 'source> {
@@ -51,6 +64,8 @@ struct Context<'a> {
     scope: Scope,
     statements: Vec<Statement>,
     current: BlockId,
+    enclosing: Vec<Breakable>,
+    breaks: Vec<(BlockId, Scope)>,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -131,6 +146,8 @@ fn lower_function(
         scope: Scope::new(),
         statements: Vec::new(),
         current: entry,
+        enclosing: Vec::new(),
+        breaks: Vec::new(),
     };
 
     for parameter in &declaration.params.items {
@@ -243,9 +260,9 @@ impl Context<'_> {
         statements: &[AstStatement<'_>],
     ) -> Result<Flow, Vec<Diagnostic>> {
         for statement in statements {
-            match self.lower_statement(table, function, statement)? {
-                Flow::Continues => {}
-                Flow::Returned => return Ok(Flow::Returned),
+            let flow = self.lower_statement(table, function, statement)?;
+            if !flow.continues() {
+                return Ok(flow);
             }
         }
         Ok(Flow::Continues)
@@ -287,6 +304,12 @@ impl Context<'_> {
             AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
             AstStatement::ForOfStatement(statement) => {
                 self.lower_for_of(table, function, statement)
+            }
+            AstStatement::SwitchStatement(statement) => {
+                self.lower_switch(table, function, statement)
+            }
+            AstStatement::BreakStatement(statement) => {
+                self.lower_break(function, statement.label.as_ref(), statement.span)
             }
             other => Err(vec![refuse(
                 "unsupported-statement",
@@ -696,7 +719,9 @@ impl Context<'_> {
         );
         self.scope.insert(bound.name.to_string(), current);
 
+        self.enclosing.push(Breakable::Loop);
         let body_flow = self.lower_statement(table, function, &statement.body)?;
+        self.enclosing.pop();
         if body_flow == Flow::Continues {
             let one_type = table.number_literal(1.0);
             let one = self.assign(
@@ -798,7 +823,9 @@ impl Context<'_> {
 
         self.current = body;
         self.statements.clear();
+        self.enclosing.push(Breakable::Loop);
         let body_flow = self.lower_statement(table, function, &statement.body)?;
+        self.enclosing.pop();
 
         if body_flow == Flow::Continues {
             let mut back_arguments = Vec::with_capacity(carried.len());
@@ -861,7 +888,7 @@ impl Context<'_> {
         self.scope = before.clone();
         let then_flow = self.lower_statement(table, function, &statement.consequent)?;
         let then_exit = self.current;
-        if then_flow == Flow::Continues {
+        if then_flow.continues() {
             self.seal(
                 function,
                 Terminator::Jump {
@@ -879,7 +906,7 @@ impl Context<'_> {
             None => Flow::Continues,
         };
         let else_exit = self.current;
-        if else_flow == Flow::Continues {
+        if else_flow.continues() {
             self.seal(
                 function,
                 Terminator::Jump {
@@ -890,8 +917,11 @@ impl Context<'_> {
         }
         let else_scope = std::mem::take(&mut self.scope);
 
-        if then_flow == Flow::Returned && else_flow == Flow::Returned {
+        if !then_flow.continues() && !else_flow.continues() {
             self.scope = before;
+            if then_flow == Flow::Broke || else_flow == Flow::Broke {
+                return Ok(Flow::Broke);
+            }
             return Ok(Flow::Returned);
         }
 
@@ -900,7 +930,7 @@ impl Context<'_> {
         let mut else_arguments = Vec::new();
         let mut merged = before.clone();
 
-        if then_flow == Flow::Continues && else_flow == Flow::Continues {
+        if then_flow.continues() && else_flow.continues() {
             let mut names: Vec<&String> = before.keys().collect();
             names.sort();
             for name in names {
@@ -924,23 +954,209 @@ impl Context<'_> {
                 else_arguments.push(carried_else);
                 merged.insert(name.clone(), parameter);
             }
-        } else if then_flow == Flow::Continues {
+        } else if then_flow.continues() {
             merged = then_scope;
         } else {
             merged = else_scope;
         }
 
         function.block_mut(join).parameters = parameters;
-        if then_flow == Flow::Continues {
+        if then_flow.continues() {
             function.block_mut(then_exit).terminator = Terminator::Jump {
                 target: join,
                 arguments: then_arguments,
             };
         }
-        if else_flow == Flow::Continues {
+        if else_flow.continues() {
             function.block_mut(else_exit).terminator = Terminator::Jump {
                 target: join,
                 arguments: else_arguments,
+            };
+        }
+
+        self.scope = merged;
+        self.current = join;
+        self.statements.clear();
+        Ok(Flow::Continues)
+    }
+
+    fn lower_break(
+        &mut self,
+        function: &mut Function,
+        label: Option<&oxc_ast::ast::LabelIdentifier<'_>>,
+        span: oxc_span::Span,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        if label.is_some() {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                span,
+                "a labelled `break` is not lowered yet",
+            )]);
+        }
+        match self.enclosing.last() {
+            Some(Breakable::Switch(join)) => {
+                let target = *join;
+                self.seal(
+                    function,
+                    Terminator::Jump {
+                        target,
+                        arguments: Vec::new(),
+                    },
+                );
+                self.breaks.push((self.current, self.scope.clone()));
+                Ok(Flow::Broke)
+            }
+            Some(Breakable::Loop) => Err(vec![refuse(
+                "unsupported-statement",
+                span,
+                "a `break` out of a loop is not lowered yet; only a `break` in a `switch` is",
+            )]),
+            None => Err(vec![refuse(
+                "unsupported-statement",
+                span,
+                "a `break` with no loop or `switch` around it is not lowered",
+            )]),
+        }
+    }
+
+    fn lower_switch(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::SwitchStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let discriminant = self.lower_expression(table, function, &statement.discriminant)?;
+        let before = self.scope.clone();
+
+        let join = function.add_block(empty_block());
+        let bodies: Vec<BlockId> = statement
+            .cases
+            .iter()
+            .map(|_| function.add_block(empty_block()))
+            .collect();
+        let fallback = statement
+            .cases
+            .iter()
+            .position(|case| case.test.is_none())
+            .map(|position| bodies[position]);
+
+        for (position, case) in statement.cases.iter().enumerate() {
+            let Some(test) = &case.test else {
+                continue;
+            };
+            let label = self.lower_expression(table, function, test)?;
+            let matched = self.combine(
+                table,
+                function,
+                BinaryOp::StrictEqual,
+                discriminant,
+                label,
+                case.span,
+            )?;
+            let next = function.add_block(empty_block());
+            self.seal(
+                function,
+                Terminator::Branch {
+                    condition: matched,
+                    then_block: bodies[position],
+                    then_arguments: Vec::new(),
+                    else_block: next,
+                    else_arguments: Vec::new(),
+                },
+            );
+            self.current = next;
+            self.statements.clear();
+        }
+
+        let mut edges: Vec<(BlockId, Scope)> = Vec::new();
+        let unmatched = self.current;
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: fallback.unwrap_or(join),
+                arguments: Vec::new(),
+            },
+        );
+        if fallback.is_none() {
+            edges.push((unmatched, before.clone()));
+        }
+
+        let outer_breaks = std::mem::take(&mut self.breaks);
+        self.enclosing.push(Breakable::Switch(join));
+        let last = statement.cases.len().saturating_sub(1);
+        for (position, case) in statement.cases.iter().enumerate() {
+            self.current = bodies[position];
+            self.statements.clear();
+            self.scope = before.clone();
+            let flow = self.lower_statements(table, function, &case.consequent)?;
+            if !flow.continues() {
+                continue;
+            }
+            if position == last {
+                let exit = self.current;
+                self.seal(
+                    function,
+                    Terminator::Jump {
+                        target: join,
+                        arguments: Vec::new(),
+                    },
+                );
+                edges.push((exit, std::mem::take(&mut self.scope)));
+                continue;
+            }
+            if !case.consequent.is_empty() {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    case.span,
+                    "a `case` that runs into the next one is not lowered yet; end it with `break` or `return`",
+                )]);
+            }
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: bodies[position + 1],
+                    arguments: Vec::new(),
+                },
+            );
+        }
+        self.enclosing.pop();
+        edges.extend(std::mem::replace(&mut self.breaks, outer_breaks));
+
+        if edges.is_empty() {
+            self.scope = before;
+            return Ok(Flow::Returned);
+        }
+
+        let mut names: Vec<&String> = before.keys().collect();
+        names.sort();
+        let mut parameters = Vec::new();
+        let mut passed: Vec<Vec<ValueId>> = vec![Vec::new(); edges.len()];
+        let mut merged = before.clone();
+        for name in names {
+            let first = edges[0].1[name];
+            if edges.iter().all(|(_, scope)| scope[name] == first) {
+                merged.insert(name.clone(), first);
+                continue;
+            }
+            let members: Vec<TypeId> = edges
+                .iter()
+                .map(|(_, scope)| function.type_of(scope[name]))
+                .collect();
+            let wanted = table.union(members);
+            for (position, (exit, scope)) in edges.iter().enumerate() {
+                let carried = self.appended(function, *exit, scope[name], wanted, statement.span);
+                passed[position].push(carried);
+            }
+            let parameter = function.fresh_value(wanted);
+            parameters.push(parameter);
+            merged.insert(name.clone(), parameter);
+        }
+
+        function.block_mut(join).parameters = parameters;
+        for ((exit, _), arguments) in edges.iter().zip(passed) {
+            function.block_mut(*exit).terminator = Terminator::Jump {
+                target: join,
+                arguments,
             };
         }
 

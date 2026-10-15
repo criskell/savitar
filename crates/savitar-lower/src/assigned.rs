@@ -45,6 +45,17 @@ fn walk_statement(statement: &Statement<'_>, found: &mut BTreeSet<String>) {
             }
             walk_statement(&statement.body, found);
         }
+        Statement::SwitchStatement(statement) => {
+            walk_expression(&statement.discriminant, found);
+            for case in &statement.cases {
+                if let Some(test) = &case.test {
+                    walk_expression(test, found);
+                }
+                for inner in &case.consequent {
+                    walk_statement(inner, found);
+                }
+            }
+        }
         Statement::ReturnStatement(statement) => {
             if let Some(argument) = &statement.argument {
                 walk_expression(argument, found);

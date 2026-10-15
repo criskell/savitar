@@ -1569,3 +1569,461 @@ fn writing_a_field_an_index_signature_would_cover_is_still_refused() {
         report.diagnostics[0].message
     );
 }
+
+fn outcome_union(table: &mut TypeTable) -> savitar_types::TypeId {
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let error_kind = table.intern(TypeKind::StringLiteral("error".to_string()));
+    let ok = table.object(vec![
+        Field {
+            name: "kind".to_string(),
+            type_id: ok_kind,
+            optional: false,
+            method: false,
+        },
+        Field {
+            name: "body".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+        },
+    ]);
+    let failed = table.object(vec![
+        Field {
+            name: "kind".to_string(),
+            type_id: error_kind,
+            optional: false,
+            method: false,
+        },
+        Field {
+            name: "detail".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+        },
+    ]);
+    table.union(vec![ok, failed])
+}
+
+fn equality_tests(function: &savitar_ir::Function) -> usize {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Binary {
+                        op: BinaryOp::StrictEqual,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+fn returns_without_a_value(function: &savitar_ir::Function) -> usize {
+    function
+        .blocks()
+        .filter(|(_, block)| block.terminator == Terminator::Return(None))
+        .count()
+}
+
+#[test]
+fn a_switch_over_a_discriminant_becomes_a_chain_of_strict_equality_tests() {
+    let source = "function describe(outcome: Outcome): string {\n  switch (outcome.kind) {\n    case \"ok\":\n      return outcome.body;\n    case \"error\":\n      return outcome.detail;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let outcome = outcome_union(&mut table);
+    let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let error_kind = table.intern(TypeKind::StringLiteral("error".to_string()));
+    let discriminant = table.union(vec![ok_kind, error_kind]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("outcome", Answer::Known(outcome)),
+            ("kind", Answer::Known(discriminant)),
+            ("body", Answer::Known(text)),
+            ("detail", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("describe.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        equality_tests(function),
+        2,
+        "one strict equality per case label"
+    );
+
+    let returned: Vec<_> = function
+        .blocks()
+        .filter_map(|(_, block)| match block.terminator {
+            Terminator::Return(Some(value)) => Some(function.type_of(value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(returned, vec![text, number]);
+}
+
+#[test]
+fn a_switch_with_no_default_reaches_the_join_on_the_path_no_case_matched() {
+    let source = "function describe(outcome: Outcome): string {\n  switch (outcome.kind) {\n    case \"ok\":\n      return outcome.body;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let outcome = outcome_union(&mut table);
+    let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("outcome", Answer::Known(outcome)),
+            ("kind", Answer::Known(ok_kind)),
+            ("body", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("describe.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        returns_without_a_value(function),
+        1,
+        "the unmatched path falls out of the function with no value"
+    );
+}
+
+#[test]
+fn a_switch_whose_every_clause_returns_leaves_the_join_stranded() {
+    let source = "function always(kind: string, value: number): number {\n  switch (kind) {\n    case \"a\":\n      return value;\n    default:\n      return value;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("always.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        returns_without_a_value(function),
+        0,
+        "the default covers every path, so nothing returns without a value"
+    );
+    let dominance = savitar_ir::Dominance::of(function);
+    let unreachable = function
+        .blocks()
+        .filter(|(id, _)| !dominance.reachable(*id))
+        .count();
+    assert_eq!(unreachable, 1, "the join is left stranded, not deleted");
+}
+
+#[test]
+fn a_name_a_break_changed_arrives_at_the_join_as_a_parameter() {
+    let source = "function size(kind: string, small: number, large: number): number {\n  let chosen = small;\n  switch (kind) {\n    case \"large\":\n      chosen = large;\n      break;\n    default:\n      chosen = small;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("small", Answer::Known(number)),
+            ("large", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1, "exactly one join should take a parameter");
+    let (join, block) = &joins[0];
+    assert_eq!(block.parameters.len(), 1);
+    assert_eq!(function.type_of(block.parameters[0]), number);
+    assert_eq!(
+        block.terminator,
+        Terminator::Return(Some(block.parameters[0]))
+    );
+
+    let arguments: Vec<usize> = function
+        .blocks()
+        .filter_map(|(_, candidate)| match &candidate.terminator {
+            Terminator::Jump { target, arguments } if target == join => Some(arguments.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        arguments,
+        vec![1, 1],
+        "the break and the clause that runs out both pass one argument"
+    );
+}
+
+#[test]
+fn a_case_with_no_statements_shares_the_body_of_the_next_one() {
+    let source = "function rank(kind: string): number {\n  switch (kind) {\n    case \"a\":\n    case \"b\":\n      return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("kind", Answer::Known(text))]);
+    let file = SourceFile::new("rank.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(equality_tests(function), 2);
+
+    let bodies = function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Constant(savitar_ir::Constant::Number(bits)),
+                    ..
+                } if *bits == 1.0f64.to_bits()
+            )
+        })
+        .count();
+    assert_eq!(bodies, 1, "both labels reach one body, not a copy each");
+}
+
+#[test]
+fn a_case_that_runs_into_the_next_one_is_refused_rather_than_flattened() {
+    let source = "function pick(kind: string, value: number): number {\n  switch (kind) {\n    case \"a\":\n      value = 1;\n    case \"b\":\n      return value;\n  }\n  return value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("runs into the next one"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_case_label_no_one_can_type_is_refused_rather_than_guessed() {
+    let source = "function rank(kind: string): number {\n  switch (kind) {\n    case missing:\n      return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("kind", Answer::Known(text))]);
+    let file = SourceFile::new("rank.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "no-type-answer");
+}
+
+#[test]
+fn a_break_inside_a_loop_is_refused_instead_of_leaving_the_loop_wrong() {
+    let source = "function first(values: readonly number[], start: number): number {\n  let found = start;\n  for (const value of values) {\n    found = value;\n    break;\n  }\n  return found;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let values = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("values", Answer::Known(values)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("first.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+    assert!(
+        report.diagnostics[0].message.contains("out of a loop"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_break_in_one_arm_of_an_if_inside_a_case_still_reaches_the_join() {
+    let source = "function size(kind: string, small: number, large: number): number {\n  let chosen = small;\n  switch (kind) {\n    case \"large\":\n      if (large > small) {\n        chosen = large;\n        break;\n      }\n      chosen = small;\n      break;\n    default:\n      chosen = large;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("small", Answer::Known(number)),
+            ("large", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1, "only the switch join takes a parameter");
+    let (join, _) = &joins[0];
+    let arguments: Vec<usize> = function
+        .blocks()
+        .filter_map(|(_, candidate)| match &candidate.terminator {
+            Terminator::Jump { target, arguments } if target == join => Some(arguments.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        arguments,
+        vec![1, 1, 1],
+        "two breaks and the default all carry the name"
+    );
+}
+
+#[test]
+fn a_switch_inside_a_loop_carries_the_name_it_changed_through_the_header() {
+    let source = "function total(kind: string, step: number): number {\n  let sum = step;\n  while (sum < step) {\n    switch (kind) {\n      case \"add\":\n        sum = sum + step;\n        break;\n      default:\n        sum = step;\n    }\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("step", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let headers = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .count();
+    assert_eq!(
+        headers, 2,
+        "the loop header and the switch join each take the name"
+    );
+}
+
+#[test]
+fn a_default_clause_before_the_last_case_still_takes_the_unmatched_path() {
+    let source = "function pick(kind: string, small: number, large: number): number {\n  switch (kind) {\n    default:\n      return small;\n    case \"large\":\n      return large;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("small", Answer::Known(number)),
+            ("large", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(returns_without_a_value(function), 0);
+}
+
+#[test]
+fn a_break_in_a_nested_switch_leaves_only_the_switch_around_it() {
+    let source = "function label(outer: string, inner: string, first: number, second: number): number {\n  let chosen = first;\n  switch (outer) {\n    case \"x\":\n      switch (inner) {\n        case \"y\":\n          chosen = second;\n          break;\n        default:\n          chosen = first;\n      }\n      break;\n    default:\n      chosen = second;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("outer", Answer::Known(text)),
+            ("inner", Answer::Known(text)),
+            ("first", Answer::Known(number)),
+            ("second", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("label.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(joins.len(), 2, "each switch keeps a join of its own");
+    let incoming: Vec<usize> = joins
+        .iter()
+        .map(|join| {
+            function
+                .blocks()
+                .filter(|(_, block)| {
+                    matches!(&block.terminator, Terminator::Jump { target, .. } if target == join)
+                })
+                .count()
+        })
+        .collect();
+    assert_eq!(
+        incoming,
+        vec![2, 2],
+        "the inner break feeds the inner join, not the outer one"
+    );
+}
