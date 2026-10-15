@@ -41,6 +41,7 @@ pub enum TypeKind {
     String,
     Symbol,
     Unknown,
+    NonPrimitive,
     StringLiteral(String),
     NumberLiteral(u64),
     BooleanLiteral(bool),
@@ -59,6 +60,7 @@ pub enum TypeKind {
         parameters: Vec<Parameter>,
         returns: TypeId,
     },
+    Overloaded(Vec<TypeId>),
     Union(Vec<TypeId>),
     Nominal(NominalId),
     TypeParameter(u32),
@@ -167,6 +169,13 @@ impl TypeTable {
 
     pub fn tuple(&mut self, elements: Vec<TypeId>, readonly: bool) -> TypeId {
         self.intern(TypeKind::Tuple { elements, readonly })
+    }
+
+    pub fn overloaded(&mut self, forms: Vec<TypeId>) -> TypeId {
+        if let [only] = forms.as_slice() {
+            return *only;
+        }
+        self.intern(TypeKind::Overloaded(forms))
     }
 
     pub fn fresh_type_parameter(&mut self) -> TypeId {
@@ -334,6 +343,20 @@ mod tests {
             method: true,
         }]);
         assert_ne!(as_field, as_method);
+    }
+
+    #[test]
+    fn overload_order_is_part_of_the_type_and_one_form_collapses() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let from_number = table.function(vec![Parameter { type_id: number }], number);
+        let from_text = table.function(vec![Parameter { type_id: text }], number);
+        assert_eq!(table.overloaded(vec![from_number]), from_number);
+        assert_ne!(
+            table.overloaded(vec![from_number, from_text]),
+            table.overloaded(vec![from_text, from_number])
+        );
     }
 
     #[test]

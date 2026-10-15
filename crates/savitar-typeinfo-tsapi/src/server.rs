@@ -444,10 +444,19 @@ impl TsApi {
             return self.intern_signature(table, signature, depth);
         }
         if signatures.len() > 1 {
-            return Answer::Unsupported(format!(
-                "an overloaded signature with {} forms is not modelled yet",
-                signatures.len()
-            ));
+            if !properties.is_empty() || !indexes.is_empty() {
+                return Answer::Unsupported(
+                    "a callable object with properties is not modelled yet".into(),
+                );
+            }
+            let mut forms = Vec::with_capacity(signatures.len());
+            for signature in &signatures {
+                match self.intern_signature(table, signature, depth) {
+                    Answer::Known(form) => forms.push(form),
+                    other => return other,
+                }
+            }
+            return Answer::Known(table.overloaded(forms));
         }
 
         let mut fields = Vec::with_capacity(properties.len());

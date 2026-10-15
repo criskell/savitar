@@ -39,6 +39,7 @@ pub fn classify(flags: TypeFlags) -> Classified {
         (TypeFlags::NUMBER, TypeKind::Number),
         (TypeFlags::BIG_INT, TypeKind::BigInt),
         (TypeFlags::ES_SYMBOL, TypeKind::Symbol),
+        (TypeFlags::NON_PRIMITIVE, TypeKind::NonPrimitive),
     ] {
         if flags.has(flag) {
             return Classified::Primitive(kind);
@@ -63,10 +64,6 @@ pub fn classify(flags: TypeFlags) -> Classified {
         (
             TypeFlags::UNIQUE_ES_SYMBOL,
             "`unique symbol` is not modelled yet",
-        ),
-        (
-            TypeFlags::NON_PRIMITIVE,
-            "the `object` keyword names no shape",
         ),
         (TypeFlags::INDEX, "`keyof T` is not modelled yet"),
         (

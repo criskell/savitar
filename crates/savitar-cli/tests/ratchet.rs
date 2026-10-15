@@ -34,38 +34,27 @@ fn floor_path(corpus: &Path) -> PathBuf {
     corpus.join("coverage-floor.txt")
 }
 
-fn recorded_floor(corpus: &Path) -> u32 {
-    std::fs::read_to_string(floor_path(corpus))
-        .expect("the coverage floor should be recorded")
-        .trim()
-        .parse()
-        .expect("the coverage floor should be a whole percentage")
+struct Measured {
+    coverage: Coverage,
+    gaps: Vec<String>,
 }
 
-#[test]
-fn type_coverage_of_the_corpus_never_falls() {
-    let root = workspace_root();
-    let corpus = root.join("test-files/corpus");
-    let Some(binary) = provider_binary(&root) else {
-        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
-        return;
-    };
-
-    let files = corpus_files(&corpus);
+fn measure(directory: &Path, binary: &OsString) -> Measured {
+    let files = corpus_files(directory);
     let open: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
-    let api = TsApi::start(&binary, &corpus, &open).expect("the provider should start");
+    let api = TsApi::start(binary, directory, &open).expect("the provider should start");
     let mut table = TypeTable::new();
-    let mut total = Coverage::default();
+    let mut coverage = Coverage::default();
     let mut gaps: Vec<String> = Vec::new();
 
     for path in &files {
-        let text = std::fs::read_to_string(path).expect("the corpus file should be readable");
+        let text = std::fs::read_to_string(path).expect("the file should be readable");
         let name = path.to_str().expect("utf-8 path").to_string();
         let file = SourceFile::new(name, text);
         let report = check_types(&file, &api, &mut table);
-        total.known += report.coverage.known;
-        total.unsupported += report.coverage.unsupported;
-        total.out_of_scope += report.coverage.out_of_scope;
+        coverage.known += report.coverage.known;
+        coverage.unsupported += report.coverage.unsupported;
+        coverage.out_of_scope += report.coverage.out_of_scope;
         for diagnostic in &report.diagnostics {
             let at = file.line_col(diagnostic.span.start);
             gaps.push(format!(
@@ -78,32 +67,66 @@ fn type_coverage_of_the_corpus_never_falls() {
         }
     }
 
-    let actual = total.percent_known();
-    let floor = recorded_floor(&corpus);
+    Measured { coverage, gaps }
+}
+
+fn assert_ratchet(directory: &Path, measured: &Measured, counted: usize) {
+    let floor: usize = std::fs::read_to_string(floor_path(directory))
+        .expect("the floor should be recorded")
+        .trim()
+        .parse()
+        .expect("the floor should be a whole number");
 
     assert_eq!(
-        total.out_of_scope,
+        measured.coverage.out_of_scope,
         0,
-        "the provider answered nothing for {} bindings; the first gaps are:\n{}",
-        total.out_of_scope,
-        gaps.join("\n")
+        "the provider answered nothing for {} bindings; the gaps are:\n{}",
+        measured.coverage.out_of_scope,
+        measured.gaps.join("\n")
     );
 
     assert!(
-        actual >= floor,
-        "type coverage fell from {floor}% to {actual}% ({} of {} bindings); the gaps are:\n{}",
-        total.known,
-        total.total(),
-        gaps.join("\n")
+        counted >= floor,
+        "the ratchet fell from {floor} to {counted} of {}; the gaps are:\n{}",
+        measured.coverage.total(),
+        measured.gaps.join("\n")
     );
 
-    if actual > floor {
+    if counted > floor {
         panic!(
-            "type coverage rose from {floor}% to {actual}% ({} of {} bindings).\n\
-             Raise the ratchet: echo {actual} > {}",
-            total.known,
-            total.total(),
-            floor_path(&corpus).display()
+            "the ratchet rose from {floor} to {counted} of {}.\nRaise it: echo {counted} > {}",
+            measured.coverage.total(),
+            floor_path(directory).display()
         );
     }
+}
+
+#[test]
+fn type_coverage_of_the_corpus_never_falls() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = measure(&corpus, &binary);
+    assert_ratchet(
+        &corpus,
+        &measured,
+        measured.coverage.percent_known() as usize,
+    );
+}
+
+#[test]
+fn the_number_of_standard_library_types_reached_never_falls() {
+    let root = workspace_root();
+    let surface = root.join("test-files/lib");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = measure(&surface, &binary);
+    assert_ratchet(&surface, &measured, measured.coverage.known);
 }
