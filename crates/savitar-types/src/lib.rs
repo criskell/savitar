@@ -15,6 +15,12 @@ pub struct Field {
     pub name: String,
     pub type_id: TypeId,
     pub optional: bool,
+    pub method: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Parameter {
+    pub type_id: TypeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +49,10 @@ pub enum TypeKind {
     Object {
         fields: Vec<Field>,
         indexes: Vec<IndexSignature>,
+    },
+    Function {
+        parameters: Vec<Parameter>,
+        returns: TypeId,
     },
     Union(Vec<TypeId>),
     Nominal(NominalId),
@@ -129,6 +139,22 @@ impl TypeTable {
         self.intern(TypeKind::Object { fields, indexes })
     }
 
+    #[must_use]
+    pub fn admits_undefined(&self, id: TypeId) -> bool {
+        match self.kind(id) {
+            TypeKind::Undefined | TypeKind::Unknown => true,
+            TypeKind::Union(members) => members.iter().any(|&member| self.admits_undefined(member)),
+            _ => false,
+        }
+    }
+
+    pub fn function(&mut self, parameters: Vec<Parameter>, returns: TypeId) -> TypeId {
+        self.intern(TypeKind::Function {
+            parameters,
+            returns,
+        })
+    }
+
     pub fn optional(&mut self, inner: TypeId) -> TypeId {
         let undefined = self.intern(TypeKind::Undefined);
         self.union(vec![inner, undefined])
@@ -185,11 +211,13 @@ mod tests {
             name: "x".to_string(),
             type_id: number,
             optional: false,
+            method: false,
         };
         let y = Field {
             name: "y".to_string(),
             type_id: text,
             optional: true,
+            method: false,
         };
         assert_eq!(
             table.object(vec![x.clone(), y.clone()]),
@@ -240,13 +268,60 @@ mod tests {
             name: "x".to_string(),
             type_id: number,
             optional: false,
+            method: false,
         }]);
         let optional = table.object(vec![Field {
             name: "x".to_string(),
             type_id: number,
             optional: true,
+            method: false,
         }]);
         assert_ne!(required, optional);
+    }
+
+    #[test]
+    fn a_method_is_a_different_type_from_a_field_of_the_same_function_type() {
+        let mut table = TypeTable::new();
+        let void = table.intern(TypeKind::Void);
+        let signature = table.function(vec![], void);
+        let as_field = table.object(vec![Field {
+            name: "run".to_string(),
+            type_id: signature,
+            optional: false,
+            method: false,
+        }]);
+        let as_method = table.object(vec![Field {
+            name: "run".to_string(),
+            type_id: signature,
+            optional: false,
+            method: true,
+        }]);
+        assert_ne!(as_field, as_method);
+    }
+
+    #[test]
+    fn parameter_order_is_part_of_a_function_type() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let void = table.intern(TypeKind::Void);
+        let left = Parameter { type_id: number };
+        let right = Parameter { type_id: text };
+        assert_ne!(
+            table.function(vec![left.clone(), right.clone()], void),
+            table.function(vec![right, left], void)
+        );
+    }
+
+    #[test]
+    fn an_optional_type_admits_undefined_and_a_plain_one_does_not() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        assert!(!table.admits_undefined(number));
+        let optional = table.optional(number);
+        assert!(table.admits_undefined(optional));
+        let undefined = table.intern(TypeKind::Undefined);
+        assert!(table.admits_undefined(undefined));
     }
 
     #[test]

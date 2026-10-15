@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
-use savitar_types::{Field, IndexSignature, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, Parameter, TypeKind, TypeTable};
 
 const SOURCE: &str = concat!(
     "const n = 1;\n",
@@ -27,6 +27,9 @@ const SOURCE: &str = concat!(
     "declare const chain: Chain;\n",
     "declare const dict: Record<string, number>;\n",
     "declare const mixed: { a: number; [k: string]: number };\n",
+    "declare const fn: (a: number, b: string) => boolean;\n",
+    "declare const loose: (a?: number) => void;\n",
+    "declare const obj: { value: number; run(flag: boolean): void };\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -146,10 +149,10 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     assert_eq!(table.kind(nested), &TypeKind::Array(array));
 
     let other = api.type_at(&mut table, path, Span::new(position_of("st"), 0));
-    let Answer::Unsupported(reason) = other else {
-        panic!("`Set` must not be guessed, got {other:?}");
-    };
-    assert!(reason.contains("method"), "unexpected: {reason}");
+    assert!(
+        matches!(other, Answer::Unsupported(_)),
+        "`Set` must not be guessed, got {other:?}"
+    );
 
     let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
     let Answer::Known(object) = object else {
@@ -160,6 +163,7 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         name: "x".to_string(),
         type_id: number,
         optional: false,
+        method: false,
     }]);
     assert_eq!(object, expected);
 
@@ -173,11 +177,13 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
             name: "x".to_string(),
             type_id: number,
             optional: false,
+            method: false,
         },
         Field {
             name: "y".to_string(),
             type_id: text_kind,
             optional: false,
+            method: false,
         },
     ]);
     assert_eq!(shape, sorted, "declaration order must not change identity");
@@ -204,11 +210,13 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         name: "deep".to_string(),
         type_id: number,
         optional: false,
+        method: false,
     }]);
     let expected = table.object(vec![Field {
         name: "inner".to_string(),
         type_id: inner,
         optional: false,
+        method: false,
     }]);
     assert_eq!(boxed, expected);
 
@@ -247,6 +255,50 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     assert_eq!(indexes.len(), 1, "the index signature should survive");
     assert_eq!(table.kind(indexes[0].key), &TypeKind::String);
     assert_eq!(table.kind(indexes[0].value), &TypeKind::Number);
+
+    let function = api.type_at(&mut table, path, Span::new(position_of("fn"), 0));
+    let Answer::Known(function) = function else {
+        panic!("expected a known type for `fn`, got {function:?}");
+    };
+    let boolean = table.intern(TypeKind::Boolean);
+    let expected = table.function(
+        vec![
+            Parameter { type_id: number },
+            Parameter { type_id: text_kind },
+        ],
+        boolean,
+    );
+    assert_eq!(function, expected, "a function type must keep its shape");
+
+    let loose = api.type_at(&mut table, path, Span::new(position_of("loose"), 0));
+    let Answer::Unsupported(reason) = loose else {
+        panic!("an optional parameter must not be guessed, got {loose:?}");
+    };
+    assert!(reason.contains("optional"), "unexpected: {reason}");
+
+    let with_method = api.type_at(&mut table, path, Span::new(position_of("obj"), 0));
+    let Answer::Known(with_method) = with_method else {
+        panic!("expected a known type for `obj`, got {with_method:?}");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(with_method).clone() else {
+        panic!("expected an object, got {:?}", table.kind(with_method));
+    };
+    let run = fields
+        .iter()
+        .find(|field| field.name == "run")
+        .expect("the method should be a field");
+    assert!(
+        run.method,
+        "`run` must be marked a method, not a plain field"
+    );
+    let value = fields
+        .iter()
+        .find(|field| field.name == "value")
+        .expect("the plain field should be present");
+    assert!(!value.method, "`value` must not be marked a method");
+    let void = table.intern(TypeKind::Void);
+    let run_signature = table.function(vec![Parameter { type_id: boolean }], void);
+    assert_eq!(run.type_id, run_signature);
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();

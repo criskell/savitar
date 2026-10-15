@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{Field, IndexSignature, TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SymbolFlags, TypeFlags};
@@ -273,10 +273,83 @@ impl TsApi {
         Ok(signatures)
     }
 
+    fn symbol_type(&self, reference: &Value) -> Result<Value, TsApiError> {
+        self.request(
+            "getNonMissingTypeOfSymbol",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "symbol": reference,
+            }),
+        )
+    }
+
+    fn intern_signature(&self, table: &mut TypeTable, signature: &Value, depth: u32) -> Answer {
+        let Some(signature_id) = signature.get("id").and_then(Value::as_u64) else {
+            return Answer::Unsupported("a call signature with no id".into());
+        };
+        let signature_id = u32::try_from(signature_id).unwrap_or(u32::MAX);
+
+        let parameters =
+            match self.checker_call("getParametersOfSignature", "objectId", signature_id) {
+                Ok(parameters) => parameters,
+                Err(error) => return Answer::Unsupported(error.to_string()),
+            };
+        let Some(parameters) = parameters.as_array() else {
+            return Answer::Unsupported("getParametersOfSignature returned no array".into());
+        };
+
+        let mut interned = Vec::with_capacity(parameters.len());
+        for parameter in parameters {
+            let Some(reference) = parameter.get("reference") else {
+                return Answer::Unsupported("a parameter with no symbol reference".into());
+            };
+            let parameter_type = match self.symbol_type(reference) {
+                Ok(parameter_type) => parameter_type,
+                Err(error) => return Answer::Unsupported(error.to_string()),
+            };
+            match self.intern_response(table, &parameter_type, depth + 1) {
+                Answer::Known(type_id) => {
+                    if table.admits_undefined(type_id) {
+                        return Answer::Unsupported(
+                            "the API does not say whether a parameter that admits `undefined` is optional"
+                                .into(),
+                        );
+                    }
+                    interned.push(Parameter { type_id });
+                }
+                other => return other,
+            }
+        }
+
+        let returns = match self.checker_call("getReturnTypeOfSignature", "objectId", signature_id)
+        {
+            Ok(returns) => returns,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        match self.intern_response(table, &returns, depth + 1) {
+            Answer::Known(returns) => Answer::Known(table.function(interned, returns)),
+            other => other,
+        }
+    }
+
+    fn call_signatures(&self, type_id: u32) -> Result<Vec<Value>, TsApiError> {
+        let signatures = self.checker_call("getSignaturesOfType", "type", type_id)?;
+        signatures
+            .as_array()
+            .cloned()
+            .ok_or_else(|| TsApiError::Protocol("getSignaturesOfType returned no array".into()))
+    }
+
     fn intern_fields(&self, table: &mut TypeTable, type_id: u32, depth: u32) -> Answer {
         let indexes = match self.index_signatures(table, type_id, depth) {
             Ok(indexes) => indexes,
             Err(answer) => return answer,
+        };
+
+        let signatures = match self.call_signatures(type_id) {
+            Ok(signatures) => signatures,
+            Err(error) => return Answer::Unsupported(error.to_string()),
         };
 
         let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
@@ -286,6 +359,21 @@ impl TsApi {
         let Some(properties) = properties.as_array() else {
             return Answer::Unsupported("getPropertiesOfType returned no array".into());
         };
+
+        if let [signature] = signatures.as_slice() {
+            if !properties.is_empty() || !indexes.is_empty() {
+                return Answer::Unsupported(
+                    "a callable object with properties is not modelled yet".into(),
+                );
+            }
+            return self.intern_signature(table, signature, depth);
+        }
+        if signatures.len() > 1 {
+            return Answer::Unsupported(format!(
+                "an overloaded signature with {} forms is not modelled yet",
+                signatures.len()
+            ));
+        }
 
         let mut fields = Vec::with_capacity(properties.len());
         for property in properties {
@@ -297,24 +385,15 @@ impl TsApi {
                 .and_then(Value::as_u64)
                 .map(|bits| SymbolFlags(u32::try_from(bits).unwrap_or(0)))
                 .unwrap_or_default();
-            if symbol_flags.has(SymbolFlags::METHOD) {
-                return Answer::Unsupported(format!("the method `{name}` is not modelled yet"));
-            }
-            if !symbol_flags.has(SymbolFlags::PROPERTY) {
-                return Answer::Unsupported(format!("`{name}` is not a plain property"));
+            let method = symbol_flags.has(SymbolFlags::METHOD);
+            if !method && !symbol_flags.has(SymbolFlags::PROPERTY) {
+                return Answer::Unsupported(format!("`{name}` is neither a property nor a method"));
             }
 
             let Some(reference) = property.get("reference") else {
                 return Answer::Unsupported(format!("`{name}` carries no symbol reference"));
             };
-            let field_type = match self.request(
-                "getNonMissingTypeOfSymbol",
-                json!({
-                    "snapshot": *self.snapshot.borrow(),
-                    "project": *self.project.borrow(),
-                    "symbol": reference,
-                }),
-            ) {
+            let field_type = match self.symbol_type(reference) {
                 Ok(field_type) => field_type,
                 Err(error) => return Answer::Unsupported(error.to_string()),
             };
@@ -324,6 +403,7 @@ impl TsApi {
                     name: name.to_string(),
                     type_id,
                     optional: symbol_flags.has(SymbolFlags::OPTIONAL),
+                    method,
                 }),
                 other => return other,
             }
