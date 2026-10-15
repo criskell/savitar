@@ -1,0 +1,18 @@
+[package]
+name = "savitar-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The savitar command line"
+
+[[bin]]
+name = "savitar"
+path = "src/main.rs"
+
+[dependencies]
+savitar-diagnostics.workspace = true
+savitar-sound.workspace = true
+
+[lints]
+workspace = true
