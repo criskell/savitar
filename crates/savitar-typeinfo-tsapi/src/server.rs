@@ -49,6 +49,25 @@ pub struct TsApi {
     resolving: RefCell<HashMap<u32, (TypeId, bool)>>,
 }
 
+struct FixedTuple {
+    arity: usize,
+    readonly: bool,
+}
+
+fn property_named<'a>(properties: &'a [Value], wanted: &str) -> Option<&'a Value> {
+    properties
+        .iter()
+        .find(|property| property.get("name").and_then(Value::as_str) == Some(wanted))
+}
+
+fn type_flags_of(response: &Value) -> TypeFlags {
+    response
+        .get("flags")
+        .and_then(Value::as_u64)
+        .map(|bits| TypeFlags(u32::try_from(bits).unwrap_or(0)))
+        .unwrap_or_default()
+}
+
 fn file_uri(path: &Path) -> String {
     let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     format!("file://{}", absolute.display())
@@ -444,6 +463,113 @@ impl TsApi {
         Answer::Known(table.object_with_indexes(fields, indexes))
     }
 
+    fn fixed_tuple_shape(&self, type_id: u32) -> Result<FixedTuple, Answer> {
+        let properties = self
+            .checker_call("getPropertiesOfType", "type", type_id)
+            .map_err(|error| Answer::Unsupported(error.to_string()))?;
+        let Some(properties) = properties.as_array() else {
+            return Err(Answer::Unsupported(
+                "getPropertiesOfType returned no array".into(),
+            ));
+        };
+
+        let Some(length) = property_named(properties, "length") else {
+            return Err(Answer::Unsupported(
+                "a tuple whose `length` property the API does not report".into(),
+            ));
+        };
+        let Some(reference) = length.get("reference") else {
+            return Err(Answer::Unsupported(
+                "a tuple whose `length` carries no symbol reference".into(),
+            ));
+        };
+        let length = self
+            .symbol_type(reference)
+            .map_err(|error| Answer::Unsupported(error.to_string()))?;
+        let flags = type_flags_of(&length);
+
+        if flags.has(TypeFlags::UNION) {
+            return Err(Answer::Unsupported(
+                "a tuple with an optional element: `length` is a union of arities, not one literal"
+                    .into(),
+            ));
+        }
+        if flags.has(TypeFlags::NUMBER) {
+            return Err(Answer::Unsupported(
+                "a tuple with a rest or variadic element: `length` is `number`, not a literal"
+                    .into(),
+            ));
+        }
+        if !flags.has(TypeFlags::NUMBER_LITERAL) {
+            return Err(Answer::Unsupported(
+                "a tuple whose `length` is neither a numeric literal nor `number`".into(),
+            ));
+        }
+
+        let Some(arity) = length.get("value").and_then(Value::as_u64) else {
+            return Err(Answer::Unsupported(
+                "a tuple whose `length` literal carries no whole value".into(),
+            ));
+        };
+
+        if property_named(properties, "concat").is_none() {
+            return Err(Answer::Unsupported(
+                "a tuple carrying no array members, so the absence of `push` does not prove it is readonly"
+                    .into(),
+            ));
+        }
+
+        Ok(FixedTuple {
+            arity: usize::try_from(arity).unwrap_or(usize::MAX),
+            readonly: property_named(properties, "push").is_none(),
+        })
+    }
+
+    fn intern_tuple(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        let slot = match self.enter_resolution(table, id) {
+            Ok(slot) => slot,
+            Err(reserved) => return Answer::Known(reserved),
+        };
+        let answer = self.intern_tuple_elements(table, id, depth);
+        self.leave_resolution(table, id, slot, answer)
+    }
+
+    fn intern_tuple_elements(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        let shape = match self.fixed_tuple_shape(id) {
+            Ok(shape) => shape,
+            Err(answer) => return answer,
+        };
+
+        let arguments = match self.type_arguments(id) {
+            Ok(arguments) => arguments,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        if arguments.len() < shape.arity {
+            return Answer::Unsupported(format!(
+                "a tuple of arity {} with only {} type arguments",
+                shape.arity,
+                arguments.len()
+            ));
+        }
+
+        let mut elements = Vec::with_capacity(shape.arity);
+        for (position, argument) in arguments[..shape.arity].iter().enumerate() {
+            match self.intern_response(table, argument, depth + 1) {
+                Answer::Known(element) => {
+                    if table.admits_undefined(element) {
+                        return Answer::Unsupported(format!(
+                            "element {position} of the tuple admits `undefined`, which is not modelled yet"
+                        ));
+                    }
+                    elements.push(element);
+                }
+                other => return other,
+            }
+        }
+
+        Answer::Known(table.tuple(elements, shape.readonly))
+    }
+
     fn intern_object(
         &self,
         table: &mut TypeTable,
@@ -456,10 +582,7 @@ impl TsApi {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return Answer::Unsupported(
-                "the API omits a tuple's element flags, so a rest tuple is indistinguishable from a fixed one"
-                    .into(),
-            );
+            return self.intern_tuple(table, id, depth);
         }
 
         let object_flags = response
@@ -534,11 +657,7 @@ impl TsApi {
             return Answer::Known(cached);
         }
 
-        let flags = response
-            .get("flags")
-            .and_then(Value::as_u64)
-            .map(|bits| TypeFlags(u32::try_from(bits).unwrap_or(0)))
-            .unwrap_or_default();
+        let flags = type_flags_of(response);
         let value = response.get("value");
 
         let interned = match classify(flags) {

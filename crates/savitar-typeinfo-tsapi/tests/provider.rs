@@ -15,6 +15,15 @@ const SOURCE: &str = concat!(
     "declare const opt: number | undefined;\n",
     "declare const pt: { x: number };\n",
     "declare const tup: [number, string];\n",
+    "declare const tupSolo: [number];\n",
+    "declare const tupEmpty: [];\n",
+    "declare const tupRo: readonly [number, string];\n",
+    "declare const tupNested: [[number, string], boolean];\n",
+    "declare const tupRest: [number, ...string[]];\n",
+    "declare const tupLeading: [...string[], number];\n",
+    "declare const tupOpt: [number, string?];\n",
+    "declare const tupRoRest: readonly [number, ...string[]];\n",
+    "declare const tupUndef: [number, string | undefined];\n",
     "declare const arr: number[];\n",
     "declare const ro: readonly string[];\n",
     "declare const nested: number[][];\n",
@@ -40,7 +49,7 @@ fn provider_binary() -> Option<OsString> {
     path.exists().then(|| path.into_os_string())
 }
 
-fn scratch_project() -> PathBuf {
+fn scratch_project_with(options: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before the epoch")
@@ -49,11 +58,17 @@ fn scratch_project() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
-        "{ \"compilerOptions\": { \"strict\": true, \"noUncheckedIndexedAccess\": true, \"exactOptionalPropertyTypes\": true } }",
+        format!("{{ \"compilerOptions\": {{ {options} }} }}"),
     )
     .expect("could not write tsconfig.json");
     std::fs::write(dir.join("a.ts"), SOURCE).expect("could not write a.ts");
     dir
+}
+
+fn scratch_project() -> PathBuf {
+    scratch_project_with(
+        "\"strict\": true, \"noUncheckedIndexedAccess\": true, \"exactOptionalPropertyTypes\": true",
+    )
 }
 
 fn position_of(name: &str) -> u32 {
@@ -121,12 +136,6 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     };
     let number = table.intern(TypeKind::Number);
     assert_eq!(optional, table.optional(number));
-
-    let tuple = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
-    let Answer::Unsupported(reason) = tuple else {
-        panic!("a tuple must not be guessed, got {tuple:?}");
-    };
-    assert!(reason.contains("tuple"), "unexpected: {reason}");
 
     let array = api.type_at(&mut table, path, Span::new(position_of("arr"), 0));
     let Answer::Known(array) = array else {
@@ -356,5 +365,177 @@ fn a_non_canonical_path_still_reaches_the_provider() {
         table.kind(number),
         &TypeKind::NumberLiteral(1.0f64.to_bits())
     );
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_fixed_tuple_keeps_its_elements_in_order() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let boolean = table.intern(TypeKind::Boolean);
+
+    let pair = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
+    let Answer::Known(pair) = pair else {
+        panic!("expected a known type for `tup`, got {pair:?}");
+    };
+    let expected = table.tuple(vec![number, text], false);
+    assert_eq!(pair, expected);
+    assert_ne!(
+        pair,
+        table.tuple(vec![text, number], false),
+        "element order must be part of the identity"
+    );
+
+    let solo = api.type_at(&mut table, path, Span::new(position_of("tupSolo"), 0));
+    let Answer::Known(solo) = solo else {
+        panic!("expected a known type for `tupSolo`, got {solo:?}");
+    };
+    let expected = table.tuple(vec![number], false);
+    assert_eq!(solo, expected);
+
+    let empty = api.type_at(&mut table, path, Span::new(position_of("tupEmpty"), 0));
+    let Answer::Known(empty) = empty else {
+        panic!("expected a known type for `tupEmpty`, got {empty:?}");
+    };
+    let expected = table.tuple(vec![], false);
+    assert_eq!(empty, expected);
+
+    let nested = api.type_at(&mut table, path, Span::new(position_of("tupNested"), 0));
+    let Answer::Known(nested) = nested else {
+        panic!("expected a known type for `tupNested`, got {nested:?}");
+    };
+    let expected = table.tuple(vec![pair, boolean], false);
+    assert_eq!(nested, expected);
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_readonly_tuple_differs_from_a_mutable_one_with_the_same_elements() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+
+    let frozen = api.type_at(&mut table, path, Span::new(position_of("tupRo"), 0));
+    let Answer::Known(frozen) = frozen else {
+        panic!("expected a known type for `tupRo`, got {frozen:?}");
+    };
+    let expected = table.tuple(vec![number, text], true);
+    assert_eq!(frozen, expected);
+
+    let mutable = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
+    let Answer::Known(mutable) = mutable else {
+        panic!("expected a known type for `tup`, got {mutable:?}");
+    };
+    assert_ne!(frozen, mutable);
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_tuple_with_a_rest_or_optional_element_is_refused() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    for (name, needle) in [
+        ("tupRest", "rest or variadic"),
+        ("tupLeading", "rest or variadic"),
+        ("tupRoRest", "rest or variadic"),
+        ("tupOpt", "optional"),
+    ] {
+        let answer = api.type_at(&mut table, path, Span::new(position_of(name), 0));
+        let Answer::Unsupported(reason) = answer else {
+            panic!("`{name}` must not be guessed, got {answer:?}");
+        };
+        assert!(
+            reason.contains(needle) && reason.contains("length"),
+            "`{name}` should name what the API withheld, got: {reason}"
+        );
+    }
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_tuple_element_that_admits_undefined_is_refused() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("tupUndef"), 0));
+    let Answer::Unsupported(reason) = answer else {
+        panic!("a tuple element admitting `undefined` must not be guessed, got {answer:?}");
+    };
+    assert!(
+        reason.contains("element 1") && reason.contains("undefined"),
+        "the refusal should name the element, got: {reason}"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn without_the_array_library_a_tuple_is_refused_rather_than_called_readonly() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_with("\"strict\": true, \"noLib\": true");
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
+    let Answer::Unsupported(reason) = answer else {
+        panic!("a mutable tuple with no array members must not be guessed, got {answer:?}");
+    };
+    assert!(
+        reason.contains("array members") && reason.contains("push"),
+        "the refusal should name the missing evidence, got: {reason}"
+    );
+
     std::fs::remove_dir_all(&project).ok();
 }

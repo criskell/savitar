@@ -46,6 +46,10 @@ pub enum TypeKind {
     BooleanLiteral(bool),
     Array(TypeId),
     ReadonlyArray(TypeId),
+    Tuple {
+        elements: Vec<TypeId>,
+        readonly: bool,
+    },
     Object {
         fields: Vec<Field>,
         indexes: Vec<IndexSignature>,
@@ -156,6 +160,10 @@ impl TypeTable {
             TypeKind::Union(members) => members.iter().any(|&member| self.admits_undefined(member)),
             _ => false,
         }
+    }
+
+    pub fn tuple(&mut self, elements: Vec<TypeId>, readonly: bool) -> TypeId {
+        self.intern(TypeKind::Tuple { elements, readonly })
     }
 
     pub fn function(&mut self, parameters: Vec<Parameter>, returns: TypeId) -> TypeId {
@@ -321,6 +329,66 @@ mod tests {
             table.function(vec![left.clone(), right.clone()], void),
             table.function(vec![right, left], void)
         );
+    }
+
+    #[test]
+    fn element_order_is_part_of_a_tuple_type() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        assert_ne!(
+            table.tuple(vec![number, text], false),
+            table.tuple(vec![text, number], false)
+        );
+    }
+
+    #[test]
+    fn a_readonly_tuple_is_a_different_type_from_a_mutable_one() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        assert_ne!(
+            table.tuple(vec![number], false),
+            table.tuple(vec![number], true)
+        );
+    }
+
+    #[test]
+    fn a_tuple_of_one_element_is_not_an_array_of_it() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let array = table.intern(TypeKind::Array(number));
+        assert_ne!(table.tuple(vec![number], false), array);
+    }
+
+    #[test]
+    fn a_repeated_element_is_not_deduplicated_in_a_tuple() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let pair = table.tuple(vec![number, number], false);
+        let TypeKind::Tuple { elements, readonly } = table.kind(pair).clone() else {
+            panic!("expected a tuple, got {:?}", table.kind(pair));
+        };
+        assert_eq!(elements, vec![number, number]);
+        assert!(!readonly);
+    }
+
+    #[test]
+    fn an_empty_tuple_has_its_own_identity() {
+        let mut table = TypeTable::new();
+        let empty = table.tuple(vec![], false);
+        let readonly_empty = table.tuple(vec![], true);
+        let nothing = table.object(vec![]);
+        assert_ne!(empty, readonly_empty);
+        assert_ne!(empty, nothing);
+    }
+
+    #[test]
+    fn a_tuple_does_not_admit_undefined_even_when_an_element_does() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let maybe = table.optional(number);
+        let pair = table.tuple(vec![number, maybe], false);
+        assert!(!table.admits_undefined(pair));
     }
 
     #[test]
