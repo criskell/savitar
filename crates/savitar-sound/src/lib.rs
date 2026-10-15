@@ -1,5 +1,6 @@
 mod config;
 mod rules;
+mod types;
 
 use oxc_allocator::Allocator;
 use oxc_parser::Parser;
@@ -9,6 +10,7 @@ use savitar_diagnostics::{Diagnostic, Severity, SourceFile, Span};
 
 pub use config::{CONFIG_REQUIREMENTS, ConfigRequirement, Demand, check_tsconfig};
 pub use rules::{RULES, Rule};
+pub use types::{Coverage, TypeReport, check_types};
 
 #[derive(Debug)]
 pub struct Report {

@@ -567,6 +567,9 @@ version = "0.0.1"
 dependencies = [
  "savitar-diagnostics",
  "savitar-sound",
+ "savitar-typeinfo",
+ "savitar-typeinfo-tsapi",
+ "savitar-types",
 ]
 
 [[package]]

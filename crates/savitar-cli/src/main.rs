@@ -1,9 +1,14 @@
 use std::process::ExitCode;
 
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
 use savitar_diagnostics::{SourceFile, render};
+use savitar_typeinfo_tsapi::TsApi;
+use savitar_types::TypeTable;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: savitar check <file.ts>...");
+    eprintln!("usage: savitar check [--types] <file.ts>...");
     eprintln!("       savitar rules");
     eprintln!("       savitar config");
     ExitCode::from(2)
@@ -43,6 +48,20 @@ fn list_config() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn provider_binary() -> OsString {
+    if let Some(from_env) = std::env::var_os("SAVITAR_TYPE_PROVIDER") {
+        return from_env;
+    }
+    OsString::from("./node_modules/.bin/tsc-rs")
+}
+
+fn project_root(paths: &[PathBuf]) -> PathBuf {
+    paths
+        .first()
+        .and_then(|path| path.parent())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
@@ -59,13 +78,39 @@ fn main() -> ExitCode {
         return usage();
     }
 
-    let paths: Vec<String> = args.collect();
+    let mut with_types = false;
+    let mut paths: Vec<String> = Vec::new();
+    for argument in args {
+        if argument == "--types" {
+            with_types = true;
+        } else {
+            paths.push(argument);
+        }
+    }
     if paths.is_empty() {
         return usage();
     }
 
     let mut rejected = false;
     let mut findings = 0usize;
+
+    let absolute: Vec<PathBuf> = paths
+        .iter()
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)))
+        .collect();
+    let mut provider = None;
+    if with_types {
+        let root = project_root(&absolute);
+        let open: Vec<&Path> = absolute.iter().map(PathBuf::as_path).collect();
+        match TsApi::start(&provider_binary(), &root, &open) {
+            Ok(api) => provider = Some(api),
+            Err(error) => {
+                eprintln!("savitar: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let mut table = TypeTable::new();
 
     for path in &paths {
         let text = match std::fs::read_to_string(path) {
@@ -84,6 +129,21 @@ fn main() -> ExitCode {
             rejected = true;
         }
         print!("{}", render(&file, &report.diagnostics));
+
+        if let Some(api) = &provider {
+            let types = savitar_sound::check_types(&file, api, &mut table);
+            findings += types.diagnostics.len();
+            if types.diagnostics.iter().any(|d| d.severity.rejects()) {
+                rejected = true;
+            }
+            print!("{}", render(&file, &types.diagnostics));
+            println!(
+                "savitar: {} of {} bindings typed ({}%)",
+                types.coverage.known,
+                types.coverage.total(),
+                types.coverage.percent_known()
+            );
+        }
     }
 
     if findings == 0 {
