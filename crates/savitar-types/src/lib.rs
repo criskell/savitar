@@ -131,7 +131,8 @@ impl TypeTable {
         &self.nominal_names[id.0 as usize]
     }
 
-    pub fn union(&mut self, mut members: Vec<TypeId>) -> TypeId {
+    pub fn union(&mut self, members: Vec<TypeId>) -> TypeId {
+        let mut members = self.reduced(self.flattened(members));
         members.sort_unstable();
         members.dedup();
         match members.len() {
@@ -139,6 +140,45 @@ impl TypeTable {
             1 => members[0],
             _ => self.intern(TypeKind::Union(members)),
         }
+    }
+
+    fn flattened(&self, members: Vec<TypeId>) -> Vec<TypeId> {
+        let mut flat = Vec::with_capacity(members.len());
+        for member in members {
+            match self.kind(member) {
+                TypeKind::Union(inner) => flat.extend(inner.iter().copied()),
+                TypeKind::Never => {}
+                _ => flat.push(member),
+            }
+        }
+        flat
+    }
+
+    fn reduced(&self, members: Vec<TypeId>) -> Vec<TypeId> {
+        if members
+            .iter()
+            .any(|&member| matches!(self.kind(member), TypeKind::Unknown))
+        {
+            return vec![
+                members
+                    .into_iter()
+                    .find(|&member| matches!(self.kind(member), TypeKind::Unknown))
+                    .expect("the unknown member was just found"),
+            ];
+        }
+        let holds = |wanted: &TypeKind| members.iter().any(|&member| self.kind(member) == wanted);
+        let has_number = holds(&TypeKind::Number);
+        let has_string = holds(&TypeKind::String);
+        let has_boolean = holds(&TypeKind::Boolean);
+        members
+            .into_iter()
+            .filter(|&member| match self.kind(member) {
+                TypeKind::NumberLiteral(_) => !has_number,
+                TypeKind::StringLiteral(_) => !has_string,
+                TypeKind::BooleanLiteral(_) => !has_boolean,
+                _ => true,
+            })
+            .collect()
     }
 
     pub fn number_literal(&mut self, value: f64) -> TypeId {
@@ -510,5 +550,37 @@ mod tests {
         assert_eq!(table.nominal_name(point), "Point");
         assert_eq!(table.nominal_name(user), "User");
         assert_ne!(point, user);
+    }
+
+    #[test]
+    fn a_union_of_a_union_stays_flat() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let undefined = table.intern(TypeKind::Undefined);
+        let maybe = table.union(vec![number, undefined]);
+
+        let widened = table.union(vec![maybe, text]);
+
+        let TypeKind::Union(members) = table.kind(widened).clone() else {
+            panic!("expected a union, got {:?}", table.kind(widened));
+        };
+        assert_eq!(members.len(), 3);
+        assert_eq!(table.union(vec![maybe, number]), maybe);
+    }
+
+    #[test]
+    fn a_union_drops_a_literal_its_base_already_covers() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let zero = table.number_literal(0.0);
+
+        assert_eq!(table.union(vec![number, zero]), number);
+
+        let never = table.intern(TypeKind::Never);
+        assert_eq!(table.union(vec![never, zero]), zero);
+
+        let unknown = table.intern(TypeKind::Unknown);
+        assert_eq!(table.union(vec![unknown, number]), unknown);
     }
 }
