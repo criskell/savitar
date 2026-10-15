@@ -1,5 +1,8 @@
 use oxc_ast::AstKind;
-use oxc_ast::ast::{Expression, MethodDefinitionKind, PropertyKind, TSType, TSTypeName};
+use oxc_ast::ast::{
+    Argument, ArrayExpressionElement, Expression, MethodDefinitionKind, PropertyKind, TSEnumMember,
+    TSType, TSTypeName,
+};
 use oxc_syntax::operator::UnaryOperator;
 use savitar_diagnostics::{Diagnostic, Span};
 
@@ -74,6 +77,31 @@ pub static RULES: &[Rule] = &[
         id: "no-with",
         reason: "`with` makes every name in its body unresolvable at build time",
         run: no_with,
+    },
+    Rule {
+        id: "no-sparse-array",
+        reason: "a hole reads back as `undefined` where the type promises an element, and the engine wants a dense array",
+        run: no_sparse_array,
+    },
+    Rule {
+        id: "no-array-constructor-length",
+        reason: "`new Array(n)` builds an array of holes, just like a sparse literal",
+        run: no_array_constructor_length,
+    },
+    Rule {
+        id: "no-import-equals",
+        reason: "a legacy CommonJS form escapes the ESM module graph the closed world must see",
+        run: no_import_equals,
+    },
+    Rule {
+        id: "no-export-assignment",
+        reason: "a legacy interoperability export is not an ESM module the closed world can see",
+        run: no_export_assignment,
+    },
+    Rule {
+        id: "no-numeric-enum",
+        reason: "the reverse mapping types `E[k]` as `string` but returns `undefined` for a key that is not there",
+        run: no_numeric_enum,
     },
 ];
 
@@ -342,5 +370,104 @@ fn no_arguments(kind: AstKind<'_>) -> Option<Diagnostic> {
             "`arguments` ignores the parameter list the signature declares",
         )
         .with_help("declare a rest parameter"),
+    )
+}
+
+fn no_sparse_array(kind: AstKind<'_>) -> Option<Diagnostic> {
+    let AstKind::ArrayExpression(node) = kind else {
+        return None;
+    };
+    if !node
+        .elements
+        .iter()
+        .any(|element| matches!(element, ArrayExpressionElement::Elision(_)))
+    {
+        return None;
+    }
+    Some(
+        Diagnostic::error(
+            "no-sparse-array",
+            span_of(node.span),
+            "an elided element reads back as `undefined` where the type promises an element",
+        )
+        .with_help("write every element out, or build the array with `map` over a dense source"),
+    )
+}
+
+fn no_array_constructor_length(kind: AstKind<'_>) -> Option<Diagnostic> {
+    let span = new_callee_is(kind, "Array")?;
+    let AstKind::NewExpression(node) = kind else {
+        return None;
+    };
+    let [only] = node.arguments.as_slice() else {
+        return None;
+    };
+    if matches!(only, Argument::SpreadElement(_)) {
+        return None;
+    }
+    Some(
+        Diagnostic::error(
+            "no-array-constructor-length",
+            span,
+            "`new Array(n)` builds an array of holes, just like a sparse literal",
+        )
+        .with_help("list the elements, or fill the length with `Array.from({ length: n }, ...)`"),
+    )
+}
+
+fn no_import_equals(kind: AstKind<'_>) -> Option<Diagnostic> {
+    let AstKind::TSImportEqualsDeclaration(node) = kind else {
+        return None;
+    };
+    Some(
+        Diagnostic::error(
+            "no-import-equals",
+            span_of(node.span),
+            "`import x = ...` is a legacy form outside the ESM module graph",
+        )
+        .with_help("use an ESM `import` declaration"),
+    )
+}
+
+fn no_export_assignment(kind: AstKind<'_>) -> Option<Diagnostic> {
+    let AstKind::TSExportAssignment(node) = kind else {
+        return None;
+    };
+    Some(
+        Diagnostic::error(
+            "no-export-assignment",
+            span_of(node.span),
+            "`export = x` is a legacy interoperability export, not an ESM module",
+        )
+        .with_help("use `export default x`, or named exports"),
+    )
+}
+
+fn enum_member_has_string_literal_initializer(member: &TSEnumMember<'_>) -> bool {
+    matches!(member.initializer, Some(Expression::StringLiteral(_)))
+}
+
+fn no_numeric_enum(kind: AstKind<'_>) -> Option<Diagnostic> {
+    let AstKind::TSEnumDeclaration(node) = kind else {
+        return None;
+    };
+    if node.r#const {
+        return None;
+    }
+    if node
+        .body
+        .members
+        .iter()
+        .all(enum_member_has_string_literal_initializer)
+    {
+        return None;
+    }
+    Some(
+        Diagnostic::error(
+            "no-numeric-enum",
+            span_of(node.span),
+            "the reverse mapping of a numeric enum types `E[k]` as `string` but returns `undefined` for a key that is not there",
+        )
+        .with_help("use `const enum`, or give every member a string literal initializer"),
     )
 }

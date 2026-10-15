@@ -209,6 +209,74 @@ fn arguments_is_rejected_and_rest_parameters_are_not() {
 }
 
 #[test]
+fn sparse_array_literal_is_rejected_but_dense_one_is_not() {
+    assert_eq!(rules_fired("const xs = [1, , 3];"), vec!["no-sparse-array"]);
+    assert!(rules_fired("const xs = [1, 2, 3];").is_empty());
+    assert!(rules_fired("const xs = [1, 2, 3,];").is_empty());
+    assert!(rules_fired("const xs = [...ys, 3];").is_empty());
+}
+
+#[test]
+fn array_constructor_with_one_argument_is_rejected() {
+    assert_eq!(
+        rules_fired("const xs = new Array(n);"),
+        vec!["no-array-constructor-length"]
+    );
+    assert_eq!(
+        rules_fired("const xs = new Array(8);"),
+        vec!["no-array-constructor-length"]
+    );
+}
+
+#[test]
+fn array_constructor_with_two_arguments_is_accepted() {
+    assert!(rules_fired("const xs = new Array(1, 2);").is_empty());
+    assert!(rules_fired("const xs = new Array();").is_empty());
+    assert!(rules_fired("const xs = new Array(...ys);").is_empty());
+}
+
+#[test]
+fn import_equals_is_rejected_and_esm_import_is_not() {
+    assert_eq!(
+        rules_fired("import fs = require('fs');"),
+        vec!["no-import-equals"]
+    );
+    assert!(rules_fired("import { readFile } from './fs.ts';").is_empty());
+}
+
+#[test]
+fn export_assignment_is_rejected_and_esm_export_is_not() {
+    assert_eq!(
+        rules_fired("export = handler;"),
+        vec!["no-export-assignment"]
+    );
+    assert!(rules_fired("export default handler;").is_empty());
+}
+
+#[test]
+fn numeric_enum_is_rejected() {
+    assert_eq!(
+        rules_fired("enum Color { Red, Green }"),
+        vec!["no-numeric-enum"]
+    );
+    assert_eq!(
+        rules_fired("enum Color { Red = 1, Green = 2 }"),
+        vec!["no-numeric-enum"]
+    );
+    assert_eq!(
+        rules_fired("enum Color { Red = 'r', Green = 2 }"),
+        vec!["no-numeric-enum"]
+    );
+}
+
+#[test]
+fn const_enum_and_string_enum_are_accepted() {
+    assert!(rules_fired("const enum Color { Red }").is_empty());
+    assert!(rules_fired("enum Name { A = \"a\" }").is_empty());
+    assert!(rules_fired("const enum Color { Red = 1, Green = 2 }").is_empty());
+}
+
+#[test]
 fn every_rule_has_a_reason_and_a_unique_id() {
     let mut ids: Vec<&str> = savitar_sound::RULES.iter().map(|rule| rule.id).collect();
     let total = ids.len();
