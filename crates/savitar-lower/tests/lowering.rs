@@ -216,3 +216,182 @@ fn an_object_literal_lowers_to_a_shape_built_from_its_values() {
     let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
     assert_eq!(names, vec!["count", "label"]);
 }
+
+#[test]
+fn a_value_that_differs_between_branches_arrives_as_a_block_parameter() {
+    let source = "function pick(flag: boolean, left: number, right: number): number {\n  let chosen = left;\n  if (flag) {\n    chosen = right;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1, "exactly one join should take a parameter");
+    let (join, block) = &joins[0];
+    assert_eq!(block.parameters.len(), 1);
+
+    let Terminator::Return(Some(returned)) = block.terminator else {
+        panic!("the join should return, got {:?}", block.terminator);
+    };
+    assert_eq!(
+        returned, block.parameters[0],
+        "the returned value must be the parameter the branches carry in"
+    );
+
+    let arguments: Vec<usize> = function
+        .blocks()
+        .filter_map(|(_, candidate)| match &candidate.terminator {
+            Terminator::Jump { target, arguments } if target == join => Some(arguments.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arguments, vec![1, 1], "both arms must pass one argument");
+}
+
+#[test]
+fn a_value_untouched_by_the_branches_needs_no_parameter() {
+    let source = "function keep(flag: boolean, value: number): number {\n  const held = value;\n  if (flag) {\n    const ignored = value;\n  }\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("keep.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .all(|(_, block)| block.parameters.is_empty()),
+        "nothing changed across the branches, so no join parameter is needed"
+    );
+}
+
+#[test]
+fn a_branch_that_returns_does_not_feed_the_join() {
+    let source = "function guard(flag: boolean, value: number): number {\n  let held = value;\n  if (flag) {\n    return value;\n  } else {\n    held = value;\n  }\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("guard.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .all(|(_, block)| block.parameters.is_empty()),
+        "only one arm reaches the join, so its values flow straight through"
+    );
+    let returns = function
+        .blocks()
+        .filter(|(_, block)| matches!(block.terminator, Terminator::Return(_)))
+        .count();
+    assert_eq!(returns, 2, "both the guard and the tail return");
+}
+
+#[test]
+fn both_branches_returning_leaves_no_join_at_all() {
+    let source = "function always(flag: boolean, value: number): number {\n  if (flag) {\n    return value;\n  } else {\n    return value;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("always.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.block_count(),
+        3,
+        "entry plus two arms, and no join to jump to"
+    );
+}
+
+#[test]
+fn a_name_that_leaves_the_branches_with_two_types_is_refused() {
+    let source = "function mixed(flag: boolean, left: number, right: string): void {\n  let held = left;\n  if (flag) {\n    held = right;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("mixed.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("two different types"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn assigning_to_an_unbound_name_is_refused() {
+    let source = "function stray(value: number): void {\n  missing = value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("value", Answer::Known(number))]);
+    let file = SourceFile::new("stray.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+}

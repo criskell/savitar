@@ -4,15 +4,16 @@ use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, Expression, FunctionBody, ObjectPropertyKind,
+    Argument, AssignmentTarget, BindingPattern, Expression, FunctionBody, ObjectPropertyKind,
     Statement as AstStatement, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use oxc_syntax::operator::{BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 use savitar_diagnostics::{Diagnostic, SourceFile, Span};
 use savitar_ir::{
-    BinaryOp, Block, Constant, Function, Rvalue, Statement, Terminator, UnaryOp, ValueId, verify,
+    BinaryOp, Block, BlockId, Constant, Function, Rvalue, Statement, Terminator, UnaryOp, ValueId,
+    verify,
 };
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
@@ -25,11 +26,20 @@ pub struct LowerReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+type Scope = HashMap<String, ValueId>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Continues,
+    Returned,
+}
+
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
-    scope: HashMap<String, ValueId>,
+    scope: Scope,
     statements: Vec<Statement>,
+    current: BlockId,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -81,6 +91,14 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
     }
 }
 
+fn empty_block() -> Block {
+    Block {
+        parameters: Vec::new(),
+        statements: Vec::new(),
+        terminator: Terminator::Unreachable,
+    }
+}
+
 fn lower_function(
     file: &SourceFile,
     provider: &dyn TypeProvider,
@@ -90,11 +108,13 @@ fn lower_function(
     body: &FunctionBody<'_>,
 ) -> Result<Function, Vec<Diagnostic>> {
     let mut function = Function::new(name);
+    let entry = function.add_block(empty_block());
     let mut context = Context {
         file,
         provider,
-        scope: HashMap::new(),
+        scope: Scope::new(),
         statements: Vec::new(),
+        current: entry,
     };
 
     for parameter in &declaration.params.items {
@@ -110,36 +130,10 @@ fn lower_function(
         context.scope.insert(id.name.to_string(), value);
     }
 
-    let mut returned = None;
-    for statement in &body.statements {
-        match statement {
-            AstStatement::VariableDeclaration(declaration) => {
-                for declarator in &declaration.declarations {
-                    context.lower_declarator(table, &mut function, declarator)?;
-                }
-            }
-            AstStatement::ReturnStatement(statement) => {
-                let Some(argument) = &statement.argument else {
-                    break;
-                };
-                returned = Some(context.lower_expression(table, &mut function, argument)?);
-                break;
-            }
-            other => {
-                return Err(vec![refuse(
-                    "unsupported-statement",
-                    statement_span(other),
-                    "only declarations and a final return are lowered yet",
-                )]);
-            }
-        }
+    let flow = context.lower_statements(table, &mut function, &body.statements)?;
+    if flow == Flow::Continues {
+        context.seal(&mut function, Terminator::Return(None));
     }
-
-    function.add_block(Block {
-        parameters: Vec::new(),
-        statements: context.statements,
-        terminator: Terminator::Return(returned),
-    });
 
     let malformations = verify(&function);
     if !malformations.is_empty() {
@@ -189,6 +183,197 @@ impl Context<'_> {
             span: span_of(span),
         });
         target
+    }
+
+    fn seal(&mut self, function: &mut Function, terminator: Terminator) {
+        let block = function.block_mut(self.current);
+        block.statements = std::mem::take(&mut self.statements);
+        block.terminator = terminator;
+    }
+
+    fn lower_statements(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statements: &[AstStatement<'_>],
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        for statement in statements {
+            match self.lower_statement(table, function, statement)? {
+                Flow::Continues => {}
+                Flow::Returned => return Ok(Flow::Returned),
+            }
+        }
+        Ok(Flow::Continues)
+    }
+
+    fn lower_statement(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &AstStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        match statement {
+            AstStatement::VariableDeclaration(declaration) => {
+                for declarator in &declaration.declarations {
+                    self.lower_declarator(table, function, declarator)?;
+                }
+                Ok(Flow::Continues)
+            }
+            AstStatement::ExpressionStatement(statement) => {
+                self.lower_effect(table, function, &statement.expression)?;
+                Ok(Flow::Continues)
+            }
+            AstStatement::ReturnStatement(statement) => {
+                let returned = match &statement.argument {
+                    Some(argument) => Some(self.lower_expression(table, function, argument)?),
+                    None => None,
+                };
+                self.seal(function, Terminator::Return(returned));
+                Ok(Flow::Returned)
+            }
+            AstStatement::BlockStatement(block) => {
+                self.lower_statements(table, function, &block.body)
+            }
+            AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
+            other => Err(vec![refuse(
+                "unsupported-statement",
+                statement_span(other),
+                "this statement is not lowered yet",
+            )]),
+        }
+    }
+
+    fn lower_effect(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        expression: &Expression<'_>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        use oxc_span::GetSpan;
+        let Expression::AssignmentExpression(assignment) = expression else {
+            self.lower_expression(table, function, expression)?;
+            return Ok(());
+        };
+        if assignment.operator != AssignmentOperator::Assign {
+            return Err(vec![refuse(
+                "unsupported-operator",
+                assignment.span,
+                "a compound assignment is not lowered yet",
+            )]);
+        }
+        let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left else {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                assignment.span(),
+                "only assignment to a plain name is lowered yet",
+            )]);
+        };
+        if !self.scope.contains_key(id.name.as_str()) {
+            return Err(vec![refuse(
+                "unsupported-reference",
+                id.span,
+                format!("`{}` is not bound in this function", id.name),
+            )]);
+        }
+        let value = self.lower_expression(table, function, &assignment.right)?;
+        self.scope.insert(id.name.to_string(), value);
+        Ok(())
+    }
+
+    fn lower_if(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::IfStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let condition = self.lower_expression(table, function, &statement.test)?;
+        let before = self.scope.clone();
+
+        let then_entry = function.add_block(empty_block());
+        let else_entry = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition,
+                then_block: then_entry,
+                then_arguments: Vec::new(),
+                else_block: else_entry,
+                else_arguments: Vec::new(),
+            },
+        );
+
+        self.current = then_entry;
+        self.scope = before.clone();
+        let then_flow = self.lower_statement(table, function, &statement.consequent)?;
+        let then_exit = self.current;
+        let then_scope = std::mem::replace(&mut self.scope, before.clone());
+
+        self.current = else_entry;
+        let else_flow = match &statement.alternate {
+            Some(alternate) => self.lower_statement(table, function, alternate)?,
+            None => Flow::Continues,
+        };
+        let else_exit = self.current;
+        let else_scope = std::mem::take(&mut self.scope);
+
+        if then_flow == Flow::Returned && else_flow == Flow::Returned {
+            self.scope = before;
+            return Ok(Flow::Returned);
+        }
+
+        let join = function.add_block(empty_block());
+        let mut parameters = Vec::new();
+        let mut then_arguments = Vec::new();
+        let mut else_arguments = Vec::new();
+        let mut merged = before.clone();
+
+        if then_flow == Flow::Continues && else_flow == Flow::Continues {
+            let mut names: Vec<&String> = before.keys().collect();
+            names.sort();
+            for name in names {
+                let from_then = then_scope[name];
+                let from_else = else_scope[name];
+                if from_then == from_else {
+                    merged.insert(name.clone(), from_then);
+                    continue;
+                }
+                if function.type_of(from_then) != function.type_of(from_else) {
+                    return Err(vec![refuse(
+                        "unsupported-statement",
+                        statement.span,
+                        format!("`{name}` leaves the branches with two different types"),
+                    )]);
+                }
+                let parameter = function.fresh_value(function.type_of(from_then));
+                parameters.push(parameter);
+                then_arguments.push(from_then);
+                else_arguments.push(from_else);
+                merged.insert(name.clone(), parameter);
+            }
+        } else if then_flow == Flow::Continues {
+            merged = then_scope;
+        } else {
+            merged = else_scope;
+        }
+
+        function.block_mut(join).parameters = parameters;
+        if then_flow == Flow::Continues {
+            function.block_mut(then_exit).terminator = Terminator::Jump {
+                target: join,
+                arguments: then_arguments,
+            };
+        }
+        if else_flow == Flow::Continues {
+            function.block_mut(else_exit).terminator = Terminator::Jump {
+                target: join,
+                arguments: else_arguments,
+            };
+        }
+
+        self.scope = merged;
+        self.current = join;
+        self.statements.clear();
+        Ok(Flow::Continues)
     }
 
     fn lower_declarator(
