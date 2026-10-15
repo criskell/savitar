@@ -22,6 +22,9 @@ pub enum TypeKind {
     String,
     Symbol,
     Unknown,
+    StringLiteral(String),
+    NumberLiteral(u64),
+    BooleanLiteral(bool),
     Array(TypeId),
     Union(Vec<TypeId>),
     Nominal(NominalId),
@@ -88,6 +91,10 @@ impl TypeTable {
             1 => members[0],
             _ => self.intern(TypeKind::Union(members)),
         }
+    }
+
+    pub fn number_literal(&mut self, value: f64) -> TypeId {
+        self.intern(TypeKind::NumberLiteral(value.to_bits()))
     }
 
     pub fn optional(&mut self, inner: TypeId) -> TypeId {
