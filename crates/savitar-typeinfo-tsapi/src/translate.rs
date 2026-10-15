@@ -5,6 +5,9 @@ use crate::flags::TypeFlags;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Classified {
     Primitive(TypeKind),
+    StringLiteral,
+    NumberLiteral,
+    BooleanLiteral,
     Union,
     Object,
     Unsupported(&'static str),
@@ -38,22 +41,20 @@ pub fn classify(flags: TypeFlags) -> Classified {
         }
     }
 
+    for (flag, classified) in [
+        (TypeFlags::STRING_LITERAL, Classified::StringLiteral),
+        (TypeFlags::NUMBER_LITERAL, Classified::NumberLiteral),
+        (TypeFlags::BOOLEAN_LITERAL, Classified::BooleanLiteral),
+    ] {
+        if flags.has(flag) {
+            return classified;
+        }
+    }
+
     for (flag, reason) in [
         (
-            TypeFlags::STRING_LITERAL,
-            "literal types are not modelled yet",
-        ),
-        (
-            TypeFlags::NUMBER_LITERAL,
-            "literal types are not modelled yet",
-        ),
-        (
             TypeFlags::BIG_INT_LITERAL,
-            "literal types are not modelled yet",
-        ),
-        (
-            TypeFlags::BOOLEAN_LITERAL,
-            "literal types are not modelled yet",
+            "bigint literals are not modelled yet",
         ),
         (
             TypeFlags::UNIQUE_ES_SYMBOL,
@@ -162,6 +163,22 @@ mod tests {
     }
 
     #[test]
+    fn literal_types_are_modelled() {
+        assert_eq!(
+            classify(TypeFlags::STRING_LITERAL),
+            Classified::StringLiteral
+        );
+        assert_eq!(
+            classify(TypeFlags::NUMBER_LITERAL),
+            Classified::NumberLiteral
+        );
+        assert_eq!(
+            classify(TypeFlags::BOOLEAN_LITERAL),
+            Classified::BooleanLiteral
+        );
+    }
+
+    #[test]
     fn hard_type_level_constructs_are_unsupported_not_guessed() {
         for flag in [
             TypeFlags::CONDITIONAL,
@@ -170,7 +187,7 @@ mod tests {
             TypeFlags::TEMPLATE_LITERAL,
             TypeFlags::INTERSECTION,
             TypeFlags::TYPE_PARAMETER,
-            TypeFlags::STRING_LITERAL,
+            TypeFlags::BIG_INT_LITERAL,
         ] {
             assert!(
                 matches!(classify(flag), Classified::Unsupported(_)),
