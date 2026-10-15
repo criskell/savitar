@@ -110,6 +110,9 @@ fn decide(
             if !type_parameters.is_empty() || !wanted_parameters.is_empty() {
                 return false;
             }
+            if parameters.iter().chain(wanted.iter()).any(|one| one.rest) {
+                return parameters == wanted;
+            }
             if parameters.len() > wanted.len() {
                 return false;
             }

@@ -56,6 +56,7 @@ const SOURCE: &str = concat!(
     "declare const labelled: Labelled;\n",
     "declare const pending: Promise<number>;\n",
     "declare const asyncFn: () => Promise<string>;\n",
+    "declare const joinAll: (first: string, ...rest: string[]) => string;\n",
     "declare const frozen: { x: number; readonly y: string };\n",
     "declare const frozenDict: { readonly [k: string]: number };\n",
     "declare const mappedFrozen: Readonly<{ p: number }>;\n",
@@ -321,8 +322,14 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let boolean = table.intern(TypeKind::Boolean);
     let expected = table.function(
         vec![
-            Parameter { type_id: number },
-            Parameter { type_id: text_kind },
+            Parameter {
+                type_id: number,
+                rest: false,
+            },
+            Parameter {
+                type_id: text_kind,
+                rest: false,
+            },
         ],
         boolean,
     );
@@ -362,7 +369,13 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         .expect("the plain field should be present");
     assert!(!value.method, "`value` must not be marked a method");
     let void = table.intern(TypeKind::Void);
-    let run_signature = table.function(vec![Parameter { type_id: boolean }], void);
+    let run_signature = table.function(
+        vec![Parameter {
+            type_id: boolean,
+            rest: false,
+        }],
+        void,
+    );
     assert_eq!(run.type_id, run_signature);
 
     let merged = api.type_at(&mut table, path, Span::new(position_of("merged"), 0));
@@ -1044,6 +1057,59 @@ fn a_readonly_index_signature_arrives_readonly() {
     assert!(
         !assignable(&table, frozen, mutable),
         "a readonly index signature must not pass for a mutable one, or a write would reach it"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_rest_parameter_is_marked_as_one() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let signature = api.type_at(&mut table, path, Span::new(position_of("joinAll"), 0));
+    let Answer::Known(signature) = signature else {
+        panic!("expected a known type for `joinAll`, got {signature:?}");
+    };
+    let TypeKind::Function { parameters, .. } = table.kind(signature).clone() else {
+        panic!("expected a function, got {:?}", table.kind(signature));
+    };
+    let text = table.intern(TypeKind::String);
+    let texts = table.intern(TypeKind::Array(text));
+    assert_eq!(
+        parameters,
+        vec![
+            Parameter {
+                type_id: text,
+                rest: false
+            },
+            Parameter {
+                type_id: texts,
+                rest: true
+            },
+        ],
+        "the rest parameter keeps the array type it declares and says it is a rest"
+    );
+
+    let plain = api.type_at(&mut table, path, Span::new(position_of("fn"), 0));
+    let Answer::Known(plain) = plain else {
+        panic!("expected a known type for `fn`, got {plain:?}");
+    };
+    let TypeKind::Function { parameters, .. } = table.kind(plain).clone() else {
+        panic!("expected a function, got {:?}", table.kind(plain));
+    };
+    assert!(
+        parameters.iter().all(|parameter| !parameter.rest),
+        "a signature with no rest parameter marks none"
     );
 
     std::fs::remove_dir_all(&project).ok();

@@ -10,7 +10,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
-use crate::flags::{ObjectFlags, SymbolFlags, TypeFlags};
+use crate::flags::{ObjectFlags, SignatureFlags, SymbolFlags, TypeFlags};
 use crate::translate::{Classified, classify, describe};
 
 const MAX_TYPE_DEPTH: u32 = 32;
@@ -468,8 +468,15 @@ impl TsApi {
             return Answer::Unsupported("getParametersOfSignature returned no array".into());
         };
 
+        let signature_flags = signature
+            .get("flags")
+            .and_then(Value::as_u64)
+            .map(|bits| SignatureFlags(u32::try_from(bits).unwrap_or(0)))
+            .unwrap_or_default();
+        let last = parameters.len().saturating_sub(1);
+
         let mut interned = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
+        for (position, parameter) in parameters.iter().enumerate() {
             let Some(reference) = parameter.get("reference") else {
                 return Answer::Unsupported("a parameter with no symbol reference".into());
             };
@@ -477,8 +484,9 @@ impl TsApi {
                 Ok(parameter_type) => parameter_type,
                 Err(error) => return Answer::Unsupported(error.to_string()),
             };
+            let rest = position == last && signature_flags.has(SignatureFlags::HAS_REST_PARAMETER);
             match self.intern_response(table, &parameter_type, depth + 1) {
-                Answer::Known(type_id) => interned.push(Parameter { type_id }),
+                Answer::Known(type_id) => interned.push(Parameter { type_id, rest }),
                 other => return other,
             }
         }

@@ -26,6 +26,7 @@ pub struct Field {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Parameter {
     pub type_id: TypeId,
+    pub rest: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -416,8 +417,20 @@ mod tests {
         let mut table = TypeTable::new();
         let number = table.intern(TypeKind::Number);
         let text = table.intern(TypeKind::String);
-        let from_number = table.function(vec![Parameter { type_id: number }], number);
-        let from_text = table.function(vec![Parameter { type_id: text }], number);
+        let from_number = table.function(
+            vec![Parameter {
+                type_id: number,
+                rest: false,
+            }],
+            number,
+        );
+        let from_text = table.function(
+            vec![Parameter {
+                type_id: text,
+                rest: false,
+            }],
+            number,
+        );
         assert_eq!(table.overloaded(vec![from_number]), from_number);
         assert_ne!(
             table.overloaded(vec![from_number, from_text]),
@@ -440,10 +453,19 @@ mod tests {
     fn a_generic_function_differs_from_the_same_shape_without_parameters() {
         let mut table = TypeTable::new();
         let parameter = table.fresh_type_parameter();
-        let plain = table.function(vec![Parameter { type_id: parameter }], parameter);
+        let plain = table.function(
+            vec![Parameter {
+                type_id: parameter,
+                rest: false,
+            }],
+            parameter,
+        );
         let generic = table.generic_function(
             vec![parameter],
-            vec![Parameter { type_id: parameter }],
+            vec![Parameter {
+                type_id: parameter,
+                rest: false,
+            }],
             parameter,
         );
         assert_ne!(plain, generic);
@@ -455,8 +477,14 @@ mod tests {
         let number = table.intern(TypeKind::Number);
         let text = table.intern(TypeKind::String);
         let void = table.intern(TypeKind::Void);
-        let left = Parameter { type_id: number };
-        let right = Parameter { type_id: text };
+        let left = Parameter {
+            type_id: number,
+            rest: false,
+        };
+        let right = Parameter {
+            type_id: text,
+            rest: false,
+        };
         assert_ne!(
             table.function(vec![left.clone(), right.clone()], void),
             table.function(vec![right, left], void)
@@ -811,12 +839,18 @@ mod tests {
         let zero = table.number_literal(0.0);
         let wide = table.intern(TypeKind::Function {
             type_parameters: Vec::new(),
-            parameters: vec![Parameter { type_id: maybe }],
+            parameters: vec![Parameter {
+                type_id: maybe,
+                rest: false,
+            }],
             returns: zero,
         });
         let narrow = table.intern(TypeKind::Function {
             type_parameters: Vec::new(),
-            parameters: vec![Parameter { type_id: number }],
+            parameters: vec![Parameter {
+                type_id: number,
+                rest: false,
+            }],
             returns: number,
         });
 

@@ -711,7 +711,13 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
     let source = "function call(value: number): number {\n  return helper(value);\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
-    let helper = table.function(vec![savitar_types::Parameter { type_id: number }], number);
+    let helper = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+        }],
+        number,
+    );
     let provider = ByName::new(
         source,
         vec![
@@ -739,6 +745,204 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
             )),
         "the free name should become a global read, not a refusal"
     );
+}
+
+fn one_parameter(table: &mut TypeTable, takes: savitar_types::TypeId) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    table.function(
+        vec![savitar_types::Parameter {
+            type_id: takes,
+            rest: false,
+        }],
+        number,
+    )
+}
+
+#[test]
+fn an_argument_the_parameter_does_not_admit_is_refused() {
+    let source = "function call(label: string): number {\n  return helper(label);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let helper = one_parameter(&mut table, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("label", Answer::Known(text)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
+}
+
+#[test]
+fn a_call_that_leaves_out_an_argument_is_refused_because_the_minimum_arity_is_unknown() {
+    let source = "function call(): number {\n  return helper();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let helper = one_parameter(&mut table, maybe);
+    let provider = ByName::new(source, vec![("helper", Answer::Known(helper))]);
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("leaves out"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_call_with_more_arguments_than_the_signature_takes_is_refused() {
+    let source = "function call(value: number): number {\n  return helper(value, value);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let helper = one_parameter(&mut table, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("value", Answer::Known(number)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("more arguments"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_object_literal_argument_is_typed_by_the_parameter_it_is_passed_to() {
+    let source = "function call(): number {\n  return helper({ x: 1 });\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let helper = one_parameter(&mut table, point);
+    let provider = ByName::new(source, vec![("helper", Answer::Known(helper))]);
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let passed = function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::NewObject { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the literal should be built");
+    assert_eq!(function.type_of(passed), point);
+}
+
+#[test]
+fn a_rest_parameter_takes_every_argument_past_the_fixed_ones() {
+    let source =
+        "function call(label: string): number {\n  return joinAll(label, label, label);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let texts = table.intern(TypeKind::Array(text));
+    let join_all = table.function(
+        vec![
+            savitar_types::Parameter {
+                type_id: text,
+                rest: false,
+            },
+            savitar_types::Parameter {
+                type_id: texts,
+                rest: true,
+            },
+        ],
+        number,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("label", Answer::Known(text)),
+            ("joinAll", Answer::Known(join_all)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::Assign {
+        value: Rvalue::Call { arguments, .. },
+        ..
+    }) = only_block(function).statements.iter().find(|statement| {
+        matches!(
+            statement,
+            Statement::Assign {
+                value: Rvalue::Call { .. },
+                ..
+            }
+        )
+    })
+    else {
+        panic!("expected a call");
+    };
+    assert_eq!(arguments.len(), 3);
+}
+
+#[test]
+fn a_rest_argument_the_element_type_does_not_admit_is_refused() {
+    let source = "function call(label: string, count: number): number {\n  return joinAll(label, count);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let texts = table.intern(TypeKind::Array(text));
+    let join_all = table.function(
+        vec![
+            savitar_types::Parameter {
+                type_id: text,
+                rest: false,
+            },
+            savitar_types::Parameter {
+                type_id: texts,
+                rest: true,
+            },
+        ],
+        number,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("label", Answer::Known(text)),
+            ("count", Answer::Known(number)),
+            ("joinAll", Answer::Known(join_all)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
 }
 
 #[test]

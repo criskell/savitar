@@ -260,6 +260,45 @@ pub fn call_result(table: &TypeTable, callee: TypeId) -> Result<TypeId, String> 
     }
 }
 
+pub fn argument_types(
+    table: &TypeTable,
+    callee: TypeId,
+    given: usize,
+) -> Result<Vec<TypeId>, String> {
+    let TypeKind::Function { parameters, .. } = table.kind(callee) else {
+        return Err("this value is not callable".to_string());
+    };
+    let rest = parameters.last().filter(|parameter| parameter.rest);
+    let fixed = parameters.len() - usize::from(rest.is_some());
+    if given < fixed {
+        return Err(
+            "a call that leaves out an argument is not lowered yet, because the declaration does not say which parameters may be left out"
+                .to_string(),
+        );
+    }
+    let Some(rest) = rest else {
+        if given > parameters.len() {
+            return Err("this call passes more arguments than the signature takes".to_string());
+        }
+        return Ok(parameters
+            .iter()
+            .take(given)
+            .map(|parameter| parameter.type_id)
+            .collect());
+    };
+    let (TypeKind::Array(element) | TypeKind::ReadonlyArray(element)) = table.kind(rest.type_id)
+    else {
+        return Err("a rest parameter whose type is not an array is not lowered yet".to_string());
+    };
+    let mut wanted: Vec<TypeId> = parameters
+        .iter()
+        .take(fixed)
+        .map(|parameter| parameter.type_id)
+        .collect();
+    wanted.resize(given, *element);
+    Ok(wanted)
+}
+
 pub fn widen(table: &mut TypeTable, id: TypeId) -> TypeId {
     match table.kind(id).clone() {
         TypeKind::NumberLiteral(_) => table.intern(TypeKind::Number),

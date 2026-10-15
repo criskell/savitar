@@ -68,3 +68,15 @@ impl SymbolFlags {
         self.0 & other.0 != 0
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SignatureFlags(pub u32);
+
+impl SignatureFlags {
+    pub const HAS_REST_PARAMETER: Self = Self(1 << 0);
+
+    #[must_use]
+    pub const fn has(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
