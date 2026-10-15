@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::SourceFile;
+use savitar_lower::lower;
 use savitar_sound::{Coverage, check_types};
 use savitar_typeinfo_tsapi::TsApi;
 use savitar_types::TypeTable;
@@ -32,6 +33,10 @@ fn corpus_files(corpus: &Path) -> Vec<PathBuf> {
 
 fn floor_path(corpus: &Path) -> PathBuf {
     corpus.join("coverage-floor.txt")
+}
+
+fn lowering_floor_path(corpus: &Path) -> PathBuf {
+    corpus.join("lowering-floor.txt")
 }
 
 struct Measured {
@@ -71,19 +76,15 @@ fn measure(directory: &Path, binary: &OsString) -> Measured {
 }
 
 fn assert_ratchet(directory: &Path, measured: &Measured, counted: usize) {
-    let floor: usize = std::fs::read_to_string(floor_path(directory))
+    assert_floor(&floor_path(directory), measured, counted);
+}
+
+fn assert_floor(floor_file: &Path, measured: &Measured, counted: usize) {
+    let floor: usize = std::fs::read_to_string(floor_file)
         .expect("the floor should be recorded")
         .trim()
         .parse()
         .expect("the floor should be a whole number");
-
-    assert_eq!(
-        measured.coverage.out_of_scope,
-        0,
-        "the provider answered nothing for {} bindings; the gaps are:\n{}",
-        measured.coverage.out_of_scope,
-        measured.gaps.join("\n")
-    );
 
     assert!(
         counted >= floor,
@@ -96,9 +97,49 @@ fn assert_ratchet(directory: &Path, measured: &Measured, counted: usize) {
         panic!(
             "the ratchet rose from {floor} to {counted} of {}.\nRaise it: echo {counted} > {}",
             measured.coverage.total(),
-            floor_path(directory).display()
+            floor_file.display()
         );
     }
+}
+
+fn assert_every_binding_is_answered(measured: &Measured) {
+    assert_eq!(
+        measured.coverage.out_of_scope,
+        0,
+        "the provider answered nothing for {} bindings; the gaps are:\n{}",
+        measured.coverage.out_of_scope,
+        measured.gaps.join("\n")
+    );
+}
+
+fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
+    let files = corpus_files(directory);
+    let open: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+    let api = TsApi::start(binary, directory, &open).expect("the provider should start");
+    let mut table = TypeTable::new();
+    let mut coverage = Coverage::default();
+    let mut gaps: Vec<String> = Vec::new();
+
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("the file should be readable");
+        let name = path.to_str().expect("utf-8 path").to_string();
+        let file = SourceFile::new(name, text);
+        let report = lower(&file, &api, &mut table);
+        coverage.known += report.functions.len();
+        coverage.unsupported += report.diagnostics.len();
+        for diagnostic in &report.diagnostics {
+            let at = file.line_col(diagnostic.span.start);
+            gaps.push(format!(
+                "{}:{}:{} {}",
+                file.name(),
+                at.line,
+                at.column,
+                diagnostic.message
+            ));
+        }
+    }
+
+    Measured { coverage, gaps }
 }
 
 #[test]
@@ -111,10 +152,28 @@ fn type_coverage_of_the_corpus_never_falls() {
     };
 
     let measured = measure(&corpus, &binary);
+    assert_every_binding_is_answered(&measured);
     assert_ratchet(
         &corpus,
         &measured,
         measured.coverage.percent_known() as usize,
+    );
+}
+
+#[test]
+fn the_number_of_functions_lowered_never_falls() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = lower_corpus(&corpus, &binary);
+    assert_floor(
+        &lowering_floor_path(&corpus),
+        &measured,
+        measured.coverage.known,
     );
 }
 
@@ -128,5 +187,6 @@ fn the_number_of_standard_library_types_reached_never_falls() {
     };
 
     let measured = measure(&surface, &binary);
+    assert_every_binding_is_answered(&measured);
     assert_ratchet(&surface, &measured, measured.coverage.known);
 }
