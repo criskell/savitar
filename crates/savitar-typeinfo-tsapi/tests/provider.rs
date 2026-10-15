@@ -39,6 +39,7 @@ const SOURCE: &str = concat!(
     "declare const mixed: { a: number; [k: string]: number };\n",
     "declare const fn: (a: number, b: string) => boolean;\n",
     "declare const loose: (a?: number) => void;\n",
+    "declare const explicitUndef: (a: number | undefined) => void;\n",
     "declare const obj: { value: number; run(flag: boolean): void };\n",
     "declare function firstOf<T>(items: readonly T[]): T | undefined;\n",
     "declare function pick<K, V>(k: K, v: V): V;\n",
@@ -301,10 +302,17 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     assert_eq!(function, expected, "a function type must keep its shape");
 
     let loose = api.type_at(&mut table, path, Span::new(position_of("loose"), 0));
-    let Answer::Unsupported(reason) = loose else {
-        panic!("an optional parameter must not be guessed, got {loose:?}");
+    let Answer::Known(loose) = loose else {
+        panic!("an optional parameter is modelled by its type, got {loose:?}");
     };
-    assert!(reason.contains("optional"), "unexpected: {reason}");
+    let explicit = api.type_at(&mut table, path, Span::new(position_of("explicitUndef"), 0));
+    let Answer::Known(explicit) = explicit else {
+        panic!("expected a known type for `explicitUndef`, got {explicit:?}");
+    };
+    assert_eq!(
+        loose, explicit,
+        "the API exposes no minimum arity, so `a?: T` and `a: T | undefined` collapse"
+    );
 
     let with_method = api.type_at(&mut table, path, Span::new(position_of("obj"), 0));
     let Answer::Known(with_method) = with_method else {

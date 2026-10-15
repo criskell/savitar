@@ -382,15 +382,7 @@ impl TsApi {
                 Err(error) => return Answer::Unsupported(error.to_string()),
             };
             match self.intern_response(table, &parameter_type, depth + 1) {
-                Answer::Known(type_id) => {
-                    if table.admits_undefined(type_id) {
-                        return Answer::Unsupported(
-                            "the API does not say whether a parameter that admits `undefined` is optional"
-                                .into(),
-                        );
-                    }
-                    interned.push(Parameter { type_id });
-                }
+                Answer::Known(type_id) => interned.push(Parameter { type_id }),
                 other => return other,
             }
         }
