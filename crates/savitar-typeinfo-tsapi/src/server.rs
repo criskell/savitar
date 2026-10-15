@@ -50,7 +50,8 @@ pub struct TsApi {
 }
 
 fn file_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    format!("file://{}", absolute.display())
 }
 
 impl TsApi {

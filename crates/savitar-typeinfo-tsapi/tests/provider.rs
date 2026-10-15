@@ -241,3 +241,30 @@ fn a_missing_binary_is_reported_not_guessed() {
     );
     std::fs::remove_dir_all(&project).ok();
 }
+
+#[test]
+fn a_non_canonical_path_still_reaches_the_provider() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+
+    let detoured = project.join("nowhere/../a.ts");
+    let detoured = detoured.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, detoured, Span::new(position_of("n"), 0));
+    let Answer::Known(number) = answer else {
+        panic!("a path with `..` should still resolve, got {answer:?}");
+    };
+    assert_eq!(
+        table.kind(number),
+        &TypeKind::NumberLiteral(1.0f64.to_bits())
+    );
+    std::fs::remove_dir_all(&project).ok();
+}
