@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use crate::flags::TypeFlags;
 use crate::translate::{Classified, classify};
 
+const MAX_TYPE_DEPTH: u32 = 32;
+
 #[derive(Debug)]
 pub enum TsApiError {
     Spawn(std::io::Error),
@@ -142,7 +144,46 @@ impl TsApi {
         )
     }
 
-    fn intern_response(&self, table: &mut TypeTable, response: &Value) -> Answer {
+    fn union_members(&self, object_id: u32) -> Result<Vec<Value>, TsApiError> {
+        let members = self.request(
+            "getTypesOfType",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "objectId": object_id,
+            }),
+        )?;
+        members
+            .as_array()
+            .cloned()
+            .ok_or_else(|| TsApiError::Protocol("getTypesOfType returned no array".into()))
+    }
+
+    fn intern_union(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
+        let members = match self.union_members(object_id) {
+            Ok(members) => members,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        if members.is_empty() {
+            return Answer::Unsupported("a union with no members".into());
+        }
+
+        let mut interned = Vec::with_capacity(members.len());
+        for member in &members {
+            match self.intern_response(table, member, depth + 1) {
+                Answer::Known(id) => interned.push(id),
+                other => return other,
+            }
+        }
+        Answer::Known(table.union(interned))
+    }
+
+    fn intern_response(&self, table: &mut TypeTable, response: &Value, depth: u32) -> Answer {
+        if depth > MAX_TYPE_DEPTH {
+            return Answer::Unsupported(format!(
+                "the type nests deeper than {MAX_TYPE_DEPTH} levels"
+            ));
+        }
         let Some(id) = response.get("id").and_then(Value::as_u64) else {
             return Answer::Unsupported("the checker answered without a type id".into());
         };
@@ -173,10 +214,14 @@ impl TsApi {
                 None => return Answer::Unsupported("a boolean literal with no value".into()),
             },
             Classified::Union => {
-                return Answer::Unsupported("union members are not walked yet".into());
+                let answer = self.intern_union(table, id, depth);
+                if let Answer::Known(interned) = answer {
+                    self.cache.borrow_mut().insert(id, interned);
+                }
+                return answer;
             }
             Classified::Object => {
-                return Answer::Unsupported("object shapes are not resolved yet".into());
+                return Answer::Unsupported(object_reason(response));
             }
             Classified::Unsupported(reason) => return Answer::Unsupported(reason.to_string()),
         };
@@ -193,7 +238,7 @@ impl TypeProvider for TsApi {
 
     fn type_at(&self, table: &mut TypeTable, file: &str, span: Span) -> Answer {
         match self.type_response(file, span.start) {
-            Ok(response) => self.intern_response(table, &response),
+            Ok(response) => self.intern_response(table, &response, 0),
             Err(error) => Answer::Unsupported(error.to_string()),
         }
     }
@@ -235,4 +280,15 @@ fn read_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value, TsApiError
         .read_exact(&mut body)
         .map_err(|error| TsApiError::Transport(error.to_string()))?;
     serde_json::from_slice(&body).map_err(|error| TsApiError::Protocol(error.to_string()))
+}
+
+fn object_reason(response: &Value) -> String {
+    if response
+        .get("isTupleType")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return "tuple types are not resolved yet".to_string();
+    }
+    "object shapes are not resolved yet".to_string()
 }

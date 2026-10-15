@@ -7,8 +7,15 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
 use savitar_types::{TypeKind, TypeTable};
 
-const SOURCE: &str =
-    "const n = 1;\nconst s = \"hi\";\nconst b = true;\ndeclare const u: number | string;\n";
+const SOURCE: &str = concat!(
+    "const n = 1;\n",
+    "const s = \"hi\";\n",
+    "const b = true;\n",
+    "declare const u: number | string;\n",
+    "declare const opt: number | undefined;\n",
+    "declare const pt: { x: number };\n",
+    "declare const tup: [number, string];\n",
+);
 
 fn provider_binary() -> Option<OsString> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -76,13 +83,41 @@ fn reads_literal_and_union_types_from_the_provider() {
     assert_eq!(table.kind(boolean), &TypeKind::BooleanLiteral(true));
 
     let union = api.type_at(&mut table, path, Span::new(position_of("u"), 0));
-    let Answer::Unsupported(reason) = union else {
-        panic!("a union must not be guessed, got {union:?}");
+    let Answer::Known(union) = union else {
+        panic!("expected a known type for `u`, got {union:?}");
     };
+    let TypeKind::Union(members) = table.kind(union).clone() else {
+        panic!("expected a union, got {:?}", table.kind(union));
+    };
+    assert_eq!(members.len(), 2);
+    let kinds: Vec<&TypeKind> = members.iter().map(|&id| table.kind(id)).collect();
     assert!(
-        reason.contains("union"),
-        "unexpected reason for a union: {reason}"
+        kinds.contains(&&TypeKind::Number),
+        "missing number: {kinds:?}"
     );
+    assert!(
+        kinds.contains(&&TypeKind::String),
+        "missing string: {kinds:?}"
+    );
+
+    let optional = api.type_at(&mut table, path, Span::new(position_of("opt"), 0));
+    let Answer::Known(optional) = optional else {
+        panic!("expected a known type for `opt`, got {optional:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    assert_eq!(optional, table.optional(number));
+
+    let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
+    let Answer::Unsupported(reason) = object else {
+        panic!("an object shape must not be guessed, got {object:?}");
+    };
+    assert!(reason.contains("object shapes"), "unexpected: {reason}");
+
+    let tuple = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
+    let Answer::Unsupported(reason) = tuple else {
+        panic!("a tuple must not be guessed, got {tuple:?}");
+    };
+    assert!(reason.contains("tuple"), "unexpected: {reason}");
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();
