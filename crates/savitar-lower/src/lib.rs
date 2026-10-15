@@ -160,13 +160,17 @@ fn statement_span(statement: &AstStatement<'_>) -> oxc_span::Span {
 }
 
 impl Context<'_> {
+    fn answer_at(&self, table: &mut TypeTable, span: oxc_span::Span) -> Answer {
+        let query = Span::new(span.end.saturating_sub(1), span.end);
+        self.provider.type_at(table, self.file.name(), query)
+    }
+
     fn type_at(
         &self,
         table: &mut TypeTable,
         span: oxc_span::Span,
     ) -> Result<TypeId, Vec<Diagnostic>> {
-        let query = Span::new(span.end.saturating_sub(1), span.end);
-        match self.provider.type_at(table, self.file.name(), query) {
+        match self.answer_at(table, span) {
             Answer::Known(id) => Ok(id),
             Answer::Unsupported(reason) => Err(vec![refuse("unsupported-type", span, reason)]),
             Answer::OutOfScope => Err(vec![refuse(
@@ -174,6 +178,26 @@ impl Context<'_> {
                 span,
                 "the provider has no type here",
             )]),
+        }
+    }
+
+    fn member_type(
+        &self,
+        table: &mut TypeTable,
+        object: TypeId,
+        name: &str,
+        member: &oxc_ast::ast::StaticMemberExpression<'_>,
+    ) -> Result<TypeId, Vec<Diagnostic>> {
+        let shaped = match types::field_result(table, object, name) {
+            Ok(id) => return Ok(id),
+            Err(reason) => reason,
+        };
+        match self.answer_at(table, member.property.span) {
+            Answer::Known(id) => Ok(id),
+            Answer::Unsupported(detail) => {
+                Err(vec![refuse("unsupported-type", member.span, detail)])
+            }
+            Answer::OutOfScope => Err(vec![refuse("unsupported-read", member.span, shaped)]),
         }
     }
 
@@ -1016,8 +1040,7 @@ impl Context<'_> {
             Expression::StaticMemberExpression(member) => {
                 let object = self.lower_expression(table, function, &member.object)?;
                 let name = member.property.name.to_string();
-                let ty = types::field_result(table, function.type_of(object), &name)
-                    .map_err(|reason| vec![refuse("unsupported-read", member.span, reason)])?;
+                let ty = self.member_type(table, function.type_of(object), &name, member)?;
                 Ok(self.assign(
                     function,
                     ty,
