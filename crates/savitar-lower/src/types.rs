@@ -275,3 +275,31 @@ pub fn widen(table: &mut TypeTable, id: TypeId) -> TypeId {
         _ => id,
     }
 }
+
+#[must_use]
+pub fn exhausted(table: &TypeTable, discriminant: TypeId, labels: &[TypeId]) -> bool {
+    let members = match table.kind(discriminant) {
+        TypeKind::Union(members) => members.clone(),
+        _ => vec![discriminant],
+    };
+    let covered: Vec<&TypeKind> = labels.iter().map(|&id| table.kind(id)).collect();
+    !members.is_empty()
+        && members
+            .iter()
+            .all(|&member| member_is_covered(table, member, &covered))
+}
+
+fn member_is_covered(table: &TypeTable, member: TypeId, covered: &[&TypeKind]) -> bool {
+    match table.kind(member) {
+        TypeKind::Boolean => {
+            covered.contains(&&TypeKind::BooleanLiteral(true))
+                && covered.contains(&&TypeKind::BooleanLiteral(false))
+        }
+        kind @ (TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_)
+        | TypeKind::Null
+        | TypeKind::Undefined) => covered.contains(&kind),
+        _ => false,
+    }
+}

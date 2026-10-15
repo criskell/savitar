@@ -1822,6 +1822,16 @@ fn equality_tests(function: &savitar_ir::Function) -> usize {
         .count()
 }
 
+fn unreachable_terminators(function: &savitar_ir::Function) -> usize {
+    let dominance = savitar_ir::Dominance::of(function);
+    function
+        .blocks()
+        .filter(|(id, block)| {
+            dominance.reachable(*id) && block.terminator == Terminator::Unreachable
+        })
+        .count()
+}
+
 fn returns_without_a_value(function: &savitar_ir::Function) -> usize {
     function
         .blocks()
@@ -1878,11 +1888,13 @@ fn a_switch_with_no_default_reaches_the_join_on_the_path_no_case_matched() {
     let text = table.intern(TypeKind::String);
     let outcome = outcome_union(&mut table);
     let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let error_kind = table.intern(TypeKind::StringLiteral("error".to_string()));
+    let discriminant = table.union(vec![ok_kind, error_kind]);
     let provider = ByName::new(
         source,
         vec![
             ("outcome", Answer::Known(outcome)),
-            ("kind", Answer::Known(ok_kind)),
+            ("kind", Answer::Known(discriminant)),
             ("body", Answer::Known(text)),
         ],
     );
@@ -1896,8 +1908,89 @@ fn a_switch_with_no_default_reaches_the_join_on_the_path_no_case_matched() {
     assert_eq!(
         returns_without_a_value(function),
         1,
-        "the unmatched path falls out of the function with no value"
+        "`error` has no case, so the unmatched path falls out of the function with no value"
     );
+}
+
+#[test]
+fn a_switch_whose_labels_cover_the_union_leaves_no_unmatched_path() {
+    let source = "function describe(outcome: Outcome): string {\n  switch (outcome.kind) {\n    case \"ok\":\n      return outcome.body;\n    case \"error\":\n      return outcome.detail;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let outcome = outcome_union(&mut table);
+    let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let error_kind = table.intern(TypeKind::StringLiteral("error".to_string()));
+    let discriminant = table.union(vec![ok_kind, error_kind]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("outcome", Answer::Known(outcome)),
+            ("kind", Answer::Known(discriminant)),
+            ("body", Answer::Known(text)),
+            ("detail", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("describe.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        returns_without_a_value(function),
+        0,
+        "every member of the union has a case, so no path leaves the function without a value"
+    );
+    assert_eq!(
+        unreachable_terminators(function),
+        1,
+        "the path no case matched is marked unreachable instead of joining"
+    );
+}
+
+#[test]
+fn a_switch_over_text_is_never_exhaustive_however_many_labels_it_has() {
+    let source = "function describe(kind: string): string {\n  switch (kind) {\n    case \"ok\":\n      return kind;\n    case \"error\":\n      return kind;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("kind", Answer::Known(text))]);
+    let file = SourceFile::new("describe.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        returns_without_a_value(function),
+        1,
+        "`string` holds values no label names, so the unmatched path stays"
+    );
+}
+
+#[test]
+fn a_switch_over_a_boolean_is_exhaustive_once_both_labels_appear() {
+    let source = "function pick(flag: boolean, value: number): number {\n  switch (flag) {\n    case true:\n      return value;\n    case false:\n      return value;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let boolean = table.intern(TypeKind::Boolean);
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(returns_without_a_value(function), 0);
 }
 
 #[test]

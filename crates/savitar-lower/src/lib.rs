@@ -1040,11 +1040,13 @@ impl Context<'_> {
             .position(|case| case.test.is_none())
             .map(|position| bodies[position]);
 
+        let mut labels = Vec::with_capacity(statement.cases.len());
         for (position, case) in statement.cases.iter().enumerate() {
             let Some(test) = &case.test else {
                 continue;
             };
             let label = self.lower_expression(table, function, test)?;
+            labels.push(function.type_of(label));
             let matched = self.combine(
                 table,
                 function,
@@ -1070,15 +1072,21 @@ impl Context<'_> {
 
         let mut edges: Vec<(BlockId, Scope)> = Vec::new();
         let unmatched = self.current;
-        self.seal(
-            function,
-            Terminator::Jump {
-                target: fallback.unwrap_or(join),
-                arguments: Vec::new(),
-            },
-        );
-        if fallback.is_none() {
-            edges.push((unmatched, before.clone()));
+        let exhaustive =
+            fallback.is_none() && types::exhausted(table, function.type_of(discriminant), &labels);
+        if exhaustive {
+            self.seal(function, Terminator::Unreachable);
+        } else {
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: fallback.unwrap_or(join),
+                    arguments: Vec::new(),
+                },
+            );
+            if fallback.is_none() {
+                edges.push((unmatched, before.clone()));
+            }
         }
 
         let outer_breaks = std::mem::take(&mut self.breaks);
