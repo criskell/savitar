@@ -1,0 +1,218 @@
+use std::cell::RefCell;
+
+use savitar_diagnostics::{SourceFile, Span};
+use savitar_ir::{BinaryOp, Rvalue, Statement, Terminator, verify};
+use savitar_lower::lower;
+use savitar_typeinfo::{Answer, TypeProvider};
+use savitar_types::{Field, TypeKind, TypeTable};
+
+struct ByName {
+    answers: RefCell<Vec<(String, Answer)>>,
+    source: String,
+}
+
+impl ByName {
+    fn new(source: &str, answers: Vec<(&str, Answer)>) -> Self {
+        Self {
+            answers: RefCell::new(
+                answers
+                    .into_iter()
+                    .map(|(name, answer)| (name.to_string(), answer))
+                    .collect(),
+            ),
+            source: source.to_string(),
+        }
+    }
+}
+
+impl TypeProvider for ByName {
+    fn name(&self) -> &'static str {
+        "by-name"
+    }
+
+    fn type_at(&self, _table: &mut TypeTable, _file: &str, span: Span) -> Answer {
+        let at = span.start as usize;
+        for (name, answer) in self.answers.borrow().iter() {
+            let ends_here = self.source[..=at.min(self.source.len() - 1)].ends_with(name.as_str());
+            if ends_here {
+                return answer.clone();
+            }
+        }
+        Answer::OutOfScope
+    }
+}
+
+const ADD: &str = "function add(left: number, right: number): number {\n  const sum = left + right;\n  return sum;\n}\n";
+
+#[test]
+fn a_straight_line_function_lowers_to_valid_code() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        ADD,
+        vec![
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("add.ts", ADD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    let function = &report.functions[0];
+    assert_eq!(function.name(), "add");
+    assert_eq!(function.parameters().len(), 2);
+    assert_eq!(verify(function), vec![]);
+
+    let entry = function.entry().expect("the function should have a block");
+    let block = function.block(entry);
+    let Terminator::Return(Some(returned)) = block.terminator else {
+        panic!("expected a return, got {:?}", block.terminator);
+    };
+    assert_eq!(table.kind(function.type_of(returned)), &TypeKind::Number);
+
+    let sum = block
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Binary { op, .. },
+                ..
+            } => (*op == BinaryOp::Add).then_some(*target),
+            _ => None,
+        })
+        .expect("the sum should be lowered to a binary instruction");
+    assert_eq!(sum, returned);
+}
+
+#[test]
+fn adding_a_number_to_a_string_is_refused_rather_than_guessed() {
+    let source = "function bad(left: number, right: string): string {\n  const joined = left + right;\n  return joined;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("bad.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0].message.contains("joins two strings"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn reading_a_field_the_shape_does_not_declare_is_refused() {
+    let source =
+        "function take(point: Point): number {\n  const value = point.z;\n  return value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let point = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+    }]);
+    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("no field `z`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_element_read_is_optional_because_the_index_may_be_out_of_range() {
+    let source = "function first(items: number[]): number | undefined {\n  const head = items[0];\n  return head;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let array = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![("items", Answer::Known(array))]);
+    let file = SourceFile::new("first.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let entry = function.entry().expect("a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!("expected a return");
+    };
+    assert!(
+        table.admits_undefined(function.type_of(returned)),
+        "reading `items[0]` yields `number | undefined`, never `number`"
+    );
+}
+
+#[test]
+fn an_unbound_name_is_refused_rather_than_invented() {
+    let source = "function stray(): number {\n  return elsewhere;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("stray.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+}
+
+#[test]
+fn an_unsupported_statement_names_itself_instead_of_being_skipped() {
+    let source = "function loops(limit: number): number {\n  while (true) {\n    return limit;\n  }\n  return limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("loops.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+}
+
+#[test]
+fn an_object_literal_lowers_to_a_shape_built_from_its_values() {
+    let source = "function make(name: string): { label: string; count: number } {\n  const built = { label: name, count: 1 };\n  return built;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("name", Answer::Known(text))]);
+    let file = SourceFile::new("make.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let entry = function.entry().expect("a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!("expected a return");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(function.type_of(returned)).clone() else {
+        panic!(
+            "expected an object, got {:?}",
+            table.kind(function.type_of(returned))
+        );
+    };
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(names, vec!["count", "label"]);
+}

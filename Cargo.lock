@@ -585,6 +585,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "savitar-lower"
+version = "0.0.1"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_parser",
+ "oxc_span",
+ "oxc_syntax",
+ "savitar-diagnostics",
+ "savitar-ir",
+ "savitar-typeinfo",
+ "savitar-types",
+]
+
+[[package]]
 name = "savitar-sound"
 version = "0.0.1"
 dependencies = [
