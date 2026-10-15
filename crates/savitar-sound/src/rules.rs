@@ -85,7 +85,7 @@ pub static RULES: &[Rule] = &[
     },
     Rule {
         id: "no-array-constructor-length",
-        reason: "`new Array(n)` builds an array of holes, just like a sparse literal",
+        reason: "a numeric length builds an array of holes, just like a sparse literal",
         run: no_array_constructor_length,
     },
     Rule {
@@ -399,10 +399,10 @@ fn no_array_constructor_length(kind: AstKind<'_>) -> Option<Diagnostic> {
     let AstKind::NewExpression(node) = kind else {
         return None;
     };
-    let [only] = node.arguments.as_slice() else {
+    let [Argument::NumericLiteral(length)] = node.arguments.as_slice() else {
         return None;
     };
-    if matches!(only, Argument::SpreadElement(_)) {
+    if length.value == 0.0 {
         return None;
     }
     Some(

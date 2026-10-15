@@ -219,7 +219,7 @@ fn sparse_array_literal_is_rejected_but_dense_one_is_not() {
 #[test]
 fn array_constructor_with_one_argument_is_rejected() {
     assert_eq!(
-        rules_fired("const xs = new Array(n);"),
+        rules_fired("const xs = new Array(1);"),
         vec!["no-array-constructor-length"]
     );
     assert_eq!(
@@ -233,6 +233,18 @@ fn array_constructor_with_two_arguments_is_accepted() {
     assert!(rules_fired("const xs = new Array(1, 2);").is_empty());
     assert!(rules_fired("const xs = new Array();").is_empty());
     assert!(rules_fired("const xs = new Array(...ys);").is_empty());
+    assert!(
+        rules_fired("const xs = new Array(0);").is_empty(),
+        "`new Array(0)` is dense, so it is sound"
+    );
+    assert!(
+        rules_fired("const xs = new Array(\"x\");").is_empty(),
+        "a single non-numeric argument is an element, not a length"
+    );
+    assert!(
+        rules_fired("const xs = new Array(n);").is_empty(),
+        "a variable length needs the type pass; refusing it here would reject sound code"
+    );
 }
 
 #[test]
