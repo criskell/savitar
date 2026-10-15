@@ -10,7 +10,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
-use crate::flags::TypeFlags;
+use crate::flags::{ObjectFlags, TypeFlags};
 use crate::translate::{Classified, classify};
 
 const MAX_TYPE_DEPTH: u32 = 32;
@@ -178,6 +178,95 @@ impl TsApi {
         Answer::Known(table.union(interned))
     }
 
+    fn symbol_name_of_type(&self, object_id: u32) -> Option<String> {
+        let symbol = self
+            .request(
+                "getSymbolOfType",
+                json!({
+                    "snapshot": *self.snapshot.borrow(),
+                    "project": *self.project.borrow(),
+                    "objectId": object_id,
+                }),
+            )
+            .ok()?;
+        symbol
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    fn type_arguments(&self, type_id: u32) -> Result<Vec<Value>, TsApiError> {
+        let arguments = self.request(
+            "getTypeArguments",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "type": type_id,
+            }),
+        )?;
+        arguments
+            .as_array()
+            .cloned()
+            .ok_or_else(|| TsApiError::Protocol("getTypeArguments returned no array".into()))
+    }
+
+    fn intern_object(
+        &self,
+        table: &mut TypeTable,
+        response: &Value,
+        id: u32,
+        depth: u32,
+    ) -> Answer {
+        if response
+            .get("isTupleType")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Answer::Unsupported("tuple types are not resolved yet".into());
+        }
+
+        let object_flags = response
+            .get("objectFlags")
+            .and_then(Value::as_u64)
+            .map(|bits| ObjectFlags(u32::try_from(bits).unwrap_or(0)))
+            .unwrap_or_default();
+        if !object_flags.has(ObjectFlags::REFERENCE) {
+            return Answer::Unsupported("object shapes are not resolved yet".into());
+        }
+
+        let name = self.symbol_name_of_type(id);
+        let readonly = match name.as_deref() {
+            Some("Array") => false,
+            Some("ReadonlyArray") => true,
+            Some(other) => {
+                return Answer::Unsupported(format!("`{other}` is not resolved yet"));
+            }
+            None => {
+                return Answer::Unsupported("a generic reference with no symbol".into());
+            }
+        };
+
+        let arguments = match self.type_arguments(id) {
+            Ok(arguments) => arguments,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        let [element] = arguments.as_slice() else {
+            return Answer::Unsupported(format!(
+                "an array with {} type arguments",
+                arguments.len()
+            ));
+        };
+
+        match self.intern_response(table, element, depth + 1) {
+            Answer::Known(element) => Answer::Known(table.intern(if readonly {
+                TypeKind::ReadonlyArray(element)
+            } else {
+                TypeKind::Array(element)
+            })),
+            other => other,
+        }
+    }
+
     fn intern_response(&self, table: &mut TypeTable, response: &Value, depth: u32) -> Answer {
         if depth > MAX_TYPE_DEPTH {
             return Answer::Unsupported(format!(
@@ -221,7 +310,11 @@ impl TsApi {
                 return answer;
             }
             Classified::Object => {
-                return Answer::Unsupported(object_reason(response));
+                let answer = self.intern_object(table, response, id, depth);
+                if let Answer::Known(interned) = answer {
+                    self.cache.borrow_mut().insert(id, interned);
+                }
+                return answer;
             }
             Classified::Unsupported(reason) => return Answer::Unsupported(reason.to_string()),
         };
@@ -280,15 +373,4 @@ fn read_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value, TsApiError
         .read_exact(&mut body)
         .map_err(|error| TsApiError::Transport(error.to_string()))?;
     serde_json::from_slice(&body).map_err(|error| TsApiError::Protocol(error.to_string()))
-}
-
-fn object_reason(response: &Value) -> String {
-    if response
-        .get("isTupleType")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return "tuple types are not resolved yet".to_string();
-    }
-    "object shapes are not resolved yet".to_string()
 }

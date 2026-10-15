@@ -26,6 +26,7 @@ pub enum TypeKind {
     NumberLiteral(u64),
     BooleanLiteral(bool),
     Array(TypeId),
+    ReadonlyArray(TypeId),
     Union(Vec<TypeId>),
     Nominal(NominalId),
     Unresolved,

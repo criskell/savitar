@@ -38,3 +38,16 @@ impl TypeFlags {
         self.0 & other.0 != 0
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectFlags(pub u32);
+
+impl ObjectFlags {
+    pub const REFERENCE: Self = Self(1 << 2);
+    pub const ANONYMOUS: Self = Self(1 << 4);
+
+    #[must_use]
+    pub const fn has(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}

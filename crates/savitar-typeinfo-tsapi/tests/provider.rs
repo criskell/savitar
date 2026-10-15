@@ -15,6 +15,10 @@ const SOURCE: &str = concat!(
     "declare const opt: number | undefined;\n",
     "declare const pt: { x: number };\n",
     "declare const tup: [number, string];\n",
+    "declare const arr: number[];\n",
+    "declare const ro: readonly string[];\n",
+    "declare const nested: number[][];\n",
+    "declare const st: Set<number>;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -48,7 +52,7 @@ fn position_of(name: &str) -> u32 {
 }
 
 #[test]
-fn reads_literal_and_union_types_from_the_provider() {
+fn reads_literals_unions_and_arrays_from_the_provider() {
     let Some(binary) = provider_binary() else {
         eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
         return;
@@ -118,6 +122,32 @@ fn reads_literal_and_union_types_from_the_provider() {
         panic!("a tuple must not be guessed, got {tuple:?}");
     };
     assert!(reason.contains("tuple"), "unexpected: {reason}");
+
+    let array = api.type_at(&mut table, path, Span::new(position_of("arr"), 0));
+    let Answer::Known(array) = array else {
+        panic!("expected a known type for `arr`, got {array:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    assert_eq!(table.kind(array), &TypeKind::Array(number));
+
+    let readonly = api.type_at(&mut table, path, Span::new(position_of("ro"), 0));
+    let Answer::Known(readonly) = readonly else {
+        panic!("expected a known type for `ro`, got {readonly:?}");
+    };
+    let text_kind = table.intern(TypeKind::String);
+    assert_eq!(table.kind(readonly), &TypeKind::ReadonlyArray(text_kind));
+
+    let nested = api.type_at(&mut table, path, Span::new(position_of("nested"), 0));
+    let Answer::Known(nested) = nested else {
+        panic!("expected a known type for `nested`, got {nested:?}");
+    };
+    assert_eq!(table.kind(nested), &TypeKind::Array(array));
+
+    let other = api.type_at(&mut table, path, Span::new(position_of("st"), 0));
+    let Answer::Unsupported(reason) = other else {
+        panic!("`Set` must not be guessed, got {other:?}");
+    };
+    assert!(reason.contains("Set"), "unexpected: {reason}");
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();
