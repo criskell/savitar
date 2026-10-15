@@ -9,6 +9,7 @@ pub enum Classified {
     NumberLiteral,
     BooleanLiteral,
     Union,
+    Intersection,
     Object,
     TypeParameter,
     Unsupported(&'static str),
@@ -83,10 +84,6 @@ pub fn classify(flags: TypeFlags) -> Classified {
             TypeFlags::CONDITIONAL,
             "conditional types need the type evaluator",
         ),
-        (
-            TypeFlags::INTERSECTION,
-            "intersections are not modelled yet",
-        ),
     ] {
         if flags.has(flag) {
             return Classified::Unsupported(reason);
@@ -95,6 +92,9 @@ pub fn classify(flags: TypeFlags) -> Classified {
 
     if flags.has(TypeFlags::UNION) {
         return Classified::Union;
+    }
+    if flags.has(TypeFlags::INTERSECTION) {
+        return Classified::Intersection;
     }
     if flags.has(TypeFlags::OBJECT) {
         return Classified::Object;
@@ -158,6 +158,11 @@ mod tests {
     }
 
     #[test]
+    fn an_intersection_is_walked_by_the_caller() {
+        assert_eq!(classify(TypeFlags::INTERSECTION), Classified::Intersection);
+    }
+
+    #[test]
     fn a_plain_union_is_walked_by_the_caller() {
         assert_eq!(classify(TypeFlags::UNION), Classified::Union);
     }
@@ -190,7 +195,6 @@ mod tests {
             TypeFlags::INDEXED_ACCESS,
             TypeFlags::INDEX,
             TypeFlags::TEMPLATE_LITERAL,
-            TypeFlags::INTERSECTION,
             TypeFlags::BIG_INT_LITERAL,
         ] {
             assert!(

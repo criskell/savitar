@@ -44,6 +44,8 @@ const SOURCE: &str = concat!(
     "declare function firstOf<T>(items: readonly T[]): T | undefined;\n",
     "declare function pick<K, V>(k: K, v: V): V;\n",
     "declare const loose2: (x: any) => void;\n",
+    "declare const merged: { a: number } & { b: string };\n",
+    "declare const clashing: { a: number } & { a: string };\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -342,6 +344,35 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let void = table.intern(TypeKind::Void);
     let run_signature = table.function(vec![Parameter { type_id: boolean }], void);
     assert_eq!(run.type_id, run_signature);
+
+    let merged = api.type_at(&mut table, path, Span::new(position_of("merged"), 0));
+    let Answer::Known(merged) = merged else {
+        panic!("expected a known type for `merged`, got {merged:?}");
+    };
+    let expected = table.object(vec![
+        Field {
+            name: "a".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+        },
+        Field {
+            name: "b".to_string(),
+            type_id: text_kind,
+            optional: false,
+            method: false,
+        },
+    ]);
+    assert_eq!(
+        merged, expected,
+        "an intersection of object shapes merges into one shape"
+    );
+
+    let clashing = api.type_at(&mut table, path, Span::new(position_of("clashing"), 0));
+    assert!(
+        matches!(clashing, Answer::Unsupported(_)),
+        "a field declared twice with different types must not be merged, got {clashing:?}"
+    );
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();

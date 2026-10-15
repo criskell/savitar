@@ -213,6 +213,58 @@ impl TsApi {
             .ok_or_else(|| TsApiError::Protocol("getTypesOfType returned no array".into()))
     }
 
+    fn intern_intersection(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
+        let slot = match self.enter_resolution(table, object_id) {
+            Ok(slot) => slot,
+            Err(reserved) => return Answer::Known(reserved),
+        };
+        let answer = self.merge_intersection(table, object_id, depth);
+        self.leave_resolution(table, object_id, slot, answer)
+    }
+
+    fn merge_intersection(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
+        let members = match self.union_members(object_id) {
+            Ok(members) => members,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        if members.is_empty() {
+            return Answer::Unsupported("an intersection with no members".into());
+        }
+
+        let mut fields: Vec<Field> = Vec::new();
+        let mut indexes: Vec<IndexSignature> = Vec::new();
+        for member in &members {
+            let interned = match self.intern_response(table, member, depth + 1) {
+                Answer::Known(interned) => interned,
+                other => return other,
+            };
+            let TypeKind::Object {
+                fields: member_fields,
+                indexes: member_indexes,
+            } = table.kind(interned).clone()
+            else {
+                return Answer::Unsupported(
+                    "an intersection of something other than object shapes".into(),
+                );
+            };
+            for field in member_fields {
+                if let Some(existing) = fields.iter().find(|held| held.name == field.name) {
+                    if *existing != field {
+                        return Answer::Unsupported(format!(
+                            "the intersection declares `{}` twice with different types",
+                            field.name
+                        ));
+                    }
+                    continue;
+                }
+                fields.push(field);
+            }
+            indexes.extend(member_indexes);
+        }
+
+        Answer::Known(table.object_with_indexes(fields, indexes))
+    }
+
     fn intern_union(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
         let slot = match self.enter_resolution(table, object_id) {
             Ok(slot) => slot,
@@ -695,6 +747,13 @@ impl TsApi {
                 None => return Answer::Unsupported("a boolean literal with no value".into()),
             },
             Classified::TypeParameter => table.fresh_type_parameter(),
+            Classified::Intersection => {
+                let answer = self.intern_intersection(table, id, depth);
+                if let Answer::Known(interned) = answer {
+                    self.cache.borrow_mut().insert(id, interned);
+                }
+                return answer;
+            }
             Classified::Union => {
                 let answer = self.intern_union(table, id, depth);
                 if let Answer::Known(interned) = answer {
