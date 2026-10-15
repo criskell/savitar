@@ -179,7 +179,7 @@ fn an_unbound_name_is_refused_rather_than_invented() {
 
 #[test]
 fn an_unsupported_statement_names_itself_instead_of_being_skipped() {
-    let source = "function loops(limit: number): number {\n  for (const held of [limit]) {\n    return held;\n  }\n  return limit;\n}\n";
+    let source = "function loops(limit: number): number {\n  do {\n    return limit;\n  } while (true);\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
     let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
@@ -530,4 +530,101 @@ fn incrementing_something_that_is_not_a_number_is_refused() {
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+}
+
+#[test]
+fn a_binding_declared_in_a_block_does_not_escape_it() {
+    let source = "function scoped(value: number): number {\n  let out = value;\n  {\n    const inner = value;\n    out = inner;\n  }\n  return out;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("value", Answer::Known(number))]);
+    let file = SourceFile::new("scoped.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_name_used_after_its_block_closed_is_refused() {
+    let source = "function leaked(value: number): number {\n  {\n    const inner = value;\n  }\n  return inner;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("value", Answer::Known(number))]);
+    let file = SourceFile::new("leaked.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+}
+
+#[test]
+fn a_for_of_over_an_array_yields_the_element_not_an_optional() {
+    let source = "function total(values: readonly number[]): number {\n  let sum = 0;\n  for (const value of values) {\n    sum += value;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let array = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(source, vec![("values", Answer::Known(array))]);
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let element = function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::ReadElement { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the loop should read an element");
+    assert_eq!(
+        table.kind(function.type_of(element)),
+        &TypeKind::Number,
+        "the loop bound keeps the element present, and the sparse-array rules keep it dense"
+    );
+
+    let headers: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(
+        headers[0].1.parameters.len(),
+        2,
+        "the index and the running total are both carried"
+    );
+}
+
+#[test]
+fn a_for_of_over_something_that_is_not_an_array_is_refused() {
+    let source = "function walk(values: Iterable<number>): number {\n  let sum = 0;\n  for (const value of values) {\n    sum += value;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let opaque = table.object(vec![Field {
+        name: "size".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+    }]);
+    let provider = ByName::new(source, vec![("values", Answer::Known(opaque))]);
+    let file = SourceFile::new("walk.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0].message.contains("iterator protocol"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }

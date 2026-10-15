@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Expression, FunctionBody, ObjectPropertyKind,
-    SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
+    Argument, AssignmentTarget, BindingPattern, Expression, ForStatementLeft, FunctionBody,
+    ObjectPropertyKind, SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
@@ -235,10 +235,16 @@ impl Context<'_> {
                 Ok(Flow::Returned)
             }
             AstStatement::BlockStatement(block) => {
-                self.lower_statements(table, function, &block.body)
+                let outer: Vec<String> = self.scope.keys().cloned().collect();
+                let flow = self.lower_statements(table, function, &block.body)?;
+                self.scope.retain(|name, _| outer.contains(name));
+                Ok(flow)
             }
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
             AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
+            AstStatement::ForOfStatement(statement) => {
+                self.lower_for_of(table, function, statement)
+            }
             other => Err(vec![refuse(
                 "unsupported-statement",
                 statement_span(other),
@@ -340,6 +346,191 @@ impl Context<'_> {
         };
         self.scope.insert(id.name.to_string(), stored);
         Ok(())
+    }
+
+    fn lower_for_of(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::ForOfStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        if statement.r#await {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                statement.span,
+                "`for await` is not lowered yet",
+            )]);
+        }
+        let ForStatementLeft::VariableDeclaration(declaration) = &statement.left else {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                statement.span,
+                "a `for of` over an existing name is not lowered yet",
+            )]);
+        };
+        let [declarator] = declaration.declarations.as_slice() else {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                statement.span,
+                "a `for of` must bind exactly one name",
+            )]);
+        };
+        let BindingPattern::BindingIdentifier(bound) = &declarator.id else {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                statement.span,
+                "a `for of` over a pattern is not lowered yet",
+            )]);
+        };
+
+        let iterated = self.lower_expression(table, function, &statement.right)?;
+        let element = match table.kind(function.type_of(iterated)).clone() {
+            TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => element,
+            _ => {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    statement.span,
+                    "only an array is walked by `for of` yet; another iterable needs the iterator protocol",
+                )]);
+            }
+        };
+
+        let number = table.intern(TypeKind::Number);
+        let zero_type = table.number_literal(0.0);
+        let zero = self.assign(
+            function,
+            zero_type,
+            Rvalue::Constant(Constant::Number(0.0f64.to_bits())),
+            statement.span,
+        );
+        let start = self.assign(function, number, Rvalue::Widen(zero), statement.span);
+
+        let carried: Vec<String> = assigned::assigned_names(std::slice::from_ref(&statement.body))
+            .into_iter()
+            .filter(|name| self.scope.contains_key(name))
+            .collect();
+
+        let header = function.add_block(empty_block());
+        let index = function.fresh_value(number);
+        let mut parameters = vec![index];
+        let mut entry_arguments = vec![start];
+        for name in &carried {
+            let incoming = self.scope[name];
+            let parameter = function.fresh_value(function.type_of(incoming));
+            parameters.push(parameter);
+            entry_arguments.push(incoming);
+        }
+        function.block_mut(header).parameters = parameters.clone();
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: header,
+                arguments: entry_arguments,
+            },
+        );
+
+        self.current = header;
+        self.statements.clear();
+        for (name, parameter) in carried.iter().zip(parameters.iter().skip(1)) {
+            self.scope.insert(name.clone(), *parameter);
+        }
+        let at_header = self.scope.clone();
+
+        let length = self.assign(
+            function,
+            number,
+            Rvalue::ReadField {
+                object: iterated,
+                name: "length".to_string(),
+            },
+            statement.span,
+        );
+        let boolean = table.intern(TypeKind::Boolean);
+        let in_range = self.assign(
+            function,
+            boolean,
+            Rvalue::Binary {
+                op: BinaryOp::Less,
+                left: index,
+                right: length,
+            },
+            statement.span,
+        );
+
+        let body = function.add_block(empty_block());
+        let exit = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition: in_range,
+                then_block: body,
+                then_arguments: Vec::new(),
+                else_block: exit,
+                else_arguments: Vec::new(),
+            },
+        );
+
+        self.current = body;
+        self.statements.clear();
+        let current = self.assign(
+            function,
+            element,
+            Rvalue::ReadElement {
+                array: iterated,
+                index,
+            },
+            statement.span,
+        );
+        self.scope.insert(bound.name.to_string(), current);
+
+        let body_flow = self.lower_statement(table, function, &statement.body)?;
+        if body_flow == Flow::Continues {
+            let one_type = table.number_literal(1.0);
+            let one = self.assign(
+                function,
+                one_type,
+                Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
+                statement.span,
+            );
+            let stepped = self.assign(
+                function,
+                number,
+                Rvalue::Binary {
+                    op: BinaryOp::Add,
+                    left: index,
+                    right: one,
+                },
+                statement.span,
+            );
+            let mut back_arguments = vec![stepped];
+            for name in &carried {
+                back_arguments.push(self.scope[name]);
+            }
+            for (name, value) in &self.scope {
+                if !at_header.contains_key(name) {
+                    continue;
+                }
+                if at_header.get(name) != Some(value) && !carried.contains(name) {
+                    return Err(vec![refuse(
+                        "malformed-ir",
+                        statement.span,
+                        format!("`{name}` changes in the loop but carries no header parameter"),
+                    )]);
+                }
+            }
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: header,
+                    arguments: back_arguments,
+                },
+            );
+        }
+
+        self.scope = at_header;
+        self.current = exit;
+        self.statements.clear();
+        Ok(Flow::Continues)
     }
 
     fn lower_while(
