@@ -1,0 +1,21 @@
+[package]
+name = "savitar-sound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The soundness layer: which TypeScript programs Savitar accepts"
+
+[dependencies]
+savitar-diagnostics.workspace = true
+savitar-typeinfo.workspace = true
+savitar-types.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_parser.workspace = true
+oxc_semantic.workspace = true
+oxc_span.workspace = true
+oxc_syntax = "0.154.0"
+
+[lints]
+workspace = true
