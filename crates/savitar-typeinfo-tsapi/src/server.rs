@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -7,10 +7,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
-use crate::flags::{ObjectFlags, TypeFlags};
+use crate::flags::{ObjectFlags, SymbolFlags, TypeFlags};
 use crate::translate::{Classified, classify};
 
 const MAX_TYPE_DEPTH: u32 = 32;
@@ -46,6 +46,7 @@ pub struct TsApi {
     snapshot: RefCell<Value>,
     project: RefCell<Value>,
     cache: RefCell<HashMap<u32, TypeId>>,
+    resolving: RefCell<HashSet<u32>>,
 }
 
 fn file_uri(path: &Path) -> String {
@@ -77,6 +78,7 @@ impl TsApi {
             snapshot: RefCell::new(Value::Null),
             project: RefCell::new(Value::Null),
             cache: RefCell::new(HashMap::new()),
+            resolving: RefCell::new(HashSet::new()),
         };
 
         let uris: Vec<Value> = open_files
@@ -210,6 +212,84 @@ impl TsApi {
             .ok_or_else(|| TsApiError::Protocol("getTypeArguments returned no array".into()))
     }
 
+    fn checker_call(&self, method: &str, field: &str, id: u32) -> Result<Value, TsApiError> {
+        self.request(
+            method,
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                field: id,
+            }),
+        )
+    }
+
+    fn has_index_signature(&self, type_id: u32) -> Result<bool, TsApiError> {
+        let infos = self.checker_call("getIndexInfosOfType", "type", type_id)?;
+        Ok(infos.as_array().is_some_and(|infos| !infos.is_empty()))
+    }
+
+    fn intern_fields(&self, table: &mut TypeTable, type_id: u32, depth: u32) -> Answer {
+        match self.has_index_signature(type_id) {
+            Ok(true) => {
+                return Answer::Unsupported("index signatures are not modelled yet".into());
+            }
+            Ok(false) => {}
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        }
+
+        let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
+            Ok(properties) => properties,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        let Some(properties) = properties.as_array() else {
+            return Answer::Unsupported("getPropertiesOfType returned no array".into());
+        };
+
+        let mut fields = Vec::with_capacity(properties.len());
+        for property in properties {
+            let Some(name) = property.get("name").and_then(Value::as_str) else {
+                return Answer::Unsupported("a property with no name".into());
+            };
+            let symbol_flags = property
+                .get("flags")
+                .and_then(Value::as_u64)
+                .map(|bits| SymbolFlags(u32::try_from(bits).unwrap_or(0)))
+                .unwrap_or_default();
+            if symbol_flags.has(SymbolFlags::METHOD) {
+                return Answer::Unsupported(format!("the method `{name}` is not modelled yet"));
+            }
+            if !symbol_flags.has(SymbolFlags::PROPERTY) {
+                return Answer::Unsupported(format!("`{name}` is not a plain property"));
+            }
+
+            let Some(reference) = property.get("reference") else {
+                return Answer::Unsupported(format!("`{name}` carries no symbol reference"));
+            };
+            let field_type = match self.request(
+                "getNonMissingTypeOfSymbol",
+                json!({
+                    "snapshot": *self.snapshot.borrow(),
+                    "project": *self.project.borrow(),
+                    "symbol": reference,
+                }),
+            ) {
+                Ok(field_type) => field_type,
+                Err(error) => return Answer::Unsupported(error.to_string()),
+            };
+
+            match self.intern_response(table, &field_type, depth + 1) {
+                Answer::Known(type_id) => fields.push(Field {
+                    name: name.to_string(),
+                    type_id,
+                    optional: symbol_flags.has(SymbolFlags::OPTIONAL),
+                }),
+                other => return other,
+            }
+        }
+
+        Answer::Known(table.object(fields))
+    }
+
     fn intern_object(
         &self,
         table: &mut TypeTable,
@@ -230,8 +310,23 @@ impl TsApi {
             .and_then(Value::as_u64)
             .map(|bits| ObjectFlags(u32::try_from(bits).unwrap_or(0)))
             .unwrap_or_default();
+
+        if object_flags.has(ObjectFlags::MAPPED) {
+            return Answer::Unsupported("mapped types are not modelled yet".into());
+        }
+
         if !object_flags.has(ObjectFlags::REFERENCE) {
-            return Answer::Unsupported("object shapes are not resolved yet".into());
+            if !object_flags.has(ObjectFlags(
+                ObjectFlags::ANONYMOUS.0 | ObjectFlags::INTERFACE.0 | ObjectFlags::CLASS.0,
+            )) {
+                return Answer::Unsupported("object shapes are not resolved yet".into());
+            }
+            if !self.resolving.borrow_mut().insert(id) {
+                return Answer::Unsupported("recursive object types are not modelled yet".into());
+            }
+            let answer = self.intern_fields(table, id, depth);
+            self.resolving.borrow_mut().remove(&id);
+            return answer;
         }
 
         let name = self.symbol_name_of_type(id);

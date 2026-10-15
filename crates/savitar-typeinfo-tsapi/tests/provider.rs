@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
-use savitar_types::{TypeKind, TypeTable};
+use savitar_types::{Field, TypeKind, TypeTable};
 
 const SOURCE: &str = concat!(
     "const n = 1;\n",
@@ -19,6 +19,12 @@ const SOURCE: &str = concat!(
     "declare const ro: readonly string[];\n",
     "declare const nested: number[][];\n",
     "declare const st: Set<number>;\n",
+    "declare const shape: { y: string; x: number };\n",
+    "declare const maybe: { x: number; tag?: string };\n",
+    "interface Boxed { inner: { deep: number } }\n",
+    "declare const boxed: Boxed;\n",
+    "interface Chain { next: Chain }\n",
+    "declare const chain: Chain;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -38,7 +44,7 @@ fn scratch_project() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
-        "{ \"compilerOptions\": { \"strict\": true, \"noUncheckedIndexedAccess\": true } }",
+        "{ \"compilerOptions\": { \"strict\": true, \"noUncheckedIndexedAccess\": true, \"exactOptionalPropertyTypes\": true } }",
     )
     .expect("could not write tsconfig.json");
     std::fs::write(dir.join("a.ts"), SOURCE).expect("could not write a.ts");
@@ -111,12 +117,6 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let number = table.intern(TypeKind::Number);
     assert_eq!(optional, table.optional(number));
 
-    let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
-    let Answer::Unsupported(reason) = object else {
-        panic!("an object shape must not be guessed, got {object:?}");
-    };
-    assert!(reason.contains("object shapes"), "unexpected: {reason}");
-
     let tuple = api.type_at(&mut table, path, Span::new(position_of("tup"), 0));
     let Answer::Unsupported(reason) = tuple else {
         panic!("a tuple must not be guessed, got {tuple:?}");
@@ -148,6 +148,77 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         panic!("`Set` must not be guessed, got {other:?}");
     };
     assert!(reason.contains("Set"), "unexpected: {reason}");
+
+    let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
+    let Answer::Known(object) = object else {
+        panic!("expected a known type for `pt`, got {object:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    assert_eq!(
+        table.kind(object),
+        &TypeKind::Object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+        }])
+    );
+
+    let shape = api.type_at(&mut table, path, Span::new(position_of("shape"), 0));
+    let Answer::Known(shape) = shape else {
+        panic!("expected a known type for `shape`, got {shape:?}");
+    };
+    let text_kind = table.intern(TypeKind::String);
+    let sorted = table.object(vec![
+        Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+        },
+        Field {
+            name: "y".to_string(),
+            type_id: text_kind,
+            optional: false,
+        },
+    ]);
+    assert_eq!(shape, sorted, "declaration order must not change identity");
+
+    let maybe = api.type_at(&mut table, path, Span::new(position_of("maybe"), 0));
+    let Answer::Known(maybe) = maybe else {
+        panic!("expected a known type for `maybe`, got {maybe:?}");
+    };
+    let TypeKind::Object(fields) = table.kind(maybe).clone() else {
+        panic!("expected an object, got {:?}", table.kind(maybe));
+    };
+    let tag = fields
+        .iter()
+        .find(|field| field.name == "tag")
+        .expect("the optional field should be present");
+    assert!(tag.optional, "`tag?` must be marked optional");
+    assert_eq!(table.kind(tag.type_id), &TypeKind::String);
+
+    let boxed = api.type_at(&mut table, path, Span::new(position_of("boxed"), 0));
+    let Answer::Known(boxed) = boxed else {
+        panic!("expected a known type for `boxed`, got {boxed:?}");
+    };
+    let inner = table.object(vec![Field {
+        name: "deep".to_string(),
+        type_id: number,
+        optional: false,
+    }]);
+    assert_eq!(
+        table.kind(boxed),
+        &TypeKind::Object(vec![Field {
+            name: "inner".to_string(),
+            type_id: inner,
+            optional: false,
+        }])
+    );
+
+    let chain = api.type_at(&mut table, path, Span::new(position_of("chain"), 0));
+    let Answer::Unsupported(reason) = chain else {
+        panic!("a recursive type must not be guessed, got {chain:?}");
+    };
+    assert!(reason.contains("recursive"), "unexpected: {reason}");
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();

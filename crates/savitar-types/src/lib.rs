@@ -11,6 +11,13 @@ impl TypeId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Field {
+    pub name: String,
+    pub type_id: TypeId,
+    pub optional: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Never,
     Null,
@@ -27,6 +34,7 @@ pub enum TypeKind {
     BooleanLiteral(bool),
     Array(TypeId),
     ReadonlyArray(TypeId),
+    Object(Vec<Field>),
     Union(Vec<TypeId>),
     Nominal(NominalId),
     Unresolved,
@@ -98,6 +106,11 @@ impl TypeTable {
         self.intern(TypeKind::NumberLiteral(value.to_bits()))
     }
 
+    pub fn object(&mut self, mut fields: Vec<Field>) -> TypeId {
+        fields.sort_by(|left, right| left.name.cmp(&right.name));
+        self.intern(TypeKind::Object(fields))
+    }
+
     pub fn optional(&mut self, inner: TypeId) -> TypeId {
         let undefined = self.intern(TypeKind::Undefined);
         self.union(vec![inner, undefined])
@@ -143,6 +156,44 @@ mod tests {
         assert!(members.contains(&number));
         assert!(members.contains(&undefined));
         assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn object_field_order_does_not_change_type_identity() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let x = Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+        };
+        let y = Field {
+            name: "y".to_string(),
+            type_id: text,
+            optional: true,
+        };
+        assert_eq!(
+            table.object(vec![x.clone(), y.clone()]),
+            table.object(vec![y, x])
+        );
+    }
+
+    #[test]
+    fn an_optional_field_is_a_different_type() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let required = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+        }]);
+        let optional = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: true,
+        }]);
+        assert_ne!(required, optional);
     }
 
     #[test]
