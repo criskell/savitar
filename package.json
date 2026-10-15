@@ -1,0 +1,8 @@
+{
+  "name": "savitar-toolchain",
+  "private": true,
+  "description": "Pinned external type provider for savitar-typeinfo-tsapi",
+  "devDependencies": {
+    "tsc-rs": "0.7.0"
+  }
+}
