@@ -1002,6 +1002,111 @@ fn an_annotated_declaration_holds_the_declared_type() {
 }
 
 #[test]
+fn an_object_literal_widens_its_fields_to_fit_the_declared_shape() {
+    let source = "function hold(): void {\n  const kept: Point = { x: 1 };\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(point))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), point);
+}
+
+#[test]
+fn an_object_literal_with_no_declared_shape_still_widens_its_fields() {
+    let source = "function hold(): void {\n  const kept = { x: 1 };\n}\n";
+    let mut table = TypeTable::new();
+    let point = point_shape(&mut table);
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(
+        function.type_of(*target),
+        point,
+        "a field of an object literal holds the widened type, as it does in TypeScript"
+    );
+}
+
+#[test]
+fn an_object_literal_keeps_a_literal_field_the_declaration_asks_for() {
+    let source = "function hold(): void {\n  const kept: Tagged = { kind: \"ok\" };\n}\n";
+    let mut table = TypeTable::new();
+    let ok = table.intern(TypeKind::StringLiteral("ok".to_string()));
+    let tagged = table.object(vec![Field {
+        name: "kind".to_string(),
+        type_id: ok,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(tagged))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), tagged);
+}
+
+#[test]
+fn an_array_literal_widens_its_elements_to_fit_the_declared_array() {
+    let source = "function hold(): void {\n  const kept: number[] = [1, 2];\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let numbers = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![("kept", Answer::Known(numbers))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), numbers);
+}
+
+#[test]
+fn an_array_literal_with_no_declared_type_still_widens_its_elements() {
+    let source = "function hold(): void {\n  const kept = [1, 2];\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let numbers = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), numbers);
+}
+
+#[test]
 fn a_declaration_refuses_a_value_the_declared_type_does_not_admit() {
     let source = "function hold(): void {\n  const kept: number = \"hi\";\n}\n";
     let mut table = TypeTable::new();

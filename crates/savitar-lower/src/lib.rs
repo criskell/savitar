@@ -11,7 +11,7 @@ use oxc_ast::ast::{
     VariableDeclarator,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
 };
@@ -1186,6 +1186,22 @@ impl Context<'_> {
         target
     }
 
+    fn settled(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        wanted: Option<TypeId>,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        match wanted {
+            Some(wanted) if savitar_types::assignable(table, function.type_of(value), wanted) => {
+                self.coerced(function, table, value, wanted, span)
+            }
+            _ => self.widened(table, function, value, span),
+        }
+    }
+
     fn widened(
         &mut self,
         table: &mut TypeTable,
@@ -1648,6 +1664,10 @@ impl Context<'_> {
                 self.read_element(table, function, array, index, member)
             }
             Expression::ObjectExpression(object) => {
+                let declared = expected.and_then(|id| match table.kind(id) {
+                    TypeKind::Object { fields, .. } => Some(fields.clone()),
+                    _ => None,
+                });
                 let mut values = Vec::with_capacity(object.properties.len());
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {
@@ -1664,7 +1684,15 @@ impl Context<'_> {
                             "a computed key in an object literal is not lowered yet",
                         )]);
                     };
-                    let value = self.lower_expression(table, function, &property.value)?;
+                    let wanted = declared.as_ref().and_then(|fields| {
+                        fields
+                            .iter()
+                            .find(|field| field.name == name)
+                            .map(|field| field.type_id)
+                    });
+                    let value =
+                        self.lower_expression_expecting(table, function, &property.value, wanted)?;
+                    let value = self.settled(table, function, value, wanted, property.span);
                     values.push((name.to_string(), value));
                 }
                 let fields = values
@@ -1686,6 +1714,10 @@ impl Context<'_> {
                 ))
             }
             Expression::ArrayExpression(array) => {
+                let declared = expected.and_then(|id| match table.kind(id) {
+                    TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => Some(*element),
+                    _ => None,
+                });
                 let mut elements = Vec::with_capacity(array.elements.len());
                 for element in &array.elements {
                     let Some(element) = element.as_expression() else {
@@ -1695,7 +1727,10 @@ impl Context<'_> {
                             "a hole or spread in an array literal is not lowered yet",
                         )]);
                     };
-                    elements.push(self.lower_expression(table, function, element)?);
+                    let span = element.span();
+                    let value =
+                        self.lower_expression_expecting(table, function, element, declared)?;
+                    elements.push(self.settled(table, function, value, declared, span));
                 }
                 if elements.is_empty() {
                     let Some(declared) = expected else {
