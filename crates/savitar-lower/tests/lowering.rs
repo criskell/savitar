@@ -174,7 +174,10 @@ fn an_unbound_name_is_refused_rather_than_invented() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+    assert_eq!(
+        report.diagnostics[0].rule, "no-type-answer",
+        "a free name is the provider's business, and it has no type for this one"
+    );
 }
 
 #[test]
@@ -557,7 +560,10 @@ fn a_name_used_after_its_block_closed_is_refused() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+    assert_eq!(
+        report.diagnostics[0].rule, "no-type-answer",
+        "the block closed, so the name is free, and the provider has no type for it"
+    );
 }
 
 #[test]
@@ -624,6 +630,148 @@ fn a_for_of_over_something_that_is_not_an_array_is_refused() {
     assert!(report.functions.is_empty());
     assert!(
         report.diagnostics[0].message.contains("iterator protocol"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_conditional_expression_joins_both_arms_through_a_parameter() {
+    let source = "function pick(flag: boolean, left: number, right: number): number {\n  const chosen = flag ? left : right;\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1);
+    let Terminator::Return(Some(returned)) = joins[0].1.terminator else {
+        panic!("the join should return the chosen value");
+    };
+    assert_eq!(returned, joins[0].1.parameters[0]);
+}
+
+#[test]
+fn a_conditional_with_two_types_carries_their_union() {
+    let source = "function maybe(flag: boolean, value: number): number | undefined {\n  const held = flag ? value : undefined;\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("maybe.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Terminator::Return(Some(returned)) = function
+        .blocks()
+        .find(|(_, block)| !block.parameters.is_empty())
+        .expect("a join")
+        .1
+        .terminator
+    else {
+        panic!("expected a return");
+    };
+    assert!(table.admits_undefined(function.type_of(returned)));
+}
+
+#[test]
+fn a_name_the_function_does_not_bind_is_read_as_a_global() {
+    let source = "function call(value: number): number {\n  return helper(value);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let helper = table.function(vec![savitar_types::Parameter { type_id: number }], number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("value", Answer::Known(number)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .flat_map(|(_, block)| block.statements.iter())
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Global(_),
+                    ..
+                }
+            )),
+        "the free name should become a global read, not a refusal"
+    );
+}
+
+#[test]
+fn an_empty_array_literal_takes_its_element_type_from_the_declaration() {
+    let source = "function collect(): string[] {\n  const out: string[] = [];\n  return out;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let array = table.intern(TypeKind::Array(text));
+    let provider = ByName::new(source, vec![("out", Answer::Known(array))]);
+    let file = SourceFile::new("collect.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let entry = function.entry().expect("a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!("expected a return");
+    };
+    assert_eq!(
+        table.kind(function.type_of(returned)),
+        &TypeKind::Array(text)
+    );
+}
+
+#[test]
+fn an_empty_array_literal_with_nothing_declaring_it_is_refused() {
+    let source = "function collect(): void {\n  const out = [];\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("collect.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("nothing declares it"),
         "{}",
         report.diagnostics[0].message
     );

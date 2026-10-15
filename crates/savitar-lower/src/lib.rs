@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Expression, ForStatementLeft, FunctionBody,
-    ObjectPropertyKind, SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
+    Argument, AssignmentTarget, BindingPattern, Declaration, Expression, ForStatementLeft,
+    FunctionBody, ObjectPropertyKind, SimpleAssignmentTarget, Statement as AstStatement,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
@@ -69,8 +70,13 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
     let mut diagnostics = Vec::new();
 
     for statement in &parsed.program.body {
-        let AstStatement::FunctionDeclaration(declaration) = statement else {
-            continue;
+        let declaration = match statement {
+            AstStatement::FunctionDeclaration(declaration) => declaration,
+            AstStatement::ExportDeclaration(export) => match &export.declaration {
+                Declaration::FunctionDeclaration(declaration) => declaration,
+                _ => continue,
+            },
+            _ => continue,
         };
         let Some(body) = &declaration.body else {
             continue;
@@ -775,6 +781,90 @@ impl Context<'_> {
         Ok(self.assign(function, ty, Rvalue::Binary { op, left, right }, span))
     }
 
+    fn lower_conditional(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        conditional: &oxc_ast::ast::ConditionalExpression<'_>,
+        expected: Option<TypeId>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let condition = self.lower_expression(table, function, &conditional.test)?;
+        let then_entry = function.add_block(empty_block());
+        let else_entry = function.add_block(empty_block());
+        let join = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition,
+                then_block: then_entry,
+                then_arguments: Vec::new(),
+                else_block: else_entry,
+                else_arguments: Vec::new(),
+            },
+        );
+
+        self.current = then_entry;
+        self.statements.clear();
+        let then_value =
+            self.lower_expression_expecting(table, function, &conditional.consequent, expected)?;
+        let then_exit = self.current;
+        let then_statements = std::mem::take(&mut self.statements);
+
+        self.current = else_entry;
+        self.statements.clear();
+        let else_value =
+            self.lower_expression_expecting(table, function, &conditional.alternate, expected)?;
+        let else_exit = self.current;
+        let else_statements = std::mem::take(&mut self.statements);
+
+        let merged = table.union(vec![
+            function.type_of(then_value),
+            function.type_of(else_value),
+        ]);
+
+        self.current = then_exit;
+        self.statements = then_statements;
+        let then_carried = self.coerced(function, table, then_value, merged, conditional.span);
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: vec![then_carried],
+            },
+        );
+
+        self.current = else_exit;
+        self.statements = else_statements;
+        let else_carried = self.coerced(function, table, else_value, merged, conditional.span);
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: vec![else_carried],
+            },
+        );
+
+        let parameter = function.fresh_value(merged);
+        function.block_mut(join).parameters = vec![parameter];
+        self.current = join;
+        self.statements.clear();
+        Ok(parameter)
+    }
+
+    fn coerced(
+        &mut self,
+        function: &mut Function,
+        _table: &mut TypeTable,
+        value: ValueId,
+        wanted: TypeId,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        if function.type_of(value) == wanted {
+            return value;
+        }
+        self.assign(function, wanted, Rvalue::Widen(value), span)
+    }
+
     fn lower_declarator(
         &mut self,
         table: &mut TypeTable,
@@ -796,7 +886,11 @@ impl Context<'_> {
                 "a declaration without an initialiser is not lowered yet",
             )]);
         };
-        let value = self.lower_expression(table, function, init)?;
+        let declared = declarator
+            .type_annotation
+            .as_ref()
+            .and_then(|_| self.type_at(table, id.span).ok());
+        let value = self.lower_expression_expecting(table, function, init, declared)?;
         let value = if widening {
             self.widened(table, function, value, declarator.span)
         } else {
@@ -811,6 +905,16 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         expression: &Expression<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        self.lower_expression_expecting(table, function, expression, None)
+    }
+
+    fn lower_expression_expecting(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        expression: &Expression<'_>,
+        expected: Option<TypeId>,
     ) -> Result<ValueId, Vec<Diagnostic>> {
         match expression {
             Expression::NumericLiteral(literal) => {
@@ -857,14 +961,14 @@ impl Context<'_> {
                         id.span,
                     ));
                 }
-                Err(vec![refuse(
-                    "unsupported-reference",
-                    id.span,
-                    format!("`{}` is not bound in this function", id.name),
-                )])
+                let ty = self.type_at(table, id.span)?;
+                Ok(self.assign(function, ty, Rvalue::Global(id.name.to_string()), id.span))
             }
             Expression::ParenthesizedExpression(inner) => {
-                self.lower_expression(table, function, &inner.expression)
+                self.lower_expression_expecting(table, function, &inner.expression, expected)
+            }
+            Expression::ConditionalExpression(conditional) => {
+                self.lower_conditional(table, function, conditional, expected)
             }
             Expression::UnaryExpression(unary) => {
                 let Some(op) = unary_op(unary.operator) else {
@@ -984,11 +1088,31 @@ impl Context<'_> {
                     elements.push(self.lower_expression(table, function, element)?);
                 }
                 if elements.is_empty() {
-                    return Err(vec![refuse(
-                        "unsupported-expression",
+                    let Some(declared) = expected else {
+                        return Err(vec![refuse(
+                            "unsupported-expression",
+                            array.span,
+                            "an empty array literal names no element type, and nothing declares it",
+                        )]);
+                    };
+                    if !matches!(
+                        table.kind(declared),
+                        TypeKind::Array(_) | TypeKind::ReadonlyArray(_)
+                    ) {
+                        return Err(vec![refuse(
+                            "unsupported-expression",
+                            array.span,
+                            "an empty array literal is declared as something other than an array",
+                        )]);
+                    }
+                    return Ok(self.assign(
+                        function,
+                        declared,
+                        Rvalue::NewArray {
+                            elements: Vec::new(),
+                        },
                         array.span,
-                        "an empty array literal names no element type",
-                    )]);
+                    ));
                 }
                 let members: Vec<TypeId> =
                     elements.iter().map(|id| function.type_of(*id)).collect();
@@ -1026,7 +1150,7 @@ impl Context<'_> {
                 Err(vec![refuse(
                     "unsupported-expression",
                     other.span(),
-                    "this expression is not lowered yet",
+                    format!("`{}` is not lowered yet", expression_kind(other)),
                 )])
             }
         }
@@ -1057,4 +1181,31 @@ fn unary_op(operator: UnaryOperator) -> Option<UnaryOp> {
         UnaryOperator::Typeof => UnaryOp::TypeOf,
         _ => return None,
     })
+}
+
+fn expression_kind(expression: &Expression<'_>) -> &'static str {
+    match expression {
+        Expression::TemplateLiteral(_) => "a template literal",
+        Expression::ConditionalExpression(_) => "a conditional expression",
+        Expression::LogicalExpression(_) => "a logical operator",
+        Expression::AwaitExpression(_) => "await",
+        Expression::NewExpression(_) => "new",
+        Expression::ThisExpression(_) => "this",
+        Expression::ArrowFunctionExpression(_) => "an arrow function",
+        Expression::FunctionExpression(_) => "a function expression",
+        Expression::AssignmentExpression(_) => "an assignment used as a value",
+        Expression::UpdateExpression(_) => "an update used as a value",
+        Expression::TSAsExpression(_) => "an `as` assertion",
+        Expression::TSNonNullExpression(_) => "a `!` assertion",
+        Expression::TSSatisfiesExpression(_) => "a `satisfies` expression",
+        Expression::SequenceExpression(_) => "a comma expression",
+        Expression::TaggedTemplateExpression(_) => "a tagged template",
+        Expression::BigIntLiteral(_) => "a bigint literal",
+        Expression::RegExpLiteral(_) => "a regular expression literal",
+        Expression::ChainExpression(_) => "an optional chain",
+        Expression::ClassExpression(_) => "a class expression",
+        Expression::Super(_) => "super",
+        Expression::YieldExpression(_) => "yield",
+        _ => "this expression",
+    }
 }

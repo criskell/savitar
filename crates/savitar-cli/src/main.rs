@@ -8,7 +8,7 @@ use savitar_typeinfo_tsapi::TsApi;
 use savitar_types::TypeTable;
 
 fn usage() -> ExitCode {
-    eprintln!("usage: savitar check [--types] <file.ts>...");
+    eprintln!("usage: savitar check [--types] [--ir] <file.ts>...");
     eprintln!("       savitar rules");
     eprintln!("       savitar config");
     ExitCode::from(2)
@@ -79,10 +79,14 @@ fn main() -> ExitCode {
     }
 
     let mut with_types = false;
+    let mut with_ir = false;
     let mut paths: Vec<String> = Vec::new();
     for argument in args {
         if argument == "--types" {
             with_types = true;
+        } else if argument == "--ir" {
+            with_types = true;
+            with_ir = true;
         } else {
             paths.push(argument);
         }
@@ -143,6 +147,16 @@ fn main() -> ExitCode {
                 types.coverage.total(),
                 types.coverage.percent_known()
             );
+
+            if with_ir {
+                let lowered = savitar_lower::lower(&file, api, &mut table);
+                print!("{}", render(&file, &lowered.diagnostics));
+                println!(
+                    "savitar: {} function(s) lowered, {} refused",
+                    lowered.functions.len(),
+                    lowered.diagnostics.len()
+                );
+            }
         }
     }
 

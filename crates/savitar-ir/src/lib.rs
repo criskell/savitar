@@ -66,6 +66,7 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rvalue {
     Parameter(u32),
+    Global(String),
     Constant(Constant),
     Widen(ValueId),
     Unary {
