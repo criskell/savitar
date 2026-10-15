@@ -128,3 +128,42 @@ fn coverage_of_a_file_with_no_bindings_is_complete() {
     assert_eq!(report.coverage.total(), 0);
     assert_eq!(report.coverage.percent_known(), 100);
 }
+
+#[test]
+fn a_type_only_import_is_not_asked_for_a_value_type() {
+    let mut table = TypeTable::new();
+    let provider = Scripted::new(vec![]);
+    let file = savitar_diagnostics::SourceFile::new(
+        "fixture.ts",
+        "import type { User } from \"./model.ts\";\nimport { type Role, kind } from \"./role.ts\";\n",
+    );
+
+    let report = check_types(&file, &provider, &mut table);
+
+    assert_eq!(
+        report.coverage.total(),
+        1,
+        "only `kind` is a value binding; the type-only ones have no value type"
+    );
+    assert_eq!(provider.asked.borrow().len(), 1);
+}
+
+#[test]
+fn a_type_parameter_is_not_asked_for_a_value_type() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = Scripted::new(vec![Answer::Known(number), Answer::Known(number)]);
+    let file = savitar_diagnostics::SourceFile::new(
+        "fixture.ts",
+        "export function firstOf<T>(items: readonly T[]): T | undefined {\n  return items[0];\n}\n",
+    );
+
+    let report = check_types(&file, &provider, &mut table);
+
+    assert_eq!(
+        report.coverage.total(),
+        2,
+        "`firstOf` and `items` are value bindings; `T` is not"
+    );
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}

@@ -1,5 +1,6 @@
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
+use oxc_ast::ast::ImportOrExportKind;
 use oxc_parser::Parser;
 use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
@@ -57,6 +58,26 @@ pub fn check_types(
         .build(&parsed.program)
         .semantic;
 
+    let mut type_only: Vec<Span> = Vec::new();
+    for node in semantic.nodes() {
+        match node.kind() {
+            AstKind::ImportDeclaration(declaration)
+                if declaration.import_kind == ImportOrExportKind::Type =>
+            {
+                type_only.push(Span::new(declaration.span.start, declaration.span.end));
+            }
+            AstKind::ImportSpecifier(specifier)
+                if specifier.import_kind == ImportOrExportKind::Type =>
+            {
+                type_only.push(Span::new(specifier.span.start, specifier.span.end));
+            }
+            AstKind::TSTypeParameter(parameter) => {
+                type_only.push(Span::new(parameter.span.start, parameter.span.end));
+            }
+            _ => {}
+        }
+    }
+
     let mut diagnostics = Vec::new();
     let mut coverage = Coverage::default();
 
@@ -65,6 +86,13 @@ pub fn check_types(
             AstKind::BindingIdentifier(binding) => (binding.span, binding.name.as_str()),
             _ => continue,
         };
+
+        if type_only
+            .iter()
+            .any(|outer| outer.start <= span.start && span.end <= outer.end)
+        {
+            continue;
+        }
 
         let query = Span::new(span.end.saturating_sub(1), span.end);
         match provider.type_at(table, file.name(), query) {
