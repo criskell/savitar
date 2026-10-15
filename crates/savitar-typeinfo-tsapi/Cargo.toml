@@ -1,0 +1,15 @@
+[package]
+name = "savitar-typeinfo-tsapi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "TypeProvider over the TypeScript API protocol, spoken by both tsgo and tsc-rs"
+
+[dependencies]
+savitar-diagnostics.workspace = true
+savitar-typeinfo.workspace = true
+savitar-types.workspace = true
+
+[lints]
+workspace = true
