@@ -125,3 +125,19 @@ pub fn call_result(table: &TypeTable, callee: TypeId) -> Result<TypeId, String> 
         _ => Err("this value is not callable".to_string()),
     }
 }
+
+pub fn widen(table: &mut TypeTable, id: TypeId) -> TypeId {
+    match table.kind(id).clone() {
+        TypeKind::NumberLiteral(_) => table.intern(TypeKind::Number),
+        TypeKind::StringLiteral(_) => table.intern(TypeKind::String),
+        TypeKind::BooleanLiteral(_) => table.intern(TypeKind::Boolean),
+        TypeKind::Union(members) => {
+            let widened: Vec<TypeId> = members
+                .into_iter()
+                .map(|member| widen(table, member))
+                .collect();
+            table.union(widened)
+        }
+        _ => id,
+    }
+}

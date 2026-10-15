@@ -1,15 +1,17 @@
+mod assigned;
 mod types;
 
 use std::collections::HashMap;
 
 use oxc_allocator::Allocator;
+use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Expression, FunctionBody, ObjectPropertyKind,
-    Statement as AstStatement, VariableDeclarator,
+    SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
+use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator, UpdateOperator};
 use savitar_diagnostics::{Diagnostic, SourceFile, Span};
 use savitar_ir::{
     BinaryOp, Block, BlockId, Constant, Function, Rvalue, Statement, Terminator, UnaryOp, ValueId,
@@ -214,8 +216,9 @@ impl Context<'_> {
     ) -> Result<Flow, Vec<Diagnostic>> {
         match statement {
             AstStatement::VariableDeclaration(declaration) => {
+                let widening = declaration.kind != VariableDeclarationKind::Const;
                 for declarator in &declaration.declarations {
-                    self.lower_declarator(table, function, declarator)?;
+                    self.lower_declarator(table, function, declarator, widening)?;
                 }
                 Ok(Flow::Continues)
             }
@@ -235,6 +238,7 @@ impl Context<'_> {
                 self.lower_statements(table, function, &block.body)
             }
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
+            AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
             other => Err(vec![refuse(
                 "unsupported-statement",
                 statement_span(other),
@@ -250,17 +254,36 @@ impl Context<'_> {
         expression: &Expression<'_>,
     ) -> Result<(), Vec<Diagnostic>> {
         use oxc_span::GetSpan;
+        if let Expression::UpdateExpression(update) = expression {
+            let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument else {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    update.span,
+                    "only `++` and `--` on a plain name are lowered yet",
+                )]);
+            };
+            let held = self.bound(id.name.as_str(), id.span)?;
+            let op = if update.operator == UpdateOperator::Increment {
+                BinaryOp::Add
+            } else {
+                BinaryOp::Subtract
+            };
+            let one_type = table.number_literal(1.0);
+            let one = self.assign(
+                function,
+                one_type,
+                Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
+                update.span,
+            );
+            let stepped = self.combine(table, function, op, held, one, update.span)?;
+            self.scope.insert(id.name.to_string(), stepped);
+            return Ok(());
+        }
+
         let Expression::AssignmentExpression(assignment) = expression else {
             self.lower_expression(table, function, expression)?;
             return Ok(());
         };
-        if assignment.operator != AssignmentOperator::Assign {
-            return Err(vec![refuse(
-                "unsupported-operator",
-                assignment.span,
-                "a compound assignment is not lowered yet",
-            )]);
-        }
         let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left else {
             return Err(vec![refuse(
                 "unsupported-statement",
@@ -268,16 +291,141 @@ impl Context<'_> {
                 "only assignment to a plain name is lowered yet",
             )]);
         };
-        if !self.scope.contains_key(id.name.as_str()) {
-            return Err(vec![refuse(
-                "unsupported-reference",
-                id.span,
-                format!("`{}` is not bound in this function", id.name),
-            )]);
-        }
+        let held = self.bound(id.name.as_str(), id.span)?;
         let value = self.lower_expression(table, function, &assignment.right)?;
-        self.scope.insert(id.name.to_string(), value);
+        let stored = match assignment.operator {
+            AssignmentOperator::Assign => value,
+            AssignmentOperator::Addition => {
+                self.combine(table, function, BinaryOp::Add, held, value, assignment.span)?
+            }
+            AssignmentOperator::Subtraction => self.combine(
+                table,
+                function,
+                BinaryOp::Subtract,
+                held,
+                value,
+                assignment.span,
+            )?,
+            AssignmentOperator::Multiplication => self.combine(
+                table,
+                function,
+                BinaryOp::Multiply,
+                held,
+                value,
+                assignment.span,
+            )?,
+            AssignmentOperator::Division => self.combine(
+                table,
+                function,
+                BinaryOp::Divide,
+                held,
+                value,
+                assignment.span,
+            )?,
+            AssignmentOperator::Remainder => self.combine(
+                table,
+                function,
+                BinaryOp::Remainder,
+                held,
+                value,
+                assignment.span,
+            )?,
+            other => {
+                return Err(vec![refuse(
+                    "unsupported-operator",
+                    assignment.span,
+                    format!("the assignment `{}` is not lowered yet", other.as_str()),
+                )]);
+            }
+        };
+        self.scope.insert(id.name.to_string(), stored);
         Ok(())
+    }
+
+    fn lower_while(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::WhileStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let carried: Vec<String> = assigned::assigned_names(std::slice::from_ref(&statement.body))
+            .into_iter()
+            .filter(|name| self.scope.contains_key(name))
+            .collect();
+
+        let header = function.add_block(empty_block());
+        let mut parameters = Vec::with_capacity(carried.len());
+        let mut entry_arguments = Vec::with_capacity(carried.len());
+        for name in &carried {
+            let incoming = self.scope[name];
+            let parameter = function.fresh_value(function.type_of(incoming));
+            parameters.push(parameter);
+            entry_arguments.push(incoming);
+        }
+        function.block_mut(header).parameters = parameters.clone();
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: header,
+                arguments: entry_arguments,
+            },
+        );
+
+        self.current = header;
+        self.statements.clear();
+        for (name, parameter) in carried.iter().zip(&parameters) {
+            self.scope.insert(name.clone(), *parameter);
+        }
+        let at_header = self.scope.clone();
+
+        let condition = self.lower_expression(table, function, &statement.test)?;
+        let body = function.add_block(empty_block());
+        let exit = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition,
+                then_block: body,
+                then_arguments: Vec::new(),
+                else_block: exit,
+                else_arguments: Vec::new(),
+            },
+        );
+
+        self.current = body;
+        self.statements.clear();
+        let body_flow = self.lower_statement(table, function, &statement.body)?;
+
+        if body_flow == Flow::Continues {
+            let mut back_arguments = Vec::with_capacity(carried.len());
+            for name in &carried {
+                back_arguments.push(self.scope[name]);
+            }
+            for (name, value) in &self.scope {
+                if !at_header.contains_key(name) {
+                    continue;
+                }
+                if at_header.get(name) != Some(value) && !carried.contains(name) {
+                    return Err(vec![refuse(
+                        "malformed-ir",
+                        statement.span,
+                        format!("`{name}` changes in the loop but carries no header parameter"),
+                    )]);
+                }
+            }
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: header,
+                    arguments: back_arguments,
+                },
+            );
+        }
+
+        self.scope = at_header;
+        self.current = exit;
+        self.statements.clear();
+        Ok(Flow::Continues)
     }
 
     fn lower_if(
@@ -302,18 +450,40 @@ impl Context<'_> {
             },
         );
 
+        let join = function.add_block(empty_block());
+
         self.current = then_entry;
+        self.statements.clear();
         self.scope = before.clone();
         let then_flow = self.lower_statement(table, function, &statement.consequent)?;
         let then_exit = self.current;
+        if then_flow == Flow::Continues {
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: join,
+                    arguments: Vec::new(),
+                },
+            );
+        }
         let then_scope = std::mem::replace(&mut self.scope, before.clone());
 
         self.current = else_entry;
+        self.statements.clear();
         let else_flow = match &statement.alternate {
             Some(alternate) => self.lower_statement(table, function, alternate)?,
             None => Flow::Continues,
         };
         let else_exit = self.current;
+        if else_flow == Flow::Continues {
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: join,
+                    arguments: Vec::new(),
+                },
+            );
+        }
         let else_scope = std::mem::take(&mut self.scope);
 
         if then_flow == Flow::Returned && else_flow == Flow::Returned {
@@ -321,7 +491,6 @@ impl Context<'_> {
             return Ok(Flow::Returned);
         }
 
-        let join = function.add_block(empty_block());
         let mut parameters = Vec::new();
         let mut then_arguments = Vec::new();
         let mut else_arguments = Vec::new();
@@ -376,11 +545,51 @@ impl Context<'_> {
         Ok(Flow::Continues)
     }
 
+    fn widened(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        let held = function.type_of(value);
+        let wide = types::widen(table, held);
+        if wide == held {
+            return value;
+        }
+        self.assign(function, wide, Rvalue::Widen(value), span)
+    }
+
+    fn bound(&self, name: &str, span: oxc_span::Span) -> Result<ValueId, Vec<Diagnostic>> {
+        self.scope.get(name).copied().ok_or_else(|| {
+            vec![refuse(
+                "unsupported-reference",
+                span,
+                format!("`{name}` is not bound in this function"),
+            )]
+        })
+    }
+
+    fn combine(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        op: BinaryOp,
+        left: ValueId,
+        right: ValueId,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = types::binary_result(table, op, function.type_of(left), function.type_of(right))
+            .map_err(|reason| vec![refuse("unsupported-operator", span, reason)])?;
+        Ok(self.assign(function, ty, Rvalue::Binary { op, left, right }, span))
+    }
+
     fn lower_declarator(
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
         declarator: &VariableDeclarator<'_>,
+        widening: bool,
     ) -> Result<(), Vec<Diagnostic>> {
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
             return Err(vec![refuse(
@@ -397,6 +606,11 @@ impl Context<'_> {
             )]);
         };
         let value = self.lower_expression(table, function, init)?;
+        let value = if widening {
+            self.widened(table, function, value, declarator.span)
+        } else {
+            value
+        };
         self.scope.insert(id.name.to_string(), value);
         Ok(())
     }

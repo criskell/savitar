@@ -67,6 +67,7 @@ pub enum UnaryOp {
 pub enum Rvalue {
     Parameter(u32),
     Constant(Constant),
+    Widen(ValueId),
     Unary {
         op: UnaryOp,
         operand: ValueId,

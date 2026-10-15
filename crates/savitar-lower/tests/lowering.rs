@@ -179,7 +179,7 @@ fn an_unbound_name_is_refused_rather_than_invented() {
 
 #[test]
 fn an_unsupported_statement_names_itself_instead_of_being_skipped() {
-    let source = "function loops(limit: number): number {\n  while (true) {\n    return limit;\n  }\n  return limit;\n}\n";
+    let source = "function loops(limit: number): number {\n  for (const held of [limit]) {\n    return held;\n  }\n  return limit;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
     let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
@@ -346,11 +346,17 @@ fn both_branches_returning_leaves_no_join_at_all() {
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     let function = &report.functions[0];
     assert_eq!(verify(function), vec![]);
+    let dominance = savitar_ir::Dominance::of(function);
     assert_eq!(
-        function.block_count(),
+        dominance.reachable_blocks().len(),
         3,
-        "entry plus two arms, and no join to jump to"
+        "entry plus two arms; the join exists but nothing jumps to it"
     );
+    let unreachable = function
+        .blocks()
+        .filter(|(id, _)| !dominance.reachable(*id))
+        .count();
+    assert_eq!(unreachable, 1, "the join is left stranded, not deleted");
 }
 
 #[test]
@@ -394,4 +400,134 @@ fn assigning_to_an_unbound_name_is_refused() {
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+}
+
+#[test]
+fn a_loop_carries_its_running_total_through_a_header_parameter() {
+    let source = "function total(limit: number): number {\n  let sum = 0;\n  let seen = 0;\n  while (seen < limit) {\n    sum += seen;\n    seen++;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let headers: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(headers.len(), 1, "only the loop header takes parameters");
+    let (header, block) = &headers[0];
+    assert_eq!(
+        block.parameters.len(),
+        2,
+        "both `sum` and `seen` are carried across iterations"
+    );
+
+    let entering: Vec<usize> = function
+        .blocks()
+        .filter_map(|(_, candidate)| match &candidate.terminator {
+            Terminator::Jump { target, arguments } if target == header => Some(arguments.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        entering,
+        vec![2, 2],
+        "the entry and the back edge both pass both values"
+    );
+}
+
+#[test]
+fn a_loop_that_assigns_nothing_takes_no_header_parameter() {
+    let source = "function spin(flag: boolean): void {\n  while (flag) {\n    const ignored = flag;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(source, vec![("flag", Answer::Known(boolean))]);
+    let file = SourceFile::new("spin.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .all(|(_, block)| block.parameters.is_empty())
+    );
+}
+
+#[test]
+fn a_loop_whose_body_branches_still_carries_every_name() {
+    let source = "function count(limit: number, flag: boolean): number {\n  let seen = 0;\n  while (seen < limit) {\n    if (flag) {\n      seen += 2;\n    } else {\n      seen += 1;\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("count.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(
+        verify(function),
+        vec![],
+        "the inner join and the loop header must both carry `seen`"
+    );
+    let carrying = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .count();
+    assert_eq!(carrying, 2, "one for the inner join, one for the header");
+}
+
+#[test]
+fn a_compound_assignment_on_a_string_joins_instead_of_adding() {
+    let source = "function join(left: string, right: string): string {\n  let out = left;\n  out += right;\n  return out;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("left", Answer::Known(text)),
+            ("right", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("join.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let entry = function.entry().expect("a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!("expected a return");
+    };
+    assert_eq!(table.kind(function.type_of(returned)), &TypeKind::String);
+}
+
+#[test]
+fn incrementing_something_that_is_not_a_number_is_refused() {
+    let source = "function bump(label: string): void {\n  let held = label;\n  held++;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("label", Answer::Known(text))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
 }
