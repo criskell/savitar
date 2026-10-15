@@ -734,17 +734,18 @@ impl Context<'_> {
                     merged.insert(name.clone(), from_then);
                     continue;
                 }
-                if function.type_of(from_then) != function.type_of(from_else) {
-                    return Err(vec![refuse(
-                        "unsupported-statement",
-                        statement.span,
-                        format!("`{name}` leaves the branches with two different types"),
-                    )]);
-                }
-                let parameter = function.fresh_value(function.type_of(from_then));
+                let wanted = table.union(vec![
+                    function.type_of(from_then),
+                    function.type_of(from_else),
+                ]);
+                let carried_then =
+                    self.appended(function, then_exit, from_then, wanted, statement.span);
+                let carried_else =
+                    self.appended(function, else_exit, from_else, wanted, statement.span);
+                let parameter = function.fresh_value(wanted);
                 parameters.push(parameter);
-                then_arguments.push(from_then);
-                else_arguments.push(from_else);
+                then_arguments.push(carried_then);
+                else_arguments.push(carried_else);
                 merged.insert(name.clone(), parameter);
             }
         } else if then_flow == Flow::Continues {
@@ -771,6 +772,26 @@ impl Context<'_> {
         self.current = join;
         self.statements.clear();
         Ok(Flow::Continues)
+    }
+
+    fn appended(
+        &mut self,
+        function: &mut Function,
+        exit: BlockId,
+        value: ValueId,
+        wanted: TypeId,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        if function.type_of(value) == wanted {
+            return value;
+        }
+        let target = function.fresh_value(wanted);
+        function.block_mut(exit).statements.push(Statement::Assign {
+            target,
+            value: Rvalue::Widen(value),
+            span: span_of(span),
+        });
+        target
     }
 
     fn widened(

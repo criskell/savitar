@@ -363,7 +363,7 @@ fn both_branches_returning_leaves_no_join_at_all() {
 }
 
 #[test]
-fn a_name_that_leaves_the_branches_with_two_types_is_refused() {
+fn a_name_that_leaves_the_branches_with_two_types_carries_their_union() {
     let source = "function mixed(flag: boolean, left: number, right: string): void {\n  let held = left;\n  if (flag) {\n    held = right;\n  }\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -381,14 +381,18 @@ fn a_name_that_leaves_the_branches_with_two_types_is_refused() {
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert!(
-        report.diagnostics[0]
-            .message
-            .contains("two different types"),
-        "{}",
-        report.diagnostics[0].message
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1, "the join should take the merged name");
+    let held = joins[0].1.parameters[0];
+    let merged = table.union(vec![number, text]);
+    assert_eq!(function.type_of(held), merged);
 }
 
 #[test]
