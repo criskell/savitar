@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
-use savitar_types::{Field, IndexSignature, Parameter, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, Parameter, TypeKind, TypeTable, assignable};
 
 const SOURCE: &str = concat!(
     "const n = 1;\n",
@@ -51,6 +51,9 @@ const SOURCE: &str = concat!(
     "declare const keyedByAnyKey: Keyed[keyof Keyed];\n",
     "declare function indexAt<T, K extends keyof T>(t: T, k: K): T[K];\n",
     "declare const pattern: RegExp;\n",
+    "declare const execArray: RegExpExecArray;\n",
+    "interface Labelled extends Array<number> { label: string }\n",
+    "declare const labelled: Labelled;\n",
     "declare const pending: Promise<number>;\n",
     "declare const asyncFn: () => Promise<string>;\n",
     "const sum = 1 + 1;\n",
@@ -740,7 +743,7 @@ fn an_indexed_access_over_type_parameters_is_refused_naming_both_operands() {
 }
 
 #[test]
-fn the_deferred_indexed_access_behind_regexp_names_its_conditional_index() {
+fn the_refusal_behind_regexp_names_the_member_path_to_its_conditional_index() {
     let Some(binary) = provider_binary() else {
         eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
         return;
@@ -758,8 +761,129 @@ fn the_deferred_indexed_access_behind_regexp_names_its_conditional_index() {
         panic!("`RegExp` carries `FlatArray<A, D>`, which must not be guessed, got {answer:?}");
     };
     assert_eq!(
-        reason, "`T[K]` stays deferred: an object shape indexed by a conditional type",
-        "the blocker is the conditional index, so the refusal must say so"
+        reason,
+        "`exec`: `indices`: `flat`: `T[K]` stays deferred: an object shape indexed by a conditional type",
+        "the blocker sits under `exec`, so the refusal must name the member path to it"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn an_interface_that_extends_array_keeps_its_own_and_its_inherited_members() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_with("\"strict\": true, \"target\": \"es2018\"");
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("execArray"), 0));
+    let Answer::Known(resolved) = answer else {
+        panic!("`RegExpExecArray` has no member Savitar cannot model here, got {answer:?}");
+    };
+    let TypeKind::Object { fields, indexes } = table.kind(resolved).clone() else {
+        panic!(
+            "an interface that extends `Array` is a shape, not an array: {:?}",
+            table.kind(resolved)
+        );
+    };
+
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    for own in ["index", "input", "0", "groups"] {
+        assert!(names.contains(&own), "missing its own `{own}`: {names:?}");
+    }
+    for inherited in ["length", "push", "map", "concat"] {
+        assert!(
+            names.contains(&inherited),
+            "missing the inherited `{inherited}`: {names:?}"
+        );
+    }
+
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    assert_eq!(
+        indexes,
+        vec![IndexSignature {
+            key: number,
+            value: text
+        }],
+        "the element type comes from the index signature `Array` declares"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn regexp_resolves_whole_once_the_library_predates_flat() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_with("\"strict\": true, \"target\": \"es2018\"");
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("pattern"), 0));
+    let Answer::Known(resolved) = answer else {
+        panic!("only `flat` blocks `RegExp`, and es2018 has no `flat`, got {answer:?}");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(resolved).clone() else {
+        panic!("`RegExp` is a shape, got {:?}", table.kind(resolved));
+    };
+    let names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    for member in ["exec", "test", "source", "lastIndex"] {
+        assert!(names.contains(&member), "missing `{member}`: {names:?}");
+    }
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn dropping_the_inherited_members_would_accept_objects_the_interface_rejects() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_with("\"strict\": true, \"target\": \"es2018\"");
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("labelled"), 0));
+    let Answer::Known(whole) = answer else {
+        panic!("`Labelled` has no member Savitar cannot model here, got {answer:?}");
+    };
+    let TypeKind::Object { fields, indexes } = table.kind(whole).clone() else {
+        panic!("`Labelled` is a shape, got {:?}", table.kind(whole));
+    };
+
+    let label = fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("`Labelled` declares `label`")
+        .clone();
+    let own_members_only = table.object_with_indexes(vec![label], indexes);
+
+    assert!(
+        assignable(&table, whole, own_members_only),
+        "the whole shape still fits a shape holding only `label`"
+    );
+    assert!(
+        !assignable(&table, own_members_only, whole),
+        "a shape holding only `label` must not pass for `Labelled`, or the inherited members would stop being required"
     );
 
     std::fs::remove_dir_all(&project).ok();

@@ -60,6 +60,13 @@ fn property_named<'a>(properties: &'a [Value], wanted: &str) -> Option<&'a Value
         .find(|property| property.get("name").and_then(Value::as_str) == Some(wanted))
 }
 
+fn refusal_reached_through_member(member: &str, answer: Answer) -> Answer {
+    match answer {
+        Answer::Unsupported(reason) => Answer::Unsupported(format!("`{member}`: {reason}")),
+        other => other,
+    }
+}
+
 fn type_flags_of(response: &Value) -> TypeFlags {
     response
         .get("flags")
@@ -548,7 +555,7 @@ impl TsApi {
                     optional: symbol_flags.has(SymbolFlags::OPTIONAL),
                     method,
                 }),
-                other => return other,
+                other => return refusal_reached_through_member(name, other),
             }
         }
 
