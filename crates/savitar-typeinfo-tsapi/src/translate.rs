@@ -12,7 +12,48 @@ pub enum Classified {
     Intersection,
     Object,
     TypeParameter,
+    IndexedAccess,
     Unsupported(&'static str),
+}
+
+#[must_use]
+pub fn describe(flags: TypeFlags) -> &'static str {
+    for (flag, name) in [
+        (TypeFlags::TYPE_PARAMETER, "a type parameter"),
+        (TypeFlags::CONDITIONAL, "a conditional type"),
+        (TypeFlags::INDEXED_ACCESS, "another indexed access"),
+        (TypeFlags::INDEX, "a `keyof`"),
+        (TypeFlags::SUBSTITUTION, "a substituted type parameter"),
+        (TypeFlags::TEMPLATE_LITERAL, "a template literal type"),
+        (TypeFlags::STRING_MAPPING, "a mapped string"),
+        (TypeFlags::STRING_LITERAL, "a literal key"),
+        (TypeFlags::NUMBER_LITERAL, "a literal key"),
+        (TypeFlags::BIG_INT_LITERAL, "a literal key"),
+        (TypeFlags::BOOLEAN_LITERAL, "a literal key"),
+        (TypeFlags::UNIQUE_ES_SYMBOL, "a `unique symbol` key"),
+        (TypeFlags::ENUM, "an enum"),
+        (TypeFlags::ENUM_LITERAL, "an enum member"),
+        (TypeFlags::STRING, "`string`"),
+        (TypeFlags::NUMBER, "`number`"),
+        (TypeFlags::BIG_INT, "`bigint`"),
+        (TypeFlags::BOOLEAN, "`boolean`"),
+        (TypeFlags::ES_SYMBOL, "`symbol`"),
+        (TypeFlags::ANY, "`any`"),
+        (TypeFlags::UNKNOWN, "`unknown`"),
+        (TypeFlags::NEVER, "`never`"),
+        (TypeFlags::UNDEFINED, "`undefined`"),
+        (TypeFlags::NULL, "`null`"),
+        (TypeFlags::VOID, "`void`"),
+        (TypeFlags::NON_PRIMITIVE, "`object`"),
+        (TypeFlags::UNION, "a union"),
+        (TypeFlags::INTERSECTION, "an intersection"),
+        (TypeFlags::OBJECT, "an object shape"),
+    ] {
+        if flags.has(flag) {
+            return name;
+        }
+    }
+    "a type Savitar does not recognise"
 }
 
 #[must_use]
@@ -57,6 +98,10 @@ pub fn classify(flags: TypeFlags) -> Classified {
         }
     }
 
+    if flags.has(TypeFlags::INDEXED_ACCESS) {
+        return Classified::IndexedAccess;
+    }
+
     for (flag, reason) in [
         (
             TypeFlags::BIG_INT_LITERAL,
@@ -79,7 +124,6 @@ pub fn classify(flags: TypeFlags) -> Classified {
             TypeFlags::SUBSTITUTION,
             "type parameter substitution is not modelled yet",
         ),
-        (TypeFlags::INDEXED_ACCESS, "`T[K]` is not modelled yet"),
         (
             TypeFlags::CONDITIONAL,
             "conditional types need the type evaluator",
@@ -189,10 +233,34 @@ mod tests {
     }
 
     #[test]
+    fn an_indexed_access_is_handed_to_the_caller_so_its_operands_can_be_named() {
+        assert_eq!(
+            classify(TypeFlags::INDEXED_ACCESS),
+            Classified::IndexedAccess
+        );
+    }
+
+    #[test]
+    fn an_operand_of_an_indexed_access_is_described_by_what_it_is() {
+        assert_eq!(describe(TypeFlags::TYPE_PARAMETER), "a type parameter");
+        assert_eq!(describe(TypeFlags::CONDITIONAL), "a conditional type");
+        assert_eq!(describe(TypeFlags::OBJECT), "an object shape");
+        assert_eq!(describe(TypeFlags::STRING_LITERAL), "a literal key");
+        assert_eq!(describe(TypeFlags::INDEX), "a `keyof`");
+    }
+
+    #[test]
+    fn an_operand_with_no_flags_is_not_given_a_plausible_name() {
+        assert_eq!(
+            describe(TypeFlags::NONE),
+            "a type Savitar does not recognise"
+        );
+    }
+
+    #[test]
     fn hard_type_level_constructs_are_unsupported_not_guessed() {
         for flag in [
             TypeFlags::CONDITIONAL,
-            TypeFlags::INDEXED_ACCESS,
             TypeFlags::INDEX,
             TypeFlags::TEMPLATE_LITERAL,
             TypeFlags::BIG_INT_LITERAL,

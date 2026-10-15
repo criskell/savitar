@@ -11,7 +11,7 @@ use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTabl
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SymbolFlags, TypeFlags};
-use crate::translate::{Classified, classify};
+use crate::translate::{Classified, classify, describe};
 
 const MAX_TYPE_DEPTH: u32 = 32;
 
@@ -374,6 +374,21 @@ impl TsApi {
             signatures.push(IndexSignature { key, value });
         }
         Ok(signatures)
+    }
+
+    fn operand_of_indexed_access(&self, method: &str, id: u32) -> String {
+        match self.checker_call(method, "objectId", id) {
+            Ok(operand) => describe(type_flags_of(&operand)).to_string(),
+            Err(error) => format!("a type the checker would not hand over ({error})"),
+        }
+    }
+
+    fn refuse_indexed_access(&self, id: u32) -> Answer {
+        Answer::Unsupported(format!(
+            "`T[K]` stays deferred: {} indexed by {}",
+            self.operand_of_indexed_access("getObjectTypeOfType", id),
+            self.operand_of_indexed_access("getIndexTypeOfType", id)
+        ))
     }
 
     fn symbol_type(&self, reference: &Value) -> Result<Value, TsApiError> {
@@ -776,6 +791,7 @@ impl TsApi {
                 None => return Answer::Unsupported("a boolean literal with no value".into()),
             },
             Classified::TypeParameter => table.fresh_type_parameter(),
+            Classified::IndexedAccess => return self.refuse_indexed_access(id),
             Classified::Intersection => {
                 let answer = self.intern_intersection(table, id, depth);
                 if let Answer::Known(interned) = answer {

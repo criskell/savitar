@@ -46,6 +46,11 @@ const SOURCE: &str = concat!(
     "declare const loose2: (x: any) => void;\n",
     "declare const merged: { a: number } & { b: string };\n",
     "declare const clashing: { a: number } & { a: string };\n",
+    "interface Keyed { method: \"GET\" | \"POST\"; path: string }\n",
+    "declare const keyedPath: Keyed[\"path\"];\n",
+    "declare const keyedByAnyKey: Keyed[keyof Keyed];\n",
+    "declare function indexAt<T, K extends keyof T>(t: T, k: K): T[K];\n",
+    "declare const pattern: RegExp;\n",
     "declare const pending: Promise<number>;\n",
     "declare const asyncFn: () => Promise<string>;\n",
     "const sum = 1 + 1;\n",
@@ -676,6 +681,87 @@ fn a_generic_signature_keeps_its_type_parameters() {
         type_parameters[0], type_parameters[1],
         "two declared parameters must stay distinct"
     );
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_concrete_indexed_access_arrives_already_resolved_by_the_checker() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    for name in ["keyedPath", "keyedByAnyKey"] {
+        let answer = api.type_at(&mut table, path, Span::new(position_of(name), 0));
+        let Answer::Known(resolved) = answer else {
+            panic!("`{name}` should reach Savitar already resolved, got {answer:?}");
+        };
+        assert_eq!(
+            table.kind(resolved),
+            &TypeKind::String,
+            "`{name}` should be the property type, not an indexed access"
+        );
+    }
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn an_indexed_access_over_type_parameters_is_refused_naming_both_operands() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("indexAt"), 0));
+    let Answer::Unsupported(reason) = answer else {
+        panic!("a deferred `T[K]` must not be guessed, got {answer:?}");
+    };
+    assert_eq!(
+        reason, "`T[K]` stays deferred: a type parameter indexed by a type parameter",
+        "the refusal should name what the checker left abstract"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn the_deferred_indexed_access_behind_regexp_names_its_conditional_index() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_with("\"strict\": true, \"target\": \"es2022\"");
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("pattern"), 0));
+    let Answer::Unsupported(reason) = answer else {
+        panic!("`RegExp` carries `FlatArray<A, D>`, which must not be guessed, got {answer:?}");
+    };
+    assert_eq!(
+        reason, "`T[K]` stays deferred: an object shape indexed by a conditional type",
+        "the blocker is the conditional index, so the refusal must say so"
+    );
+
     std::fs::remove_dir_all(&project).ok();
 }
 
