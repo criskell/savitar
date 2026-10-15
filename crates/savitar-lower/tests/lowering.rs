@@ -827,3 +827,199 @@ fn a_member_no_one_can_type_is_refused() {
         report.diagnostics[0].message
     );
 }
+
+#[test]
+fn a_template_literal_turns_every_hole_into_text() {
+    let source =
+        "function label(name: string, count: number): string {\n  return `${name}: ${count}`;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("name", Answer::Known(text)),
+            ("count", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("label.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let block = function.block(savitar_ir::BlockId::from_index(0));
+    let Some(Statement::Assign {
+        value: Rvalue::Concat(parts),
+        target,
+        ..
+    }) = block.statements.last()
+    else {
+        panic!("the template should end in a concatenation");
+    };
+    assert_eq!(parts.len(), 3, "two holes and the text between them");
+    assert_eq!(function.type_of(*target), text);
+}
+
+#[test]
+fn a_template_literal_without_holes_is_a_text_constant() {
+    let source = "function fixed(): string {\n  return `ready`;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, Vec::new());
+    let file = SourceFile::new("fixed.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let block = function.block(savitar_ir::BlockId::from_index(0));
+    let [
+        Statement::Assign {
+            value: Rvalue::Constant(savitar_ir::Constant::String(text)),
+            ..
+        },
+    ] = block.statements.as_slice()
+    else {
+        panic!("expected one text constant, got {:?}", block.statements);
+    };
+    assert_eq!(text, "ready");
+}
+
+#[test]
+fn a_template_literal_refuses_a_hole_that_is_not_a_primitive() {
+    let source = "function label(point: { x: number }): string {\n  return `${point}`;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+    }]);
+    let provider = ByName::new(source, vec![("point", Answer::Known(shape))]);
+    let file = SourceFile::new("label.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0].message.contains("into text"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_or_carries_both_sides_into_the_join() {
+    let source =
+        "function fallback(left: string, right: string): string {\n  return left || right;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("left", Answer::Known(text)),
+            ("right", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("fallback.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(joins.len(), 1);
+    assert_eq!(function.type_of(joins[0].1.parameters[0]), text);
+    let Terminator::Return(Some(returned)) = joins[0].1.terminator else {
+        panic!("the join should return the chosen side");
+    };
+    assert_eq!(returned, joins[0].1.parameters[0]);
+}
+
+#[test]
+fn an_and_only_reaches_the_right_side_when_the_left_holds() {
+    let source = "function both(flag: boolean, right: string): boolean | string {\n  return flag && right;\n}\n";
+    let mut table = TypeTable::new();
+    let boolean = table.intern(TypeKind::Boolean);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("right", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("both.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let merged = table.union(vec![boolean, text]);
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(function.type_of(joins[0].1.parameters[0]), merged);
+
+    let branches = function
+        .blocks()
+        .filter(|(_, block)| matches!(block.terminator, Terminator::Branch { .. }))
+        .count();
+    assert_eq!(branches, 1, "the right side must sit behind a branch");
+}
+
+#[test]
+fn a_coalesce_drops_the_nullish_side() {
+    let source = "function orZero(maybe: number | undefined): number {\n  return maybe ?? 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let undefined = table.intern(TypeKind::Undefined);
+    let maybe = table.union(vec![number, undefined]);
+    let provider = ByName::new(source, vec![("maybe", Answer::Known(maybe))]);
+    let file = SourceFile::new("orZero.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins: Vec<_> = function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .collect();
+    assert_eq!(
+        function.type_of(joins[0].1.parameters[0]),
+        number,
+        "undefined is gone from both paths"
+    );
+
+    let nullish = function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.clone())
+        .filter(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Unary {
+                        op: savitar_ir::UnaryOp::IsNullish,
+                        ..
+                    },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(nullish, 1, "the test is for null and undefined, not truth");
+}

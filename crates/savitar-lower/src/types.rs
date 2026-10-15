@@ -36,6 +36,28 @@ pub fn is_text_convertible(table: &TypeTable, id: TypeId) -> bool {
     }
 }
 
+#[must_use]
+pub fn without_nullish(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
+    if is_nullish(table, id) {
+        return None;
+    }
+    let TypeKind::Union(members) = table.kind(id).clone() else {
+        return Some(id);
+    };
+    let kept: Vec<TypeId> = members
+        .into_iter()
+        .filter(|&member| !is_nullish(table, member))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(table.union(kept))
+}
+
+fn is_nullish(table: &TypeTable, id: TypeId) -> bool {
+    matches!(table.kind(id), TypeKind::Null | TypeKind::Undefined)
+}
+
 pub fn binary_result(
     table: &mut TypeTable,
     op: BinaryOp,

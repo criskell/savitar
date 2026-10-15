@@ -12,7 +12,9 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::SourceType;
-use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator, UpdateOperator};
+use oxc_syntax::operator::{
+    AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
+};
 use savitar_diagnostics::{Diagnostic, SourceFile, Span};
 use savitar_ir::{
     BinaryOp, Block, BlockId, Constant, Function, Rvalue, Statement, Terminator, UnaryOp, ValueId,
@@ -157,6 +159,11 @@ fn lower_function(
 fn statement_span(statement: &AstStatement<'_>) -> oxc_span::Span {
     use oxc_span::GetSpan;
     statement.span()
+}
+
+fn expression_span(expression: &Expression<'_>) -> oxc_span::Span {
+    use oxc_span::GetSpan;
+    expression.span()
 }
 
 impl Context<'_> {
@@ -875,6 +882,173 @@ impl Context<'_> {
         Ok(parameter)
     }
 
+    fn lower_template(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        template: &oxc_ast::ast::TemplateLiteral<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let mut texts = Vec::with_capacity(template.quasis.len());
+        for quasi in &template.quasis {
+            let Some(cooked) = quasi.value.cooked.as_ref() else {
+                return Err(vec![refuse(
+                    "unsupported-expression",
+                    quasi.span,
+                    "a template part with an invalid escape is not lowered yet",
+                )]);
+            };
+            texts.push(cooked.to_string());
+        }
+
+        if template.expressions.is_empty() {
+            let text = texts.into_iter().next().unwrap_or_default();
+            let ty = table.intern(TypeKind::StringLiteral(text.clone()));
+            return Ok(self.assign(
+                function,
+                ty,
+                Rvalue::Constant(Constant::String(text)),
+                template.span,
+            ));
+        }
+
+        let text = table.intern(TypeKind::String);
+        let mut parts = Vec::with_capacity(texts.len() + template.expressions.len());
+        for (index, expression) in template.expressions.iter().enumerate() {
+            if let Some(quasi) = texts.get(index).filter(|quasi| !quasi.is_empty()) {
+                let ty = table.intern(TypeKind::StringLiteral(quasi.clone()));
+                parts.push(self.assign(
+                    function,
+                    ty,
+                    Rvalue::Constant(Constant::String(quasi.clone())),
+                    template.span,
+                ));
+            }
+            let value = self.lower_expression(table, function, expression)?;
+            let span = expression_span(expression);
+            let converted = types::unary_result(table, UnaryOp::ToText, function.type_of(value))
+                .map_err(|reason| vec![refuse("unsupported-expression", span, reason)])?;
+            parts.push(self.assign(
+                function,
+                converted,
+                Rvalue::Unary {
+                    op: UnaryOp::ToText,
+                    operand: value,
+                },
+                span,
+            ));
+        }
+        if let Some(quasi) = texts.last().filter(|quasi| !quasi.is_empty()) {
+            let ty = table.intern(TypeKind::StringLiteral(quasi.clone()));
+            parts.push(self.assign(
+                function,
+                ty,
+                Rvalue::Constant(Constant::String(quasi.clone())),
+                template.span,
+            ));
+        }
+
+        Ok(self.assign(function, text, Rvalue::Concat(parts), template.span))
+    }
+
+    fn lower_logical(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        logical: &oxc_ast::ast::LogicalExpression<'_>,
+        expected: Option<TypeId>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let left = self.lower_expression(table, function, &logical.left)?;
+        let coalescing = logical.operator == LogicalOperator::Coalesce;
+        let condition = if coalescing {
+            let boolean = table.intern(TypeKind::Boolean);
+            self.assign(
+                function,
+                boolean,
+                Rvalue::Unary {
+                    op: UnaryOp::IsNullish,
+                    operand: left,
+                },
+                logical.span,
+            )
+        } else {
+            left
+        };
+
+        let right_entry = function.add_block(empty_block());
+        let carry_entry = function.add_block(empty_block());
+        let join = function.add_block(empty_block());
+        let right_on_then = logical.operator != LogicalOperator::Or;
+        let (then_block, else_block) = if right_on_then {
+            (right_entry, carry_entry)
+        } else {
+            (carry_entry, right_entry)
+        };
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition,
+                then_block,
+                then_arguments: Vec::new(),
+                else_block,
+                else_arguments: Vec::new(),
+            },
+        );
+
+        self.current = right_entry;
+        self.statements.clear();
+        let right = self.lower_expression_expecting(table, function, &logical.right, expected)?;
+        let right_exit = self.current;
+        let right_statements = std::mem::take(&mut self.statements);
+
+        let carried_type = if coalescing {
+            types::without_nullish(table, function.type_of(left))
+        } else {
+            Some(function.type_of(left))
+        };
+        let merged = match carried_type {
+            Some(kept) => table.union(vec![kept, function.type_of(right)]),
+            None => function.type_of(right),
+        };
+
+        self.current = right_exit;
+        self.statements = right_statements;
+        let widened = self.coerced(function, table, right, merged, logical.span);
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: vec![widened],
+            },
+        );
+
+        self.current = carry_entry;
+        self.statements.clear();
+        match carried_type {
+            Some(kept) => {
+                let narrowed = if kept == function.type_of(left) {
+                    left
+                } else {
+                    self.assign(function, kept, Rvalue::Narrow(left), logical.span)
+                };
+                let carried = self.coerced(function, table, narrowed, merged, logical.span);
+                self.seal(
+                    function,
+                    Terminator::Jump {
+                        target: join,
+                        arguments: vec![carried],
+                    },
+                );
+            }
+            None => self.seal(function, Terminator::Unreachable),
+        }
+
+        let parameter = function.fresh_value(merged);
+        function.block_mut(join).parameters = vec![parameter];
+        self.current = join;
+        self.statements.clear();
+        Ok(parameter)
+    }
+
     fn coerced(
         &mut self,
         function: &mut Function,
@@ -994,6 +1168,10 @@ impl Context<'_> {
             Expression::ConditionalExpression(conditional) => {
                 self.lower_conditional(table, function, conditional, expected)
             }
+            Expression::LogicalExpression(logical) => {
+                self.lower_logical(table, function, logical, expected)
+            }
+            Expression::TemplateLiteral(template) => self.lower_template(table, function, template),
             Expression::UnaryExpression(unary) => {
                 let Some(op) = unary_op(unary.operator) else {
                     return Err(vec![refuse(
@@ -1208,9 +1386,7 @@ fn unary_op(operator: UnaryOperator) -> Option<UnaryOp> {
 
 fn expression_kind(expression: &Expression<'_>) -> &'static str {
     match expression {
-        Expression::TemplateLiteral(_) => "a template literal",
         Expression::ConditionalExpression(_) => "a conditional expression",
-        Expression::LogicalExpression(_) => "a logical operator",
         Expression::AwaitExpression(_) => "await",
         Expression::NewExpression(_) => "new",
         Expression::ThisExpression(_) => "this",
