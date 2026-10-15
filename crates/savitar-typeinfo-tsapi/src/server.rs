@@ -747,6 +747,9 @@ impl TsApi {
                 "the type nests deeper than {MAX_TYPE_DEPTH} levels"
             ));
         }
+        if response.get("intrinsicName").and_then(Value::as_str) == Some("error") {
+            return Answer::OutOfScope;
+        }
         let Some(id) = response.get("id").and_then(Value::as_u64) else {
             return Answer::Unsupported("the checker answered without a type id".into());
         };

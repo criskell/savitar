@@ -48,6 +48,7 @@ const SOURCE: &str = concat!(
     "declare const clashing: { a: number } & { a: string };\n",
     "declare const pending: Promise<number>;\n",
     "declare const asyncFn: () => Promise<string>;\n",
+    "const sum = 1 + 1;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -674,6 +675,37 @@ fn a_generic_signature_keeps_its_type_parameters() {
     assert_ne!(
         type_parameters[0], type_parameters[1],
         "two declared parameters must stay distinct"
+    );
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn the_error_type_is_reported_as_no_answer_rather_than_unknown() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let operator = SOURCE
+        .find("1 + 1")
+        .expect("the fixture should hold an operator")
+        + 2;
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(u32::try_from(operator).expect("fixture is small"), 0),
+    );
+    assert_eq!(
+        answer,
+        Answer::OutOfScope,
+        "the checker's error type means there is no node here, not that the type is unknown"
     );
     std::fs::remove_dir_all(&project).ok();
 }
