@@ -1,5 +1,5 @@
 use savitar_ir::{BinaryOp, UnaryOp};
-use savitar_types::{TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
 #[must_use]
 pub fn is_numeric(table: &TypeTable, id: TypeId) -> bool {
@@ -257,6 +257,66 @@ pub fn call_result(table: &TypeTable, callee: TypeId) -> Result<TypeId, String> 
         TypeKind::Function { returns, .. } => Ok(*returns),
         TypeKind::Overloaded(_) => Err("an overloaded call is not resolved yet".to_string()),
         _ => Err("this value is not callable".to_string()),
+    }
+}
+
+pub struct Given {
+    pub name: String,
+    pub literal: Option<TypeId>,
+}
+
+#[must_use]
+pub fn contextual_fields(
+    table: &TypeTable,
+    expected: TypeId,
+    given: &[Given],
+) -> Option<Vec<Field>> {
+    if let TypeKind::Object { fields, .. } = table.kind(expected) {
+        return Some(fields.clone());
+    }
+    let TypeKind::Union(members) = table.kind(expected) else {
+        return None;
+    };
+    let mut fitting = members
+        .iter()
+        .filter_map(|&member| member_taking(table, member, given));
+    let only = fitting.next()?;
+    fitting.next().is_none().then_some(only)
+}
+
+fn member_taking(table: &TypeTable, member: TypeId, given: &[Given]) -> Option<Vec<Field>> {
+    let TypeKind::Object { fields, .. } = table.kind(member) else {
+        return None;
+    };
+    let every_required_field_is_given = fields
+        .iter()
+        .filter(|field| !field.optional)
+        .all(|field| given.iter().any(|one| one.name == field.name));
+    if !every_required_field_is_given {
+        return None;
+    }
+    for one in given {
+        let declared = fields.iter().find(|field| field.name == one.name)?;
+        if let Some(literal) = one.literal
+            && !savitar_types::assignable(table, literal, declared.type_id)
+        {
+            return None;
+        }
+    }
+    Some(fields.clone())
+}
+
+#[must_use]
+pub fn contextual_elements(
+    table: &TypeTable,
+    expected: TypeId,
+    count: usize,
+) -> Option<(Vec<TypeId>, bool)> {
+    match table.kind(expected) {
+        TypeKind::Tuple { elements, readonly } if elements.len() == count => {
+            Some((elements.clone(), *readonly))
+        }
+        _ => None,
     }
 }
 

@@ -1690,11 +1690,7 @@ impl Context<'_> {
                 self.read_element(table, function, array, index, member)
             }
             Expression::ObjectExpression(object) => {
-                let declared = expected.and_then(|id| match table.kind(id) {
-                    TypeKind::Object { fields, .. } => Some(fields.clone()),
-                    _ => None,
-                });
-                let mut values = Vec::with_capacity(object.properties.len());
+                let mut keys = Vec::with_capacity(object.properties.len());
                 for property in &object.properties {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {
                         return Err(vec![refuse(
@@ -1710,16 +1706,28 @@ impl Context<'_> {
                             "a computed key in an object literal is not lowered yet",
                         )]);
                     };
+                    keys.push(types::Given {
+                        name: name.to_string(),
+                        literal: literal_type(table, &property.value),
+                    });
+                }
+                let declared = expected.and_then(|id| types::contextual_fields(table, id, &keys));
+                let mut values = Vec::with_capacity(object.properties.len());
+                for (position, property) in object.properties.iter().enumerate() {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        unreachable!("every property was accepted above")
+                    };
+                    let name = &keys[position].name;
                     let wanted = declared.as_ref().and_then(|fields| {
                         fields
                             .iter()
-                            .find(|field| field.name == name)
+                            .find(|field| field.name == *name)
                             .map(|field| field.type_id)
                     });
                     let value =
                         self.lower_expression_expecting(table, function, &property.value, wanted)?;
                     let value = self.settled(table, function, value, wanted, property.span);
-                    values.push((name.to_string(), value));
+                    values.push((name.clone(), value));
                 }
                 let fields = values
                     .iter()
@@ -1740,12 +1748,14 @@ impl Context<'_> {
                 ))
             }
             Expression::ArrayExpression(array) => {
+                let positional = expected
+                    .and_then(|id| types::contextual_elements(table, id, array.elements.len()));
                 let declared = expected.and_then(|id| match table.kind(id) {
                     TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => Some(*element),
                     _ => None,
                 });
                 let mut elements = Vec::with_capacity(array.elements.len());
-                for element in &array.elements {
+                for (position, element) in array.elements.iter().enumerate() {
                     let Some(element) = element.as_expression() else {
                         return Err(vec![refuse(
                             "unsupported-expression",
@@ -1754,9 +1764,24 @@ impl Context<'_> {
                         )]);
                     };
                     let span = element.span();
+                    let wanted = positional
+                        .as_ref()
+                        .map(|(wanted, _)| wanted[position])
+                        .or(declared);
                     let value =
-                        self.lower_expression_expecting(table, function, element, declared)?;
-                    elements.push(self.settled(table, function, value, declared, span));
+                        self.lower_expression_expecting(table, function, element, wanted)?;
+                    elements.push(self.settled(table, function, value, wanted, span));
+                }
+                if let Some((_, readonly)) = positional {
+                    let held: Vec<TypeId> =
+                        elements.iter().map(|id| function.type_of(*id)).collect();
+                    let ty = table.tuple(held, readonly);
+                    return Ok(self.assign(
+                        function,
+                        ty,
+                        Rvalue::NewArray { elements },
+                        array.span,
+                    ));
                 }
                 if elements.is_empty() {
                     let Some(declared) = expected else {
@@ -1836,6 +1861,20 @@ impl Context<'_> {
                 )])
             }
         }
+    }
+}
+
+fn literal_type(table: &mut TypeTable, expression: &Expression<'_>) -> Option<TypeId> {
+    match expression {
+        Expression::NumericLiteral(literal) => Some(table.number_literal(literal.value)),
+        Expression::StringLiteral(literal) => {
+            Some(table.intern(TypeKind::StringLiteral(literal.value.to_string())))
+        }
+        Expression::BooleanLiteral(literal) => {
+            Some(table.intern(TypeKind::BooleanLiteral(literal.value)))
+        }
+        Expression::NullLiteral(_) => Some(table.intern(TypeKind::Null)),
+        _ => None,
     }
 }
 

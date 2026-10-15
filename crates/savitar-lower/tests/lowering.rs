@@ -747,6 +747,143 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
     );
 }
 
+fn tagged_union(table: &mut TypeTable) -> (savitar_types::TypeId, savitar_types::TypeId) {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let counted_tag = table.intern(TypeKind::StringLiteral("counted".to_string()));
+    let named_tag = table.intern(TypeKind::StringLiteral("named".to_string()));
+    let counted = table.object(vec![
+        Field {
+            name: "tag".to_string(),
+            type_id: counted_tag,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "value".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let named = table.object(vec![
+        Field {
+            name: "tag".to_string(),
+            type_id: named_tag,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "value".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let union = table.union(vec![counted, named]);
+    (union, named)
+}
+
+#[test]
+fn an_object_literal_takes_the_union_member_its_discriminant_names() {
+    let source =
+        "function hold(): void {\n  const kept: Tagged = { tag: \"named\", value: \"hi\" };\n}\n";
+    let mut table = TypeTable::new();
+    let (union, named) = tagged_union(&mut table);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(union))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let built = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::NewObject { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the literal should be built");
+    assert_eq!(
+        function.type_of(built),
+        named,
+        "the member with the matching discriminant types the literal, so `value` stays text"
+    );
+}
+
+#[test]
+fn an_object_literal_whose_discriminant_names_no_member_is_refused() {
+    let source =
+        "function hold(): void {\n  const kept: Tagged = { tag: \"other\", value: \"hi\" };\n}\n";
+    let mut table = TypeTable::new();
+    let (union, _) = tagged_union(&mut table);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(union))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("fits the declared type"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_array_literal_takes_the_tuple_the_declaration_asks_for() {
+    let source = "function hold(): void {\n  const kept: [number, string] = [1, \"hi\"];\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(pair))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::Assign { target, .. }) = only_block(function).statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), pair);
+}
+
+#[test]
+fn an_array_literal_the_tuple_has_no_room_for_is_refused() {
+    let source = "function hold(): void {\n  const kept: [number, string] = [1, \"hi\", 2];\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(pair))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("fits the declared type"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
 fn one_parameter(table: &mut TypeTable, takes: savitar_types::TypeId) -> savitar_types::TypeId {
     let number = table.intern(TypeKind::Number);
     table.function(
