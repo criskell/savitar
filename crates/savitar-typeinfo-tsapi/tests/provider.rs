@@ -56,6 +56,9 @@ const SOURCE: &str = concat!(
     "declare const labelled: Labelled;\n",
     "declare const pending: Promise<number>;\n",
     "declare const asyncFn: () => Promise<string>;\n",
+    "declare const frozen: { x: number; readonly y: string };\n",
+    "declare const frozenDict: { readonly [k: string]: number };\n",
+    "declare const mappedFrozen: Readonly<{ p: number }>;\n",
     "const sum = 1 + 1;\n",
 );
 
@@ -203,6 +206,7 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     assert_eq!(object, expected);
 
@@ -217,12 +221,14 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         },
         Field {
             name: "y".to_string(),
             type_id: text_kind,
             optional: false,
             method: false,
+            readonly: false,
         },
     ]);
     assert_eq!(shape, sorted, "declaration order must not change identity");
@@ -250,12 +256,14 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     let expected = table.object(vec![Field {
         name: "inner".to_string(),
         type_id: inner,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     assert_eq!(boxed, expected);
 
@@ -284,6 +292,7 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         vec![IndexSignature {
             key: text_kind,
             value: number,
+            readonly: false,
         }],
     );
     assert_eq!(dict, expected, "Record should become an index signature");
@@ -366,12 +375,14 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         },
         Field {
             name: "b".to_string(),
             type_id: text_kind,
             optional: false,
             method: false,
+            readonly: false,
         },
     ]);
     assert_eq!(
@@ -811,7 +822,8 @@ fn an_interface_that_extends_array_keeps_its_own_and_its_inherited_members() {
         indexes,
         vec![IndexSignature {
             key: number,
-            value: text
+            value: text,
+            readonly: false,
         }],
         "the element type comes from the index signature `Array` declares"
     );
@@ -917,5 +929,122 @@ fn the_error_type_is_reported_as_no_answer_rather_than_unknown() {
         Answer::OutOfScope,
         "the checker's error type means there is no node here, not that the type is unknown"
     );
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn the_readonly_mark_of_a_field_comes_from_the_declaration() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let shape = api.type_at(&mut table, path, Span::new(position_of("frozen"), 0));
+    let Answer::Known(shape) = shape else {
+        panic!("expected a known type for `frozen`, got {shape:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let expected = table.object(vec![
+        Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "y".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: true,
+        },
+    ]);
+    assert_eq!(shape, expected);
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_mapped_readonly_shape_marks_every_field_readonly() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let shape = api.type_at(&mut table, path, Span::new(position_of("mappedFrozen"), 0));
+    let Answer::Known(shape) = shape else {
+        panic!("expected a known type for `mappedFrozen`, got {shape:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    let expected = table.object(vec![Field {
+        name: "p".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: true,
+    }]);
+    assert_eq!(shape, expected);
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_readonly_index_signature_arrives_readonly() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let frozen = api.type_at(&mut table, path, Span::new(position_of("frozenDict"), 0));
+    let Answer::Known(frozen) = frozen else {
+        panic!("expected a known type for `frozenDict`, got {frozen:?}");
+    };
+    let mutable = api.type_at(&mut table, path, Span::new(position_of("dict"), 0));
+    let Answer::Known(mutable) = mutable else {
+        panic!("expected a known type for `dict`, got {mutable:?}");
+    };
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let expected = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: true,
+        }],
+    );
+    assert_eq!(frozen, expected);
+    assert_ne!(
+        frozen, mutable,
+        "a readonly index signature is not the same type as a mutable one"
+    );
+    assert!(
+        !assignable(&table, frozen, mutable),
+        "a readonly index signature must not pass for a mutable one, or a write would reach it"
+    );
+
     std::fs::remove_dir_all(&project).ok();
 }

@@ -20,6 +20,7 @@ pub struct Field {
     pub type_id: TypeId,
     pub optional: bool,
     pub method: bool,
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -31,6 +32,7 @@ pub struct Parameter {
 pub struct IndexSignature {
     pub key: TypeId,
     pub value: TypeId,
+    pub readonly: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,7 +201,7 @@ impl TypeTable {
         mut indexes: Vec<IndexSignature>,
     ) -> TypeId {
         fields.sort_by(|left, right| left.name.cmp(&right.name));
-        indexes.sort_by_key(|index| (index.key, index.value));
+        indexes.sort_by_key(|index| (index.key, index.value, index.readonly));
         self.intern(TypeKind::Object { fields, indexes })
     }
 
@@ -303,12 +305,14 @@ mod tests {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         };
         let y = Field {
             name: "y".to_string(),
             type_id: text,
             optional: true,
             method: false,
+            readonly: false,
         };
         assert_eq!(
             table.object(vec![x.clone(), y.clone()]),
@@ -337,6 +341,7 @@ mod tests {
             vec![IndexSignature {
                 key: text,
                 value: number,
+                readonly: false,
             }],
         );
         assert_ne!(plain, indexed);
@@ -350,10 +355,12 @@ mod tests {
         let by_text = IndexSignature {
             key: text,
             value: number,
+            readonly: false,
         };
         let by_number = IndexSignature {
             key: number,
             value: text,
+            readonly: false,
         };
         assert_eq!(
             table.object_with_indexes(vec![], vec![by_text.clone(), by_number.clone()]),
@@ -370,12 +377,14 @@ mod tests {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         }]);
         let optional = table.object(vec![Field {
             name: "x".to_string(),
             type_id: number,
             optional: true,
             method: false,
+            readonly: false,
         }]);
         assert_ne!(required, optional);
     }
@@ -390,12 +399,14 @@ mod tests {
             type_id: signature,
             optional: false,
             method: false,
+            readonly: false,
         }]);
         let as_method = table.object(vec![Field {
             name: "run".to_string(),
             type_id: signature,
             optional: false,
             method: true,
+            readonly: false,
         }]);
         assert_ne!(as_field, as_method);
     }
@@ -635,6 +646,7 @@ mod tests {
             vec![IndexSignature {
                 key: text,
                 value: number,
+                readonly: false,
             }],
         );
         let counted = table.object(vec![Field {
@@ -642,12 +654,14 @@ mod tests {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         }]);
         let named = table.object(vec![Field {
             name: "hits".to_string(),
             type_id: text,
             optional: false,
             method: false,
+            readonly: false,
         }]);
 
         assert!(assignable(&table, empty, dictionary));
@@ -665,18 +679,111 @@ mod tests {
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         }]);
         let optional = table.object(vec![Field {
             name: "x".to_string(),
             type_id: number,
             optional: true,
             method: false,
+            readonly: false,
         }]);
 
         assert!(!assignable(&table, empty, required));
         assert!(assignable(&table, empty, optional));
         assert!(assignable(&table, required, optional));
         assert!(!assignable(&table, optional, required));
+    }
+
+    #[test]
+    fn a_readonly_field_takes_a_narrower_type_and_a_mutable_one_does_not() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let zero = table.number_literal(0.0);
+        let mutable_zero = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: zero,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+        let mutable_number = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+        let frozen_number = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: true,
+        }]);
+
+        assert!(assignable(&table, mutable_zero, frozen_number));
+        assert!(!assignable(&table, mutable_zero, mutable_number));
+        assert!(assignable(&table, mutable_number, frozen_number));
+    }
+
+    #[test]
+    fn a_readonly_field_does_not_fit_a_mutable_one() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let frozen = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: true,
+        }]);
+        let mutable = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+
+        assert!(!assignable(&table, frozen, mutable));
+    }
+
+    #[test]
+    fn a_readonly_index_signature_does_not_fit_a_mutable_one() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let zero = table.number_literal(0.0);
+        let frozen = table.object_with_indexes(
+            Vec::new(),
+            vec![IndexSignature {
+                key: text,
+                value: number,
+                readonly: true,
+            }],
+        );
+        let mutable = table.object_with_indexes(
+            Vec::new(),
+            vec![IndexSignature {
+                key: text,
+                value: number,
+                readonly: false,
+            }],
+        );
+        let frozen_zeroes = table.object_with_indexes(
+            Vec::new(),
+            vec![IndexSignature {
+                key: text,
+                value: zero,
+                readonly: true,
+            }],
+        );
+
+        assert!(!assignable(&table, frozen, mutable));
+        assert!(assignable(&table, mutable, frozen));
+        assert!(assignable(&table, frozen_zeroes, frozen));
+        assert!(!assignable(&table, frozen_zeroes, mutable));
     }
 
     #[test]
@@ -688,6 +795,7 @@ mod tests {
             type_id: chain,
             optional: false,
             method: false,
+            readonly: false,
         }]);
         table.fill(chain, table.kind(node).clone());
 

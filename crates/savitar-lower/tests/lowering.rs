@@ -126,6 +126,7 @@ fn reading_a_field_the_shape_does_not_declare_is_refused() {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
     let file = SourceFile::new("take.ts", source);
@@ -625,6 +626,7 @@ fn a_for_of_over_something_that_is_not_an_array_is_refused() {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     let provider = ByName::new(source, vec![("values", Answer::Known(opaque))]);
     let file = SourceFile::new("walk.ts", source);
@@ -850,6 +852,7 @@ fn a_template_literal_refuses_a_hole_that_is_not_a_primitive() {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }]);
     let provider = ByName::new(source, vec![("point", Answer::Known(shape))]);
     let file = SourceFile::new("label.ts", source);
@@ -1076,6 +1079,7 @@ fn point_shape(table: &mut TypeTable) -> savitar_types::TypeId {
         type_id: number,
         optional: false,
         method: false,
+        readonly: false,
     }])
 }
 
@@ -1245,6 +1249,87 @@ fn writing_through_a_readonly_array_is_refused() {
 }
 
 #[test]
+fn writing_a_field_the_shape_declares_readonly_is_refused() {
+    let source = "function bump(point: Frozen): void {\n  point.x = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let frozen = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: true,
+    }]);
+    let provider = ByName::new(source, vec![("point", Answer::Known(frozen))]);
+    let file = SourceFile::new("bump.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("readonly"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn reading_a_field_the_shape_declares_readonly_is_still_lowered() {
+    let source = "function peek(point: Frozen): number {\n  return point.x;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let frozen = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: true,
+    }]);
+    let provider = ByName::new(source, vec![("point", Answer::Known(frozen))]);
+    let file = SourceFile::new("peek.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+}
+
+#[test]
+fn writing_through_a_readonly_index_signature_is_refused() {
+    let source = "function fill(out: Frozen, key: string): void {\n  out[key] = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: true,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![("out", Answer::Known(out)), ("key", Answer::Known(text))],
+    );
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("readonly index signature"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
 fn writing_through_an_index_signature_takes_the_value_the_signature_declares() {
     let source =
         "function fill(out: Record<string, number>, key: string): void {\n  out[key] = 2;\n}\n";
@@ -1256,6 +1341,7 @@ fn writing_through_an_index_signature_takes_the_value_the_signature_declares() {
         vec![IndexSignature {
             key: text,
             value: number,
+            readonly: false,
         }],
     );
     let provider = ByName::new(
@@ -1290,6 +1376,7 @@ fn writing_a_key_no_index_signature_accepts_is_refused() {
         vec![IndexSignature {
             key: text,
             value: number,
+            readonly: false,
         }],
     );
     let provider = ByName::new(
@@ -1554,6 +1641,7 @@ fn writing_a_field_an_index_signature_would_cover_is_still_refused() {
         vec![IndexSignature {
             key: text,
             value: number,
+            readonly: false,
         }],
     );
     let provider = ByName::new(source, vec![("out", Answer::Known(out))]);
@@ -1581,12 +1669,14 @@ fn outcome_union(table: &mut TypeTable) -> savitar_types::TypeId {
             type_id: ok_kind,
             optional: false,
             method: false,
+            readonly: false,
         },
         Field {
             name: "body".to_string(),
             type_id: text,
             optional: false,
             method: false,
+            readonly: false,
         },
     ]);
     let failed = table.object(vec![
@@ -1595,12 +1685,14 @@ fn outcome_union(table: &mut TypeTable) -> savitar_types::TypeId {
             type_id: error_kind,
             optional: false,
             method: false,
+            readonly: false,
         },
         Field {
             name: "detail".to_string(),
             type_id: number,
             optional: false,
             method: false,
+            readonly: false,
         },
     ]);
     table.union(vec![ok, failed])

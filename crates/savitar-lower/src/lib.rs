@@ -1674,6 +1674,7 @@ impl Context<'_> {
                         type_id: function.type_of(*value),
                         optional: false,
                         method: false,
+                        readonly: false,
                     })
                     .collect();
                 let ty = table.object(fields);

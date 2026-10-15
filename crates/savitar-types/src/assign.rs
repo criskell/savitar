@@ -94,7 +94,7 @@ fn decide(
                 fields: wanted,
                 indexes: wanted_indexes,
             },
-        ) => object_fits(table, fields, indexes, wanted, wanted_indexes),
+        ) => object_fits(table, fields, indexes, wanted, wanted_indexes, seen),
         (
             TypeKind::Function {
                 type_parameters,
@@ -131,6 +131,7 @@ fn object_fits(
     indexes: &[IndexSignature],
     wanted: &[Field],
     wanted_indexes: &[IndexSignature],
+    seen: &mut HashSet<(TypeId, TypeId)>,
 ) -> bool {
     for want in wanted {
         match fields.iter().find(|field| field.name == want.name) {
@@ -138,7 +139,7 @@ fn object_fits(
                 if field.optional && !want.optional {
                     return false;
                 }
-                if field.type_id != want.type_id {
+                if !fits_in_slot(table, field.type_id, field.readonly, want, seen) {
                     return false;
                 }
             }
@@ -150,21 +151,47 @@ fn object_fits(
         }
     }
     for want in wanted_indexes {
-        let covered = indexes
-            .iter()
-            .any(|index| index.key == want.key && index.value == want.value);
-        if covered {
+        if let Some(index) = indexes.iter().find(|index| index.key == want.key) {
+            if !value_fits_in_index(table, index.value, index.readonly, want, seen) {
+                return false;
+            }
             continue;
         }
         let reaches = fields
             .iter()
             .filter(|field| key_covers(table, want.key, &field.name))
-            .all(|field| field.type_id == want.value);
+            .all(|field| value_fits_in_index(table, field.type_id, field.readonly, want, seen));
         if !reaches {
             return false;
         }
     }
     true
+}
+
+fn fits_in_slot(
+    table: &TypeTable,
+    held: TypeId,
+    held_readonly: bool,
+    want: &Field,
+    seen: &mut HashSet<(TypeId, TypeId)>,
+) -> bool {
+    if want.readonly {
+        return relate(table, held, want.type_id, seen);
+    }
+    !held_readonly && held == want.type_id
+}
+
+fn value_fits_in_index(
+    table: &TypeTable,
+    held: TypeId,
+    held_readonly: bool,
+    want: &IndexSignature,
+    seen: &mut HashSet<(TypeId, TypeId)>,
+) -> bool {
+    if want.readonly {
+        return relate(table, held, want.value, seen);
+    }
+    !held_readonly && held == want.value
 }
 
 fn key_covers(table: &TypeTable, key: TypeId, name: &str) -> bool {

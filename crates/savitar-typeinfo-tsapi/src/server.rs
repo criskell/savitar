@@ -378,7 +378,15 @@ impl TsApi {
                     "an index signature value that is not modelled yet".into(),
                 ));
             };
-            signatures.push(IndexSignature { key, value });
+            let readonly = info
+                .get("isReadonly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            signatures.push(IndexSignature {
+                key,
+                value,
+                readonly,
+            });
         }
         Ok(signatures)
     }
@@ -396,6 +404,20 @@ impl TsApi {
             self.operand_of_indexed_access("getObjectTypeOfType", id),
             self.operand_of_indexed_access("getIndexTypeOfType", id)
         ))
+    }
+
+    fn symbol_is_readonly(&self, reference: &Value) -> Result<bool, TsApiError> {
+        let answer = self.request(
+            "isReadonlySymbol",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "symbol": reference,
+            }),
+        )?;
+        answer
+            .as_bool()
+            .ok_or_else(|| TsApiError::Protocol("isReadonlySymbol returned no boolean".into()))
     }
 
     fn symbol_type(&self, reference: &Value) -> Result<Value, TsApiError> {
@@ -547,6 +569,10 @@ impl TsApi {
                 Ok(field_type) => field_type,
                 Err(error) => return Answer::Unsupported(error.to_string()),
             };
+            let readonly = match self.symbol_is_readonly(reference) {
+                Ok(readonly) => readonly,
+                Err(error) => return Answer::Unsupported(error.to_string()),
+            };
 
             match self.intern_response(table, &field_type, depth + 1) {
                 Answer::Known(type_id) => fields.push(Field {
@@ -554,6 +580,7 @@ impl TsApi {
                     type_id,
                     optional: symbol_flags.has(SymbolFlags::OPTIONAL),
                     method,
+                    readonly,
                 }),
                 other => return refusal_reached_through_member(name, other),
             }

@@ -183,6 +183,11 @@ pub fn field_slot(
                 "`{name}` is a method, and writing over a method is not lowered yet"
             )));
         }
+        if field.readonly {
+            return Err(SlotRefusal::Declined(format!(
+                "`{name}` is declared readonly and admits no write"
+            )));
+        }
         if field.optional {
             return Ok(table.optional(field.type_id));
         }
@@ -228,6 +233,9 @@ pub fn element_slot(table: &mut TypeTable, array: TypeId, index: TypeId) -> Resu
                 signature.key == index || key_accepts(table, signature.key, index)
             });
             match matched {
+                Some(signature) if signature.readonly => {
+                    Err("a readonly index signature admits no write".to_string())
+                }
                 Some(signature) => Ok(signature.value),
                 None => Err("no index signature accepts this key".to_string()),
             }
