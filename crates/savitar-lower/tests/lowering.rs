@@ -782,57 +782,6 @@ fn an_empty_array_literal_with_nothing_declaring_it_is_refused() {
 }
 
 #[test]
-fn a_member_the_shape_does_not_declare_is_asked_of_the_provider() {
-    let source = "function size(items: number[]): number {\n  return items.length;\n}\n";
-    let mut table = TypeTable::new();
-    let number = table.intern(TypeKind::Number);
-    let items = table.intern(TypeKind::Array(number));
-    let provider = ByName::new(
-        source,
-        vec![
-            ("items", Answer::Known(items)),
-            ("length", Answer::Known(number)),
-        ],
-    );
-    let file = SourceFile::new("size.ts", source);
-
-    let report = lower(&file, &provider, &mut table);
-
-    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
-    let function = &report.functions[0];
-    let block = function.block(savitar_ir::BlockId::from_index(0));
-    let Some(Statement::Assign {
-        value: Rvalue::ReadField { name, .. },
-        target,
-        ..
-    }) = block.statements.last()
-    else {
-        panic!("expected a field read, got {:?}", block.statements);
-    };
-    assert_eq!(name, "length");
-    assert_eq!(function.type_of(*target), number);
-}
-
-#[test]
-fn a_member_no_one_can_type_is_refused() {
-    let source = "function size(items: number[]): number {\n  return items.length;\n}\n";
-    let mut table = TypeTable::new();
-    let number = table.intern(TypeKind::Number);
-    let items = table.intern(TypeKind::Array(number));
-    let provider = ByName::new(source, vec![("items", Answer::Known(items))]);
-    let file = SourceFile::new("size.ts", source);
-
-    let report = lower(&file, &provider, &mut table);
-
-    assert!(report.functions.is_empty());
-    assert!(
-        report.diagnostics[0].message.contains("no declared shape"),
-        "{}",
-        report.diagnostics[0].message
-    );
-}
-
-#[test]
 fn a_template_literal_turns_every_hole_into_text() {
     let source =
         "function label(name: string, count: number): string {\n  return `${name}: ${count}`;\n}\n";
@@ -1026,4 +975,96 @@ fn a_coalesce_drops_the_nullish_side() {
         })
         .count();
     assert_eq!(nullish, 1, "the test is for null and undefined, not truth");
+}
+
+#[test]
+fn an_annotated_declaration_holds_the_declared_type() {
+    let source = "function hold(): void {\n  const kept: number | undefined = 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let undefined = table.intern(TypeKind::Undefined);
+    let maybe = table.union(vec![number, undefined]);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(maybe))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let block = function.block(savitar_ir::BlockId::from_index(0));
+    let Some(Statement::Assign { target, .. }) = block.statements.last() else {
+        panic!("expected the declaration to assign");
+    };
+    assert_eq!(function.type_of(*target), maybe);
+}
+
+#[test]
+fn a_declaration_refuses_a_value_the_declared_type_does_not_admit() {
+    let source = "function hold(): void {\n  const kept: number = \"hi\";\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("kept", Answer::Known(number))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("fits the declared type"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_member_the_shape_does_not_declare_is_asked_of_the_provider() {
+    let source = "function size(items: number[]): number {\n  return items.length;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("items", Answer::Known(items)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let block = function.block(savitar_ir::BlockId::from_index(0));
+    let Some(Statement::Assign {
+        value: Rvalue::ReadField { name, .. },
+        target,
+        ..
+    }) = block.statements.last()
+    else {
+        panic!("expected a field read, got {:?}", block.statements);
+    };
+    assert_eq!(name, "length");
+    assert_eq!(function.type_of(*target), number);
+}
+
+#[test]
+fn a_member_no_one_can_type_is_refused() {
+    let source = "function size(items: number[]): number {\n  return items.length;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(source, vec![("items", Answer::Known(items))]);
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics[0].message.contains("no declared shape"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }

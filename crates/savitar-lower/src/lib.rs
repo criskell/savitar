@@ -1110,10 +1110,19 @@ impl Context<'_> {
             .as_ref()
             .and_then(|_| self.type_at(table, id.span).ok());
         let value = self.lower_expression_expecting(table, function, init, declared)?;
-        let value = if widening {
-            self.widened(table, function, value, declarator.span)
-        } else {
-            value
+        let value = match declared {
+            Some(declared) => {
+                if !savitar_types::assignable(table, function.type_of(value), declared) {
+                    return Err(vec![refuse(
+                        "unsupported-assignment",
+                        declarator.span,
+                        "Savitar cannot show this value fits the declared type",
+                    )]);
+                }
+                self.coerced(function, table, value, declared, declarator.span)
+            }
+            None if widening => self.widened(table, function, value, declarator.span),
+            None => value,
         };
         self.scope.insert(id.name.to_string(), value);
         Ok(())
