@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
-use savitar_types::{Field, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, TypeKind, TypeTable};
 
 const SOURCE: &str = concat!(
     "const n = 1;\n",
@@ -25,6 +25,8 @@ const SOURCE: &str = concat!(
     "declare const boxed: Boxed;\n",
     "interface Chain { next: Chain }\n",
     "declare const chain: Chain;\n",
+    "declare const dict: Record<string, number>;\n",
+    "declare const mixed: { a: number; [k: string]: number };\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -147,21 +149,19 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let Answer::Unsupported(reason) = other else {
         panic!("`Set` must not be guessed, got {other:?}");
     };
-    assert!(reason.contains("Set"), "unexpected: {reason}");
+    assert!(reason.contains("method"), "unexpected: {reason}");
 
     let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
     let Answer::Known(object) = object else {
         panic!("expected a known type for `pt`, got {object:?}");
     };
     let number = table.intern(TypeKind::Number);
-    assert_eq!(
-        table.kind(object),
-        &TypeKind::Object(vec![Field {
-            name: "x".to_string(),
-            type_id: number,
-            optional: false,
-        }])
-    );
+    let expected = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+    }]);
+    assert_eq!(object, expected);
 
     let shape = api.type_at(&mut table, path, Span::new(position_of("shape"), 0));
     let Answer::Known(shape) = shape else {
@@ -186,7 +186,7 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let Answer::Known(maybe) = maybe else {
         panic!("expected a known type for `maybe`, got {maybe:?}");
     };
-    let TypeKind::Object(fields) = table.kind(maybe).clone() else {
+    let TypeKind::Object { fields, .. } = table.kind(maybe).clone() else {
         panic!("expected an object, got {:?}", table.kind(maybe));
     };
     let tag = fields
@@ -205,20 +205,48 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         type_id: number,
         optional: false,
     }]);
-    assert_eq!(
-        table.kind(boxed),
-        &TypeKind::Object(vec![Field {
-            name: "inner".to_string(),
-            type_id: inner,
-            optional: false,
-        }])
-    );
+    let expected = table.object(vec![Field {
+        name: "inner".to_string(),
+        type_id: inner,
+        optional: false,
+    }]);
+    assert_eq!(boxed, expected);
 
     let chain = api.type_at(&mut table, path, Span::new(position_of("chain"), 0));
     let Answer::Unsupported(reason) = chain else {
         panic!("a recursive type must not be guessed, got {chain:?}");
     };
     assert!(reason.contains("recursive"), "unexpected: {reason}");
+
+    let dict = api.type_at(&mut table, path, Span::new(position_of("dict"), 0));
+    let Answer::Known(dict) = dict else {
+        panic!("expected a known type for `dict`, got {dict:?}");
+    };
+    let expected = table.object_with_indexes(
+        vec![],
+        vec![IndexSignature {
+            key: text_kind,
+            value: number,
+        }],
+    );
+    assert_eq!(dict, expected, "Record should become an index signature");
+
+    let mixed = api.type_at(&mut table, path, Span::new(position_of("mixed"), 0));
+    let Answer::Known(mixed) = mixed else {
+        panic!("expected a known type for `mixed`, got {mixed:?}");
+    };
+    let TypeKind::Object { fields, indexes } = table.kind(mixed).clone() else {
+        panic!("expected an object, got {:?}", table.kind(mixed));
+    };
+    assert_eq!(
+        fields.len(),
+        1,
+        "the named field should survive: {fields:?}"
+    );
+    assert_eq!(fields[0].name, "a");
+    assert_eq!(indexes.len(), 1, "the index signature should survive");
+    assert_eq!(table.kind(indexes[0].key), &TypeKind::String);
+    assert_eq!(table.kind(indexes[0].value), &TypeKind::Number);
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();

@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{Field, TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SymbolFlags, TypeFlags};
@@ -163,6 +163,15 @@ impl TsApi {
     }
 
     fn intern_union(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
+        if !self.resolving.borrow_mut().insert(object_id) {
+            return Answer::Unsupported("recursive types are not modelled yet".into());
+        }
+        let answer = self.intern_union_members(table, object_id, depth);
+        self.resolving.borrow_mut().remove(&object_id);
+        answer
+    }
+
+    fn intern_union_members(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
         let members = match self.union_members(object_id) {
             Ok(members) => members,
             Err(error) => return Answer::Unsupported(error.to_string()),
@@ -224,19 +233,51 @@ impl TsApi {
         )
     }
 
-    fn has_index_signature(&self, type_id: u32) -> Result<bool, TsApiError> {
-        let infos = self.checker_call("getIndexInfosOfType", "type", type_id)?;
-        Ok(infos.as_array().is_some_and(|infos| !infos.is_empty()))
+    fn index_signatures(
+        &self,
+        table: &mut TypeTable,
+        type_id: u32,
+        depth: u32,
+    ) -> Result<Vec<IndexSignature>, Answer> {
+        let infos = self
+            .checker_call("getIndexInfosOfType", "type", type_id)
+            .map_err(|error| Answer::Unsupported(error.to_string()))?;
+        let Some(infos) = infos.as_array() else {
+            return Err(Answer::Unsupported(
+                "getIndexInfosOfType returned no array".into(),
+            ));
+        };
+
+        let mut signatures = Vec::with_capacity(infos.len());
+        for info in infos {
+            let Some(key) = info.get("keyType") else {
+                return Err(Answer::Unsupported("an index signature with no key".into()));
+            };
+            let Some(value) = info.get("valueType") else {
+                return Err(Answer::Unsupported(
+                    "an index signature with no value".into(),
+                ));
+            };
+            let Answer::Known(key) = self.intern_response(table, key, depth + 1) else {
+                return Err(Answer::Unsupported(
+                    "an index signature key that is not modelled yet".into(),
+                ));
+            };
+            let Answer::Known(value) = self.intern_response(table, value, depth + 1) else {
+                return Err(Answer::Unsupported(
+                    "an index signature value that is not modelled yet".into(),
+                ));
+            };
+            signatures.push(IndexSignature { key, value });
+        }
+        Ok(signatures)
     }
 
     fn intern_fields(&self, table: &mut TypeTable, type_id: u32, depth: u32) -> Answer {
-        match self.has_index_signature(type_id) {
-            Ok(true) => {
-                return Answer::Unsupported("index signatures are not modelled yet".into());
-            }
-            Ok(false) => {}
-            Err(error) => return Answer::Unsupported(error.to_string()),
-        }
+        let indexes = match self.index_signatures(table, type_id, depth) {
+            Ok(indexes) => indexes,
+            Err(answer) => return answer,
+        };
 
         let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
             Ok(properties) => properties,
@@ -288,7 +329,7 @@ impl TsApi {
             }
         }
 
-        Answer::Known(table.object(fields))
+        Answer::Known(table.object_with_indexes(fields, indexes))
     }
 
     fn intern_object(
@@ -312,18 +353,17 @@ impl TsApi {
             .map(|bits| ObjectFlags(u32::try_from(bits).unwrap_or(0)))
             .unwrap_or_default();
 
-        if object_flags.has(ObjectFlags::MAPPED) {
-            return Answer::Unsupported("mapped types are not modelled yet".into());
-        }
-
         if !object_flags.has(ObjectFlags::REFERENCE) {
             if !object_flags.has(ObjectFlags(
-                ObjectFlags::ANONYMOUS.0 | ObjectFlags::INTERFACE.0 | ObjectFlags::CLASS.0,
+                ObjectFlags::ANONYMOUS.0
+                    | ObjectFlags::INTERFACE.0
+                    | ObjectFlags::CLASS.0
+                    | ObjectFlags::MAPPED.0,
             )) {
                 return Answer::Unsupported("object shapes are not resolved yet".into());
             }
             if !self.resolving.borrow_mut().insert(id) {
-                return Answer::Unsupported("recursive object types are not modelled yet".into());
+                return Answer::Unsupported("recursive types are not modelled yet".into());
             }
             let answer = self.intern_fields(table, id, depth);
             self.resolving.borrow_mut().remove(&id);
@@ -334,11 +374,13 @@ impl TsApi {
         let readonly = match name.as_deref() {
             Some("Array") => false,
             Some("ReadonlyArray") => true,
-            Some(other) => {
-                return Answer::Unsupported(format!("`{other}` is not resolved yet"));
-            }
-            None => {
-                return Answer::Unsupported("a generic reference with no symbol".into());
+            _ => {
+                if !self.resolving.borrow_mut().insert(id) {
+                    return Answer::Unsupported("recursive types are not modelled yet".into());
+                }
+                let answer = self.intern_fields(table, id, depth);
+                self.resolving.borrow_mut().remove(&id);
+                return answer;
             }
         };
 

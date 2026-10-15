@@ -18,6 +18,12 @@ pub struct Field {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexSignature {
+    pub key: TypeId,
+    pub value: TypeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Never,
     Null,
@@ -34,7 +40,10 @@ pub enum TypeKind {
     BooleanLiteral(bool),
     Array(TypeId),
     ReadonlyArray(TypeId),
-    Object(Vec<Field>),
+    Object {
+        fields: Vec<Field>,
+        indexes: Vec<IndexSignature>,
+    },
     Union(Vec<TypeId>),
     Nominal(NominalId),
     Unresolved,
@@ -106,9 +115,18 @@ impl TypeTable {
         self.intern(TypeKind::NumberLiteral(value.to_bits()))
     }
 
-    pub fn object(&mut self, mut fields: Vec<Field>) -> TypeId {
+    pub fn object(&mut self, fields: Vec<Field>) -> TypeId {
+        self.object_with_indexes(fields, Vec::new())
+    }
+
+    pub fn object_with_indexes(
+        &mut self,
+        mut fields: Vec<Field>,
+        mut indexes: Vec<IndexSignature>,
+    ) -> TypeId {
         fields.sort_by(|left, right| left.name.cmp(&right.name));
-        self.intern(TypeKind::Object(fields))
+        indexes.sort_by_key(|index| (index.key, index.value));
+        self.intern(TypeKind::Object { fields, indexes })
     }
 
     pub fn optional(&mut self, inner: TypeId) -> TypeId {
@@ -176,6 +194,41 @@ mod tests {
         assert_eq!(
             table.object(vec![x.clone(), y.clone()]),
             table.object(vec![y, x])
+        );
+    }
+
+    #[test]
+    fn an_index_signature_changes_type_identity() {
+        let mut table = TypeTable::new();
+        let text = table.intern(TypeKind::String);
+        let number = table.intern(TypeKind::Number);
+        let plain = table.object(vec![]);
+        let indexed = table.object_with_indexes(
+            vec![],
+            vec![IndexSignature {
+                key: text,
+                value: number,
+            }],
+        );
+        assert_ne!(plain, indexed);
+    }
+
+    #[test]
+    fn index_signature_order_does_not_change_type_identity() {
+        let mut table = TypeTable::new();
+        let text = table.intern(TypeKind::String);
+        let number = table.intern(TypeKind::Number);
+        let by_text = IndexSignature {
+            key: text,
+            value: number,
+        };
+        let by_number = IndexSignature {
+            key: number,
+            value: text,
+        };
+        assert_eq!(
+            table.object_with_indexes(vec![], vec![by_text.clone(), by_number.clone()]),
+            table.object_with_indexes(vec![], vec![by_number, by_text])
         );
     }
 
