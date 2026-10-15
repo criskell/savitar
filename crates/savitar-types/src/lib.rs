@@ -1,4 +1,8 @@
+mod assign;
+
 use std::collections::HashMap;
+
+pub use assign::assignable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId(u32);
@@ -582,5 +586,133 @@ mod tests {
 
         let unknown = table.intern(TypeKind::Unknown);
         assert_eq!(table.union(vec![unknown, number]), unknown);
+    }
+
+    #[test]
+    fn a_literal_fits_its_base_but_not_the_other_way() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let zero = table.number_literal(0.0);
+
+        assert!(assignable(&table, zero, number));
+        assert!(!assignable(&table, number, zero));
+    }
+
+    #[test]
+    fn a_value_fits_a_union_that_holds_it() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let undefined = table.intern(TypeKind::Undefined);
+        let maybe = table.union(vec![number, undefined]);
+
+        assert!(assignable(&table, undefined, maybe));
+        assert!(assignable(&table, maybe, maybe));
+        assert!(!assignable(&table, maybe, number));
+    }
+
+    #[test]
+    fn a_mutable_array_keeps_its_element_type_exactly() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let undefined = table.intern(TypeKind::Undefined);
+        let maybe = table.union(vec![number, undefined]);
+        let numbers = table.intern(TypeKind::Array(number));
+        let maybes = table.intern(TypeKind::Array(maybe));
+        let readonly_maybes = table.intern(TypeKind::ReadonlyArray(maybe));
+
+        assert!(!assignable(&table, numbers, maybes));
+        assert!(assignable(&table, numbers, readonly_maybes));
+    }
+
+    #[test]
+    fn a_shape_fits_an_index_signature_when_every_field_matches() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let text = table.intern(TypeKind::String);
+        let empty = table.object(Vec::new());
+        let dictionary = table.object_with_indexes(
+            Vec::new(),
+            vec![IndexSignature {
+                key: text,
+                value: number,
+            }],
+        );
+        let counted = table.object(vec![Field {
+            name: "hits".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+        }]);
+        let named = table.object(vec![Field {
+            name: "hits".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+        }]);
+
+        assert!(assignable(&table, empty, dictionary));
+        assert!(assignable(&table, counted, dictionary));
+        assert!(!assignable(&table, named, dictionary));
+    }
+
+    #[test]
+    fn a_missing_field_only_fits_an_optional_one() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let empty = table.object(Vec::new());
+        let required = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+        }]);
+        let optional = table.object(vec![Field {
+            name: "x".to_string(),
+            type_id: number,
+            optional: true,
+            method: false,
+        }]);
+
+        assert!(!assignable(&table, empty, required));
+        assert!(assignable(&table, empty, optional));
+        assert!(assignable(&table, required, optional));
+        assert!(!assignable(&table, optional, required));
+    }
+
+    #[test]
+    fn a_recursive_shape_fits_itself() {
+        let mut table = TypeTable::new();
+        let chain = table.reserve();
+        let node = table.object(vec![Field {
+            name: "next".to_string(),
+            type_id: chain,
+            optional: false,
+            method: false,
+        }]);
+        table.fill(chain, table.kind(node).clone());
+
+        assert!(assignable(&table, chain, node));
+    }
+
+    #[test]
+    fn a_function_takes_a_wider_parameter_and_returns_a_narrower_value() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let undefined = table.intern(TypeKind::Undefined);
+        let maybe = table.union(vec![number, undefined]);
+        let zero = table.number_literal(0.0);
+        let wide = table.intern(TypeKind::Function {
+            type_parameters: Vec::new(),
+            parameters: vec![Parameter { type_id: maybe }],
+            returns: zero,
+        });
+        let narrow = table.intern(TypeKind::Function {
+            type_parameters: Vec::new(),
+            parameters: vec![Parameter { type_id: number }],
+            returns: number,
+        });
+
+        assert!(assignable(&table, wide, narrow));
+        assert!(!assignable(&table, narrow, wide));
     }
 }
