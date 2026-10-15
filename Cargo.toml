@@ -11,6 +11,7 @@ rust-version = "1.90"
 [workspace.dependencies]
 savitar-diagnostics = { path = "crates/savitar-diagnostics" }
 savitar-types = { path = "crates/savitar-types" }
+savitar-ir = { path = "crates/savitar-ir" }
 savitar-typeinfo = { path = "crates/savitar-typeinfo" }
 savitar-typeinfo-tsapi = { path = "crates/savitar-typeinfo-tsapi" }
 savitar-sound = { path = "crates/savitar-sound" }

@@ -577,6 +577,14 @@ name = "savitar-diagnostics"
 version = "0.0.1"
 
 [[package]]
+name = "savitar-ir"
+version = "0.0.1"
+dependencies = [
+ "savitar-diagnostics",
+ "savitar-types",
+]
+
+[[package]]
 name = "savitar-sound"
 version = "0.0.1"
 dependencies = [
