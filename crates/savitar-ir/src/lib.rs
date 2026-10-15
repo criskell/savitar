@@ -61,6 +61,8 @@ pub enum UnaryOp {
     Negate,
     Not,
     TypeOf,
+    IsNullish,
+    ToText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,8 @@ pub enum Rvalue {
     Global(String),
     Constant(Constant),
     Widen(ValueId),
+    Narrow(ValueId),
+    Concat(Vec<ValueId>),
     Unary {
         op: UnaryOp,
         operand: ValueId,

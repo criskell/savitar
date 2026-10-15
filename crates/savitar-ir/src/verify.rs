@@ -187,7 +187,8 @@ fn statement_uses(statement: &Statement) -> Vec<ValueId> {
 fn rvalue_uses(value: &Rvalue) -> Vec<ValueId> {
     match value {
         Rvalue::Parameter(_) | Rvalue::Global(_) | Rvalue::Constant(_) => Vec::new(),
-        Rvalue::Widen(value) => vec![*value],
+        Rvalue::Widen(value) | Rvalue::Narrow(value) => vec![*value],
+        Rvalue::Concat(parts) => parts.clone(),
         Rvalue::Unary { operand, .. } => vec![*operand],
         Rvalue::Binary { left, right, .. } => vec![*left, *right],
         Rvalue::ReadField { object, .. } => vec![*object],

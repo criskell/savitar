@@ -17,6 +17,25 @@ pub fn is_textual(table: &TypeTable, id: TypeId) -> bool {
     )
 }
 
+#[must_use]
+pub fn is_text_convertible(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Null
+        | TypeKind::Undefined
+        | TypeKind::Boolean
+        | TypeKind::Number
+        | TypeKind::BigInt
+        | TypeKind::String
+        | TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_) => true,
+        TypeKind::Union(members) => members
+            .iter()
+            .all(|&member| is_text_convertible(table, member)),
+        _ => false,
+    }
+}
+
 pub fn binary_result(
     table: &mut TypeTable,
     op: BinaryOp,
@@ -65,8 +84,18 @@ pub fn unary_result(table: &mut TypeTable, op: UnaryOp, operand: TypeId) -> Resu
                 Err("`-` needs a number".to_string())
             }
         }
-        UnaryOp::Not => Ok(table.intern(TypeKind::Boolean)),
+        UnaryOp::Not | UnaryOp::IsNullish => Ok(table.intern(TypeKind::Boolean)),
         UnaryOp::TypeOf => Ok(table.intern(TypeKind::String)),
+        UnaryOp::ToText => {
+            if is_text_convertible(table, operand) {
+                Ok(table.intern(TypeKind::String))
+            } else {
+                Err(
+                    "turning a value that is not a primitive into text is not lowered yet"
+                        .to_string(),
+                )
+            }
+        }
     }
 }
 
