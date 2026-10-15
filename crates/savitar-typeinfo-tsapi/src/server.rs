@@ -553,14 +553,9 @@ impl TsApi {
         }
 
         let mut elements = Vec::with_capacity(shape.arity);
-        for (position, argument) in arguments[..shape.arity].iter().enumerate() {
+        for argument in &arguments[..shape.arity] {
             match self.intern_response(table, argument, depth + 1) {
                 Answer::Known(element) => {
-                    if table.admits_undefined(element) {
-                        return Answer::Unsupported(format!(
-                            "element {position} of the tuple admits `undefined`, which is not modelled yet"
-                        ));
-                    }
                     elements.push(element);
                 }
                 other => return other,

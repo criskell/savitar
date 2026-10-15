@@ -24,6 +24,7 @@ const SOURCE: &str = concat!(
     "declare const tupOpt: [number, string?];\n",
     "declare const tupRoRest: readonly [number, ...string[]];\n",
     "declare const tupUndef: [number, string | undefined];\n",
+    "declare const tupOptional: [number, string?];\n",
     "declare const arr: number[];\n",
     "declare const ro: readonly string[];\n",
     "declare const nested: number[][];\n",
@@ -489,7 +490,7 @@ fn a_tuple_with_a_rest_or_optional_element_is_refused() {
 }
 
 #[test]
-fn a_tuple_element_that_admits_undefined_is_refused() {
+fn a_tuple_element_that_admits_undefined_keeps_its_literal_arity() {
     let Some(binary) = provider_binary() else {
         eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
         return;
@@ -503,14 +504,20 @@ fn a_tuple_element_that_admits_undefined_is_refused() {
     let mut table = TypeTable::new();
 
     let answer = api.type_at(&mut table, path, Span::new(position_of("tupUndef"), 0));
-    let Answer::Unsupported(reason) = answer else {
-        panic!("a tuple element admitting `undefined` must not be guessed, got {answer:?}");
+    let Answer::Known(tuple) = answer else {
+        panic!("an explicit `| undefined` element has a literal arity, got {answer:?}");
     };
-    assert!(
-        reason.contains("element 1") && reason.contains("undefined"),
-        "the refusal should name the element, got: {reason}"
-    );
+    let TypeKind::Tuple { elements, .. } = table.kind(tuple).clone() else {
+        panic!("expected a tuple, got {:?}", table.kind(tuple));
+    };
+    assert_eq!(elements.len(), 2);
+    assert!(table.admits_undefined(elements[1]));
 
+    let optional = api.type_at(&mut table, path, Span::new(position_of("tupOptional"), 0));
+    let Answer::Unsupported(reason) = optional else {
+        panic!("an optional element must not be guessed, got {optional:?}");
+    };
+    assert!(reason.contains("optional"), "unexpected: {reason}");
     std::fs::remove_dir_all(&project).ok();
 }
 
