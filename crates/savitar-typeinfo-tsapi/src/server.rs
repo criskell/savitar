@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -46,7 +46,7 @@ pub struct TsApi {
     snapshot: RefCell<Value>,
     project: RefCell<Value>,
     cache: RefCell<HashMap<u32, TypeId>>,
-    resolving: RefCell<HashSet<u32>>,
+    resolving: RefCell<HashMap<u32, (TypeId, bool)>>,
 }
 
 fn file_uri(path: &Path) -> String {
@@ -79,7 +79,7 @@ impl TsApi {
             snapshot: RefCell::new(Value::Null),
             project: RefCell::new(Value::Null),
             cache: RefCell::new(HashMap::new()),
-            resolving: RefCell::new(HashSet::new()),
+            resolving: RefCell::new(HashMap::new()),
         };
 
         let uris: Vec<Value> = open_files
@@ -147,6 +147,38 @@ impl TsApi {
         )
     }
 
+    fn enter_resolution(&self, table: &mut TypeTable, id: u32) -> Result<TypeId, TypeId> {
+        if let Some(entry) = self.resolving.borrow_mut().get_mut(&id) {
+            entry.1 = true;
+            return Err(entry.0);
+        }
+        let slot = table.reserve();
+        self.resolving.borrow_mut().insert(id, (slot, false));
+        Ok(slot)
+    }
+
+    fn leave_resolution(
+        &self,
+        table: &mut TypeTable,
+        id: u32,
+        slot: TypeId,
+        answer: Answer,
+    ) -> Answer {
+        let used = self
+            .resolving
+            .borrow_mut()
+            .remove(&id)
+            .is_some_and(|entry| entry.1);
+        match answer {
+            Answer::Known(interned) if used => {
+                let kind = table.kind(interned).clone();
+                table.fill(slot, kind);
+                Answer::Known(slot)
+            }
+            other => other,
+        }
+    }
+
     fn union_members(&self, object_id: u32) -> Result<Vec<Value>, TsApiError> {
         let members = self.request(
             "getTypesOfType",
@@ -163,12 +195,12 @@ impl TsApi {
     }
 
     fn intern_union(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
-        if !self.resolving.borrow_mut().insert(object_id) {
-            return Answer::Unsupported("recursive types are not modelled yet".into());
-        }
+        let slot = match self.enter_resolution(table, object_id) {
+            Ok(slot) => slot,
+            Err(reserved) => return Answer::Known(reserved),
+        };
         let answer = self.intern_union_members(table, object_id, depth);
-        self.resolving.borrow_mut().remove(&object_id);
-        answer
+        self.leave_resolution(table, object_id, slot, answer)
     }
 
     fn intern_union_members(&self, table: &mut TypeTable, object_id: u32, depth: u32) -> Answer {
@@ -424,7 +456,10 @@ impl TsApi {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return Answer::Unsupported("tuple types are not resolved yet".into());
+            return Answer::Unsupported(
+                "the API omits a tuple's element flags, so a rest tuple is indistinguishable from a fixed one"
+                    .into(),
+            );
         }
 
         let object_flags = response
@@ -442,12 +477,12 @@ impl TsApi {
             )) {
                 return Answer::Unsupported("object shapes are not resolved yet".into());
             }
-            if !self.resolving.borrow_mut().insert(id) {
-                return Answer::Unsupported("recursive types are not modelled yet".into());
-            }
+            let slot = match self.enter_resolution(table, id) {
+                Ok(slot) => slot,
+                Err(reserved) => return Answer::Known(reserved),
+            };
             let answer = self.intern_fields(table, id, depth);
-            self.resolving.borrow_mut().remove(&id);
-            return answer;
+            return self.leave_resolution(table, id, slot, answer);
         }
 
         let name = self.symbol_name_of_type(id);
@@ -455,12 +490,12 @@ impl TsApi {
             Some("Array") => false,
             Some("ReadonlyArray") => true,
             _ => {
-                if !self.resolving.borrow_mut().insert(id) {
-                    return Answer::Unsupported("recursive types are not modelled yet".into());
-                }
+                let slot = match self.enter_resolution(table, id) {
+                    Ok(slot) => slot,
+                    Err(reserved) => return Answer::Known(reserved),
+                };
                 let answer = self.intern_fields(table, id, depth);
-                self.resolving.borrow_mut().remove(&id);
-                return answer;
+                return self.leave_resolution(table, id, slot, answer);
             }
         };
 

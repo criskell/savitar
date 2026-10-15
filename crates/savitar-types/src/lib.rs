@@ -75,6 +75,16 @@ impl TypeTable {
         Self::default()
     }
 
+    pub fn reserve(&mut self) -> TypeId {
+        let id = TypeId(u32::try_from(self.kinds.len()).expect("type table overflow"));
+        self.kinds.push(TypeKind::Unresolved);
+        id
+    }
+
+    pub fn fill(&mut self, id: TypeId, kind: TypeKind) {
+        self.kinds[id.0 as usize] = kind;
+    }
+
     pub fn intern(&mut self, kind: TypeKind) -> TypeId {
         if let Some(&id) = self.interned.get(&kind) {
             return id;
@@ -310,6 +320,29 @@ mod tests {
         assert_ne!(
             table.function(vec![left.clone(), right.clone()], void),
             table.function(vec![right, left], void)
+        );
+    }
+
+    #[test]
+    fn a_reserved_slot_starts_unresolved_and_can_be_filled_later() {
+        let mut table = TypeTable::new();
+        let slot = table.reserve();
+        assert_eq!(table.kind(slot), &TypeKind::Unresolved);
+        let number = table.intern(TypeKind::Number);
+        table.fill(slot, TypeKind::Array(slot));
+        assert_eq!(table.kind(slot), &TypeKind::Array(slot));
+        assert_ne!(slot, number);
+    }
+
+    #[test]
+    fn a_reserved_slot_is_never_handed_out_by_interning() {
+        let mut table = TypeTable::new();
+        let slot = table.reserve();
+        table.fill(slot, TypeKind::Number);
+        let interned = table.intern(TypeKind::Number);
+        assert_ne!(
+            slot, interned,
+            "a filled slot keeps its own identity, so recursion cannot be deduplicated"
         );
     }
 

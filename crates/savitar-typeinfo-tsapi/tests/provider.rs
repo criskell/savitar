@@ -221,10 +221,20 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     assert_eq!(boxed, expected);
 
     let chain = api.type_at(&mut table, path, Span::new(position_of("chain"), 0));
-    let Answer::Unsupported(reason) = chain else {
-        panic!("a recursive type must not be guessed, got {chain:?}");
+    let Answer::Known(chain) = chain else {
+        panic!("expected a known type for `chain`, got {chain:?}");
     };
-    assert!(reason.contains("recursive"), "unexpected: {reason}");
+    let TypeKind::Object { fields, .. } = table.kind(chain).clone() else {
+        panic!("expected an object, got {:?}", table.kind(chain));
+    };
+    let next = fields
+        .iter()
+        .find(|field| field.name == "next")
+        .expect("the recursive field should be present");
+    assert_eq!(
+        next.type_id, chain,
+        "the recursive field must point back at the same type"
+    );
 
     let dict = api.type_at(&mut table, path, Span::new(position_of("dict"), 0));
     let Answer::Known(dict) = dict else {
