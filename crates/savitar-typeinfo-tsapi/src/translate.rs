@@ -17,7 +17,7 @@ pub enum Classified {
 #[must_use]
 pub fn classify(flags: TypeFlags) -> Classified {
     if flags.has(TypeFlags::ANY) {
-        return Classified::Unsupported("the checker answered `any`, which carries no proof");
+        return Classified::Primitive(TypeKind::Unknown);
     }
     if flags.has(TypeFlags::ENUM) || flags.has(TypeFlags::ENUM_LITERAL) {
         return Classified::Unsupported("enums are not modelled yet: reverse mapping is unsound");
@@ -107,10 +107,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn any_is_never_translated() {
+    fn any_from_a_declaration_becomes_unknown_so_it_must_be_narrowed() {
         assert_eq!(
             classify(TypeFlags::ANY),
-            Classified::Unsupported("the checker answered `any`, which carries no proof")
+            Classified::Primitive(TypeKind::Unknown)
         );
     }
 

@@ -43,6 +43,7 @@ const SOURCE: &str = concat!(
     "declare const obj: { value: number; run(flag: boolean): void };\n",
     "declare function firstOf<T>(items: readonly T[]): T | undefined;\n",
     "declare function pick<K, V>(k: K, v: V): V;\n",
+    "declare const loose2: (x: any) => void;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -166,13 +167,17 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     };
     assert_eq!(table.kind(nested), &TypeKind::Array(array));
 
-    let other = api.type_at(&mut table, path, Span::new(position_of("st"), 0));
-    let Answer::Unsupported(reason) = other else {
-        panic!("`Set` must not be guessed, got {other:?}");
+    let written_any = api.type_at(&mut table, path, Span::new(position_of("loose2"), 0));
+    let Answer::Known(written_any) = written_any else {
+        panic!("a declared `any` arrives as `unknown`, got {written_any:?}");
     };
-    assert!(
-        reason.contains("any"),
-        "`Set` is refused because the standard library uses `any`, got: {reason}"
+    let TypeKind::Function { parameters, .. } = table.kind(written_any).clone() else {
+        panic!("expected a function, got {:?}", table.kind(written_any));
+    };
+    assert_eq!(
+        table.kind(parameters[0].type_id),
+        &TypeKind::Unknown,
+        "`any` must arrive as `unknown`, never as a proof"
     );
 
     let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
