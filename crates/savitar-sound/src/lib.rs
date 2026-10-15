@@ -1,3 +1,4 @@
+mod config;
 mod rules;
 
 use oxc_allocator::Allocator;
@@ -6,6 +7,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 use savitar_diagnostics::{Diagnostic, Severity, SourceFile, Span};
 
+pub use config::{CONFIG_REQUIREMENTS, ConfigRequirement, Demand, check_tsconfig};
 pub use rules::{RULES, Rule};
 
 #[derive(Debug)]
@@ -30,6 +32,17 @@ impl Report {
 
 #[must_use]
 pub fn check(file: &SourceFile) -> Report {
+    if file
+        .name()
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|base| base == "tsconfig.json" || base.ends_with(".tsconfig.json"))
+    {
+        return Report {
+            diagnostics: check_tsconfig(file),
+        };
+    }
+
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(file.name()).unwrap_or_else(|_| SourceType::ts());
     let parsed = Parser::new(&allocator, file.text(), source_type).parse();

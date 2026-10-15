@@ -5,6 +5,7 @@ use savitar_diagnostics::{SourceFile, render};
 fn usage() -> ExitCode {
     eprintln!("usage: savitar check <file.ts>...");
     eprintln!("       savitar rules");
+    eprintln!("       savitar config");
     ExitCode::from(2)
 }
 
@@ -20,6 +21,28 @@ fn list_rules() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn list_config() -> ExitCode {
+    let width = savitar_sound::CONFIG_REQUIREMENTS
+        .iter()
+        .map(|requirement| requirement.option.len())
+        .max()
+        .unwrap_or(0);
+    for requirement in savitar_sound::CONFIG_REQUIREMENTS {
+        let demand = match requirement.demand {
+            savitar_sound::Demand::MustBeTrue => "true ",
+            savitar_sound::Demand::MustNotBeTrue => "false",
+        };
+        println!(
+            "{:<width$}  {}  {}",
+            requirement.option,
+            demand,
+            requirement.reason,
+            width = width
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
@@ -27,6 +50,9 @@ fn main() -> ExitCode {
     };
     if command == "rules" {
         return list_rules();
+    }
+    if command == "config" {
+        return list_config();
     }
     if command != "check" {
         eprintln!("savitar: unknown command `{command}`");

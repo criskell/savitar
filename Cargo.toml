@@ -19,6 +19,7 @@ oxc_ast = "0.154.0"
 oxc_parser = "0.154.0"
 oxc_semantic = "0.154.0"
 oxc_span = "0.154.0"
+jsonc-parser = "0.34.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
