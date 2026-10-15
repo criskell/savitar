@@ -55,11 +55,13 @@ pub enum TypeKind {
         indexes: Vec<IndexSignature>,
     },
     Function {
+        type_parameters: Vec<TypeId>,
         parameters: Vec<Parameter>,
         returns: TypeId,
     },
     Union(Vec<TypeId>),
     Nominal(NominalId),
+    TypeParameter(u32),
     Unresolved,
 }
 
@@ -71,6 +73,7 @@ pub struct TypeTable {
     kinds: Vec<TypeKind>,
     interned: HashMap<TypeKind, TypeId>,
     nominal_names: Vec<String>,
+    type_parameters: u32,
 }
 
 impl TypeTable {
@@ -166,8 +169,24 @@ impl TypeTable {
         self.intern(TypeKind::Tuple { elements, readonly })
     }
 
+    pub fn fresh_type_parameter(&mut self) -> TypeId {
+        let ordinal = self.type_parameters;
+        self.type_parameters += 1;
+        self.intern(TypeKind::TypeParameter(ordinal))
+    }
+
     pub fn function(&mut self, parameters: Vec<Parameter>, returns: TypeId) -> TypeId {
+        self.generic_function(Vec::new(), parameters, returns)
+    }
+
+    pub fn generic_function(
+        &mut self,
+        type_parameters: Vec<TypeId>,
+        parameters: Vec<Parameter>,
+        returns: TypeId,
+    ) -> TypeId {
         self.intern(TypeKind::Function {
+            type_parameters,
             parameters,
             returns,
         })
@@ -315,6 +334,30 @@ mod tests {
             method: true,
         }]);
         assert_ne!(as_field, as_method);
+    }
+
+    #[test]
+    fn each_type_parameter_gets_its_own_identity() {
+        let mut table = TypeTable::new();
+        let first = table.fresh_type_parameter();
+        let second = table.fresh_type_parameter();
+        assert_ne!(
+            first, second,
+            "two declared parameters are distinct even when both are written `T`"
+        );
+    }
+
+    #[test]
+    fn a_generic_function_differs_from_the_same_shape_without_parameters() {
+        let mut table = TypeTable::new();
+        let parameter = table.fresh_type_parameter();
+        let plain = table.function(vec![Parameter { type_id: parameter }], parameter);
+        let generic = table.generic_function(
+            vec![parameter],
+            vec![Parameter { type_id: parameter }],
+            parameter,
+        );
+        assert_ne!(plain, generic);
     }
 
     #[test]

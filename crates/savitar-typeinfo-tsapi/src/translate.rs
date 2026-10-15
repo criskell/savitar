@@ -10,6 +10,7 @@ pub enum Classified {
     BooleanLiteral,
     Union,
     Object,
+    TypeParameter,
     Unsupported(&'static str),
 }
 
@@ -23,6 +24,9 @@ pub fn classify(flags: TypeFlags) -> Classified {
     }
     if flags.has(TypeFlags::BOOLEAN) {
         return Classified::Primitive(TypeKind::Boolean);
+    }
+    if flags.has(TypeFlags::TYPE_PARAMETER) {
+        return Classified::TypeParameter;
     }
 
     for (flag, kind) in [
@@ -63,10 +67,6 @@ pub fn classify(flags: TypeFlags) -> Classified {
         (
             TypeFlags::NON_PRIMITIVE,
             "the `object` keyword names no shape",
-        ),
-        (
-            TypeFlags::TYPE_PARAMETER,
-            "type parameters need monomorphisation first",
         ),
         (TypeFlags::INDEX, "`keyof T` is not modelled yet"),
         (
@@ -153,6 +153,14 @@ mod tests {
     }
 
     #[test]
+    fn a_type_parameter_is_recognised_rather_than_refused() {
+        assert_eq!(
+            classify(TypeFlags::TYPE_PARAMETER),
+            Classified::TypeParameter
+        );
+    }
+
+    #[test]
     fn a_plain_union_is_walked_by_the_caller() {
         assert_eq!(classify(TypeFlags::UNION), Classified::Union);
     }
@@ -186,7 +194,6 @@ mod tests {
             TypeFlags::INDEX,
             TypeFlags::TEMPLATE_LITERAL,
             TypeFlags::INTERSECTION,
-            TypeFlags::TYPE_PARAMETER,
             TypeFlags::BIG_INT_LITERAL,
         ] {
             assert!(

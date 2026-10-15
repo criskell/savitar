@@ -40,6 +40,8 @@ const SOURCE: &str = concat!(
     "declare const fn: (a: number, b: string) => boolean;\n",
     "declare const loose: (a?: number) => void;\n",
     "declare const obj: { value: number; run(flag: boolean): void };\n",
+    "declare function firstOf<T>(items: readonly T[]): T | undefined;\n",
+    "declare function pick<K, V>(k: K, v: V): V;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -73,9 +75,14 @@ fn scratch_project() -> PathBuf {
 }
 
 fn position_of(name: &str) -> u32 {
-    let needle = format!("const {name}");
-    let offset = SOURCE.find(&needle).expect("binding not in the fixture") + needle.len() - 1;
-    u32::try_from(offset).expect("fixture is small")
+    for prefix in ["const ", "function "] {
+        let needle = format!("{prefix}{name}");
+        if let Some(at) = SOURCE.find(&needle) {
+            let offset = at + needle.len() - 1;
+            return u32::try_from(offset).expect("fixture is small");
+        }
+    }
+    panic!("binding not in the fixture: {name}");
 }
 
 #[test]
@@ -159,9 +166,12 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     assert_eq!(table.kind(nested), &TypeKind::Array(array));
 
     let other = api.type_at(&mut table, path, Span::new(position_of("st"), 0));
+    let Answer::Unsupported(reason) = other else {
+        panic!("`Set` must not be guessed, got {other:?}");
+    };
     assert!(
-        matches!(other, Answer::Unsupported(_)),
-        "`Set` must not be guessed, got {other:?}"
+        reason.contains("any"),
+        "`Set` is refused because the standard library uses `any`, got: {reason}"
     );
 
     let object = api.type_at(&mut table, path, Span::new(position_of("pt"), 0));
@@ -544,5 +554,61 @@ fn without_the_array_library_a_tuple_is_refused_rather_than_called_readonly() {
         "the refusal should name the missing evidence, got: {reason}"
     );
 
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_generic_signature_keeps_its_type_parameters() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("firstOf"), 0));
+    let Answer::Known(generic) = answer else {
+        panic!("expected a known type for `firstOf`, got {answer:?}");
+    };
+    let TypeKind::Function {
+        type_parameters,
+        parameters,
+        returns,
+    } = table.kind(generic).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(generic));
+    };
+    assert_eq!(type_parameters.len(), 1);
+    let declared = type_parameters[0];
+    assert!(matches!(table.kind(declared), TypeKind::TypeParameter(_)));
+
+    assert_eq!(parameters.len(), 1);
+    assert_eq!(
+        table.kind(parameters[0].type_id),
+        &TypeKind::ReadonlyArray(declared),
+        "the parameter should be an array of the same declared parameter"
+    );
+    assert!(table.admits_undefined(returns));
+
+    let two = api.type_at(&mut table, path, Span::new(position_of("pick"), 0));
+    let Answer::Known(two) = two else {
+        panic!("expected a known type for `pick`, got {two:?}");
+    };
+    let TypeKind::Function {
+        type_parameters, ..
+    } = table.kind(two).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(two));
+    };
+    assert_eq!(type_parameters.len(), 2);
+    assert_ne!(
+        type_parameters[0], type_parameters[1],
+        "two declared parameters must stay distinct"
+    );
     std::fs::remove_dir_all(&project).ok();
 }

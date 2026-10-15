@@ -341,6 +341,28 @@ impl TsApi {
         };
         let signature_id = u32::try_from(signature_id).unwrap_or(u32::MAX);
 
+        let mut type_parameters = Vec::new();
+        for declared in signature
+            .get("typeParameters")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            let Some(declared) = declared.as_u64() else {
+                return Answer::Unsupported("a type parameter with no id".into());
+            };
+            let declared = u32::try_from(declared).unwrap_or(u32::MAX);
+            let known = self.cache.borrow().get(&declared).copied();
+            let interned = match known {
+                Some(interned) => interned,
+                None => {
+                    let fresh = table.fresh_type_parameter();
+                    self.cache.borrow_mut().insert(declared, fresh);
+                    fresh
+                }
+            };
+            type_parameters.push(interned);
+        }
+
         let parameters =
             match self.checker_call("getParametersOfSignature", "objectId", signature_id) {
                 Ok(parameters) => parameters,
@@ -379,7 +401,9 @@ impl TsApi {
             Err(error) => return Answer::Unsupported(error.to_string()),
         };
         match self.intern_response(table, &returns, depth + 1) {
-            Answer::Known(returns) => Answer::Known(table.function(interned, returns)),
+            Answer::Known(returns) => {
+                Answer::Known(table.generic_function(type_parameters, interned, returns))
+            }
             other => other,
         }
     }
@@ -669,6 +693,7 @@ impl TsApi {
                 Some(flag) => table.intern(TypeKind::BooleanLiteral(flag)),
                 None => return Answer::Unsupported("a boolean literal with no value".into()),
             },
+            Classified::TypeParameter => table.fresh_type_parameter(),
             Classified::Union => {
                 let answer = self.intern_union(table, id, depth);
                 if let Answer::Known(interned) = answer {
