@@ -47,6 +47,7 @@ pub enum TypeKind {
     BooleanLiteral(bool),
     Array(TypeId),
     ReadonlyArray(TypeId),
+    Promise(TypeId),
     Tuple {
         elements: Vec<TypeId>,
         readonly: bool,
@@ -268,6 +269,16 @@ mod tests {
         assert_eq!(
             table.object(vec![x.clone(), y.clone()]),
             table.object(vec![y, x])
+        );
+    }
+
+    #[test]
+    fn a_promise_is_not_an_array_of_the_same_element() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        assert_ne!(
+            table.intern(TypeKind::Promise(number)),
+            table.intern(TypeKind::Array(number))
         );
     }
 

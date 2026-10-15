@@ -46,6 +46,8 @@ const SOURCE: &str = concat!(
     "declare const loose2: (x: any) => void;\n",
     "declare const merged: { a: number } & { b: string };\n",
     "declare const clashing: { a: number } & { a: string };\n",
+    "declare const pending: Promise<number>;\n",
+    "declare const asyncFn: () => Promise<string>;\n",
 );
 
 fn provider_binary() -> Option<OsString> {
@@ -373,6 +375,25 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         matches!(clashing, Answer::Unsupported(_)),
         "a field declared twice with different types must not be merged, got {clashing:?}"
     );
+
+    let pending = api.type_at(&mut table, path, Span::new(position_of("pending"), 0));
+    let Answer::Known(pending) = pending else {
+        panic!("expected a known type for `pending`, got {pending:?}");
+    };
+    assert_eq!(
+        table.kind(pending),
+        &TypeKind::Promise(number),
+        "a promise is its own kind, not an object of `then` and `catch`"
+    );
+
+    let returning = api.type_at(&mut table, path, Span::new(position_of("asyncFn"), 0));
+    let Answer::Known(returning) = returning else {
+        panic!("expected a known type for `asyncFn`, got {returning:?}");
+    };
+    let TypeKind::Function { returns, .. } = table.kind(returning).clone() else {
+        panic!("expected a function, got {:?}", table.kind(returning));
+    };
+    assert_eq!(table.kind(returns), &TypeKind::Promise(text_kind));
 
     assert_eq!(api.name(), "tsapi");
     std::fs::remove_dir_all(&project).ok();

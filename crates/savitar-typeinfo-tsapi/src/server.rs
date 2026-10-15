@@ -642,6 +642,29 @@ impl TsApi {
         Answer::Known(table.tuple(elements, shape.readonly))
     }
 
+    fn intern_wrapper(
+        &self,
+        table: &mut TypeTable,
+        id: u32,
+        depth: u32,
+        wrap: fn(TypeId) -> TypeKind,
+    ) -> Answer {
+        let arguments = match self.type_arguments(id) {
+            Ok(arguments) => arguments,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        let [only] = arguments.as_slice() else {
+            return Answer::Unsupported(format!(
+                "a single-argument generic with {} type arguments",
+                arguments.len()
+            ));
+        };
+        match self.intern_response(table, only, depth + 1) {
+            Answer::Known(inner) => Answer::Known(table.intern(wrap(inner))),
+            other => other,
+        }
+    }
+
     fn intern_object(
         &self,
         table: &mut TypeTable,
@@ -681,6 +704,9 @@ impl TsApi {
         }
 
         let name = self.symbol_name_of_type(id);
+        if name.as_deref() == Some("Promise") {
+            return self.intern_wrapper(table, id, depth, TypeKind::Promise);
+        }
         let readonly = match name.as_deref() {
             Some("Array") => false,
             Some("ReadonlyArray") => true,
