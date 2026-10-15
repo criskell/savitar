@@ -10,6 +10,7 @@ description = "TypeProvider over the TypeScript API protocol, spoken by both tsg
 savitar-diagnostics.workspace = true
 savitar-typeinfo.workspace = true
 savitar-types.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

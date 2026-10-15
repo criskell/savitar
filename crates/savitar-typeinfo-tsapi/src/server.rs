@@ -1,0 +1,238 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use savitar_diagnostics::Span;
+use savitar_typeinfo::{Answer, TypeProvider};
+use savitar_types::{TypeId, TypeKind, TypeTable};
+use serde_json::{Value, json};
+
+use crate::flags::TypeFlags;
+use crate::translate::{Classified, classify};
+
+#[derive(Debug)]
+pub enum TsApiError {
+    Spawn(std::io::Error),
+    Transport(String),
+    Protocol(String),
+}
+
+impl std::fmt::Display for TsApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "could not start the type provider: {error}"),
+            Self::Transport(message) => write!(f, "transport: {message}"),
+            Self::Protocol(message) => write!(f, "protocol: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for TsApiError {}
+
+struct Connection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+pub struct TsApi {
+    connection: RefCell<Connection>,
+    next_id: Cell<u64>,
+    snapshot: RefCell<Value>,
+    project: RefCell<Value>,
+    cache: RefCell<HashMap<u32, TypeId>>,
+}
+
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.display())
+}
+
+impl TsApi {
+    pub fn start(binary: &OsStr, cwd: &Path, open_files: &[&Path]) -> Result<Self, TsApiError> {
+        let mut child = Command::new(binary)
+            .arg("--api")
+            .arg("--async")
+            .arg("--cwd")
+            .arg(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(TsApiError::Spawn)?;
+
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout was piped"));
+        let api = Self {
+            connection: RefCell::new(Connection {
+                child,
+                stdin,
+                stdout,
+            }),
+            next_id: Cell::new(0),
+            snapshot: RefCell::new(Value::Null),
+            project: RefCell::new(Value::Null),
+            cache: RefCell::new(HashMap::new()),
+        };
+
+        let uris: Vec<Value> = open_files
+            .iter()
+            .map(|path| json!({ "uri": file_uri(path) }))
+            .collect();
+        let created = api.request("createSnapshot", json!({ "openFiles": uris }))?;
+
+        let snapshot = created
+            .get("snapshot")
+            .cloned()
+            .ok_or_else(|| TsApiError::Protocol("createSnapshot returned no snapshot".into()))?;
+        let project = created
+            .get("projects")
+            .and_then(|projects| projects.get(0))
+            .and_then(|project| project.get("id"))
+            .cloned()
+            .ok_or_else(|| TsApiError::Protocol("createSnapshot returned no project".into()))?;
+
+        *api.snapshot.borrow_mut() = snapshot;
+        *api.project.borrow_mut() = project;
+        Ok(api)
+    }
+
+    fn request(&self, method: &str, params: Value) -> Result<Value, TsApiError> {
+        self.next_id.set(self.next_id.get() + 1);
+        let id = self.next_id.get();
+        let body =
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+
+        let mut connection = self.connection.borrow_mut();
+        write!(connection.stdin, "Content-Length: {}\r\n\r\n", body.len())
+            .and_then(|()| connection.stdin.write_all(body.as_bytes()))
+            .and_then(|()| connection.stdin.flush())
+            .map_err(|error| TsApiError::Transport(error.to_string()))?;
+
+        loop {
+            let message = read_message(&mut connection.stdout)?;
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                let text = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                return Err(TsApiError::Protocol(text.to_string()));
+            }
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| TsApiError::Protocol("response carried no result".into()));
+        }
+    }
+
+    fn type_response(&self, file: &str, position: u32) -> Result<Value, TsApiError> {
+        self.request(
+            "getTypeAtPosition",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "file": { "uri": file_uri(Path::new(file)) },
+                "position": position,
+            }),
+        )
+    }
+
+    fn intern_response(&self, table: &mut TypeTable, response: &Value) -> Answer {
+        let Some(id) = response.get("id").and_then(Value::as_u64) else {
+            return Answer::Unsupported("the checker answered without a type id".into());
+        };
+        let id = u32::try_from(id).unwrap_or(u32::MAX);
+        if let Some(&cached) = self.cache.borrow().get(&id) {
+            return Answer::Known(cached);
+        }
+
+        let flags = response
+            .get("flags")
+            .and_then(Value::as_u64)
+            .map(|bits| TypeFlags(u32::try_from(bits).unwrap_or(0)))
+            .unwrap_or_default();
+        let value = response.get("value");
+
+        let interned = match classify(flags) {
+            Classified::Primitive(kind) => table.intern(kind),
+            Classified::StringLiteral => match value.and_then(Value::as_str) {
+                Some(text) => table.intern(TypeKind::StringLiteral(text.to_string())),
+                None => return Answer::Unsupported("a string literal with no value".into()),
+            },
+            Classified::NumberLiteral => match value.and_then(Value::as_f64) {
+                Some(number) => table.number_literal(number),
+                None => return Answer::Unsupported("a number literal with no value".into()),
+            },
+            Classified::BooleanLiteral => match value.and_then(Value::as_bool) {
+                Some(flag) => table.intern(TypeKind::BooleanLiteral(flag)),
+                None => return Answer::Unsupported("a boolean literal with no value".into()),
+            },
+            Classified::Union => {
+                return Answer::Unsupported("union members are not walked yet".into());
+            }
+            Classified::Object => {
+                return Answer::Unsupported("object shapes are not resolved yet".into());
+            }
+            Classified::Unsupported(reason) => return Answer::Unsupported(reason.to_string()),
+        };
+
+        self.cache.borrow_mut().insert(id, interned);
+        Answer::Known(interned)
+    }
+}
+
+impl TypeProvider for TsApi {
+    fn name(&self) -> &'static str {
+        "tsapi"
+    }
+
+    fn type_at(&self, table: &mut TypeTable, file: &str, span: Span) -> Answer {
+        match self.type_response(file, span.start) {
+            Ok(response) => self.intern_response(table, &response),
+            Err(error) => Answer::Unsupported(error.to_string()),
+        }
+    }
+}
+
+impl Drop for TsApi {
+    fn drop(&mut self) {
+        let mut connection = self.connection.borrow_mut();
+        let _ = connection.stdin.flush();
+        let _ = connection.child.kill();
+        let _ = connection.child.wait();
+    }
+}
+
+fn read_message(stdout: &mut BufReader<ChildStdout>) -> Result<Value, TsApiError> {
+    let mut length: Option<usize> = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = stdout
+            .read_line(&mut line)
+            .map_err(|error| TsApiError::Transport(error.to_string()))?;
+        if read == 0 {
+            return Err(TsApiError::Transport("the provider closed stdout".into()));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Content-Length:") {
+            length = rest.trim().parse().ok();
+        }
+    }
+
+    let length =
+        length.ok_or_else(|| TsApiError::Protocol("a message without Content-Length".into()))?;
+    let mut body = vec![0u8; length];
+    stdout
+        .read_exact(&mut body)
+        .map_err(|error| TsApiError::Transport(error.to_string()))?;
+    serde_json::from_slice(&body).map_err(|error| TsApiError::Protocol(error.to_string()))
+}
