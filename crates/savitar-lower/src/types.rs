@@ -55,6 +55,35 @@ pub fn without_nullish(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
 }
 
 #[must_use]
+pub fn may_be_undefined(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Never
+        | TypeKind::Null
+        | TypeKind::Boolean
+        | TypeKind::Number
+        | TypeKind::BigInt
+        | TypeKind::String
+        | TypeKind::Symbol
+        | TypeKind::NonPrimitive
+        | TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_)
+        | TypeKind::Array(_)
+        | TypeKind::ReadonlyArray(_)
+        | TypeKind::Promise(_)
+        | TypeKind::Tuple { .. }
+        | TypeKind::Object { .. }
+        | TypeKind::Function { .. }
+        | TypeKind::Overloaded(_)
+        | TypeKind::Constructor(_) => false,
+        TypeKind::Union(members) => members
+            .iter()
+            .any(|&member| may_be_undefined(table, member)),
+        _ => true,
+    }
+}
+
+#[must_use]
 pub fn without_member(table: &mut TypeTable, id: TypeId, dropped: &TypeKind) -> Option<TypeId> {
     if table.kind(id) == dropped {
         return None;
@@ -574,6 +603,25 @@ pub fn declared_return(table: &TypeTable, signature: TypeId) -> Result<TypeId, S
     }
 }
 
+pub fn declared_parameter(
+    table: &TypeTable,
+    signature: TypeId,
+    position: usize,
+) -> Result<TypeId, String> {
+    let TypeKind::Function { parameters, .. } = table.kind(signature) else {
+        return Err("the provider gives no signature for this function".to_string());
+    };
+    let Some(parameter) = parameters.get(position) else {
+        return Err("the signature declares no type for this parameter".to_string());
+    };
+    if parameter.optional || parameter.rest {
+        return Err(
+            "an optional or rest parameter bound by a pattern is not lowered yet".to_string(),
+        );
+    }
+    Ok(parameter.type_id)
+}
+
 #[must_use]
 pub fn contextual_fields(
     table: &TypeTable,
@@ -638,6 +686,32 @@ pub fn takes_type_arguments(table: &TypeTable, signature: TypeId) -> bool {
             ..
         } if !type_parameters.is_empty()
     )
+}
+
+pub fn object_rest_of(
+    table: &mut TypeTable,
+    source: TypeId,
+    taken: &[String],
+) -> Result<TypeId, String> {
+    let TypeKind::Object { fields, indexes } = table.kind(source).clone() else {
+        return Err("a rest in an object pattern needs a declared shape to take from".to_string());
+    };
+    if !indexes.is_empty() {
+        return Err(
+            "a rest over a shape with an index signature is not lowered yet, because the keys it carries are not named".to_string(),
+        );
+    }
+    let kept: Vec<Field> = fields
+        .into_iter()
+        .filter(|field| !taken.contains(&field.name))
+        .collect();
+    if let Some(method) = kept.iter().find(|field| field.method) {
+        return Err(format!(
+            "`{}` is a method, and a rest cannot show a method is copied",
+            method.name
+        ));
+    }
+    Ok(table.object(kept))
 }
 
 pub fn rest_of(table: &mut TypeTable, source: TypeId, from: u32) -> Result<TypeId, String> {

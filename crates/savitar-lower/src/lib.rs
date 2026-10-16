@@ -349,19 +349,30 @@ fn lower_function(
         declared
     };
 
-    for parameter in &declaration.params.items {
-        let BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+    let mut patterned = Vec::new();
+    for (position, parameter) in declaration.params.items.iter().enumerate() {
+        if let BindingPattern::BindingIdentifier(id) = &parameter.pattern {
+            let ty = context.type_at(table, id.span)?;
+            let value = function.declare_parameter(ty);
+            context
+                .scope
+                .insert(id.name.to_string(), Binding::written(value, ty));
+            continue;
+        }
+        if parameter.initializer.is_some() {
             return Err(vec![refuse(
                 "unsupported-pattern",
                 parameter.span,
-                "a parameter that is not a plain name is not lowered yet",
+                "a default on a parameter bound by a pattern is not lowered yet",
             )]);
-        };
-        let ty = context.type_at(table, id.span)?;
+        }
+        let ty = types::declared_parameter(table, signature, position)
+            .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?;
         let value = function.declare_parameter(ty);
-        context
-            .scope
-            .insert(id.name.to_string(), Binding::written(value, ty));
+        patterned.push((&parameter.pattern, value));
+    }
+    for (pattern, value) in patterned {
+        context.bind_pattern(table, &mut function, pattern, value)?;
     }
 
     let flow = context.lower_statements(table, &mut function, &body.statements)?;
@@ -601,6 +612,10 @@ impl Context<'_> {
             };
         }
 
+        if let Expression::ParenthesizedExpression(inner) = expression {
+            return self.lower_effect(table, function, &inner.expression);
+        }
+
         let Expression::AssignmentExpression(assignment) = expression else {
             self.lower_expression(table, function, expression)?;
             return Ok(());
@@ -628,12 +643,183 @@ impl Context<'_> {
             AssignmentTarget::ComputedMemberExpression(member) => {
                 self.lower_element_write(table, function, member, written, assignment.span)
             }
+            AssignmentTarget::ArrayAssignmentTarget(_)
+            | AssignmentTarget::ObjectAssignmentTarget(_) => {
+                let Written::Value(expression) = written else {
+                    return Err(vec![refuse(
+                        "unsupported-statement",
+                        assignment.span,
+                        "a compound assignment to a pattern is not lowered yet",
+                    )]);
+                };
+                let source = self.lower_expression(table, function, expression)?;
+                self.write_pattern(table, function, &assignment.left, source)
+            }
             _ => Err(vec![refuse(
                 "unsupported-statement",
                 assignment.span,
-                "only assignment to a name, a field or an element is lowered yet",
+                "only assignment to a name, a field, an element or a pattern is lowered yet",
             )]),
         }
+    }
+
+    fn write_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        target: &AssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.store_name(table, function, id.name.as_str(), id.span, source, id.span)
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                self.write_array_pattern(table, function, array, source)
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                self.write_object_pattern(table, function, object, source)
+            }
+            other => Err(vec![refuse(
+                "unsupported-pattern",
+                other.span(),
+                "a pattern that writes anywhere but to a name is not lowered yet",
+            )]),
+        }
+    }
+
+    fn write_maybe_defaulted(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match target {
+            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(with) => {
+                let value = self.defaulted(table, function, source, &with.init, with.span)?;
+                self.write_pattern(table, function, &with.binding, value)
+            }
+            other => {
+                let Some(plain) = other.as_assignment_target() else {
+                    return Err(vec![refuse(
+                        "unsupported-pattern",
+                        other.span(),
+                        "this pattern target is not lowered yet",
+                    )]);
+                };
+                self.write_pattern(table, function, plain, source)
+            }
+        }
+    }
+
+    fn write_array_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ArrayAssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for (position, element) in pattern.elements.iter().enumerate() {
+            let Some(element) = element.as_ref() else {
+                continue;
+            };
+            let at = element.span();
+            let index = self.index_constant(table, function, position, at);
+            let value = self.read_element_at(table, function, source, index, at)?;
+            self.write_maybe_defaulted(table, function, element, value)?;
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let from = u32::try_from(pattern.elements.len()).expect("a pattern is small");
+            let ty = types::rest_of(table, function.type_of(source), from)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Slice {
+                    array: source,
+                    from,
+                },
+                rest.span,
+            );
+            self.write_pattern(table, function, &rest.target, value)?;
+        }
+        Ok(())
+    }
+
+    fn write_object_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ObjectAssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut taken = Vec::with_capacity(pattern.properties.len());
+        for property in &pattern.properties {
+            match property {
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
+                    shorthand,
+                ) => {
+                    let name = shorthand.binding.name.to_string();
+                    let read =
+                        self.read_field_at(table, function, source, &name, shorthand.span)?;
+                    let value = match &shorthand.init {
+                        Some(fallback) => {
+                            self.defaulted(table, function, read, fallback, shorthand.span)?
+                        }
+                        None => read,
+                    };
+                    self.store_name(
+                        table,
+                        function,
+                        &name,
+                        shorthand.binding.span,
+                        value,
+                        shorthand.span,
+                    )?;
+                    taken.push(name);
+                }
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
+                    renamed,
+                ) => {
+                    if renamed.computed {
+                        return Err(vec![refuse(
+                            "unsupported-pattern",
+                            renamed.span,
+                            "a computed key in an object pattern is not lowered yet",
+                        )]);
+                    }
+                    let Some(name) = renamed.name.static_name() else {
+                        return Err(vec![refuse(
+                            "unsupported-pattern",
+                            renamed.span,
+                            "a key in an object pattern that is not a plain name is not lowered yet",
+                        )]);
+                    };
+                    let name = name.to_string();
+                    let value = self.read_field_at(table, function, source, &name, renamed.span)?;
+                    taken.push(name);
+                    self.write_maybe_defaulted(table, function, &renamed.binding, value)?;
+                }
+            }
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let ty = types::object_rest_of(table, function.type_of(source), &taken)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Rest {
+                    object: source,
+                    taken,
+                },
+                rest.span,
+            );
+            self.write_pattern(table, function, &rest.target, value)?;
+        }
+        Ok(())
     }
 
     fn lower_name_write(
@@ -660,16 +846,22 @@ impl Context<'_> {
                 self.combine(table, function, op, standing, one, span)?
             }
         };
-        let stored = self.kept(
-            table,
-            function,
-            stored,
-            held.declared,
-            id.name.as_str(),
-            span,
-        )?;
+        self.store_name(table, function, id.name.as_str(), id.span, stored, span)
+    }
+
+    fn store_name(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        name: &str,
+        at: oxc_span::Span,
+        value: ValueId,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let held = self.bound(name, at)?;
+        let stored = self.kept(table, function, value, held.declared, name, span)?;
         self.scope
-            .insert(id.name.to_string(), Binding::written(stored, held.declared));
+            .insert(name.to_string(), Binding::written(stored, held.declared));
         Ok(())
     }
 
@@ -1317,14 +1509,6 @@ impl Context<'_> {
                 "a `for of` must bind exactly one name",
             )]);
         };
-        let BindingPattern::BindingIdentifier(bound) = &declarator.id else {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                statement.span,
-                "a `for of` over a pattern is not lowered yet",
-            )]);
-        };
-
         let iterated = self.lower_expression(table, function, &statement.right)?;
         let element = match table.kind(function.type_of(iterated)).clone() {
             TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => element,
@@ -1405,7 +1589,7 @@ impl Context<'_> {
             statement.span,
         );
         let standing = self.standing_declarations();
-        self.declare(bound.name.as_str(), Binding::written(current, element));
+        self.bind_pattern(table, function, &declarator.id, current)?;
 
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
         let repeats = jumped.repeats();
@@ -2706,15 +2890,8 @@ impl Context<'_> {
         declarator: &VariableDeclarator<'_>,
         widening: bool,
     ) -> Result<(), Vec<Diagnostic>> {
-        if let BindingPattern::ArrayPattern(pattern) = &declarator.id {
-            return self.lower_array_pattern(table, function, declarator, pattern);
-        }
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                declarator.span,
-                "a binding that is not a plain name is not lowered yet",
-            )]);
+            return self.lower_destructuring(table, function, declarator);
         };
         let declared = declarator
             .type_annotation
@@ -2751,12 +2928,11 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn lower_array_pattern(
+    fn lower_destructuring(
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
         declarator: &VariableDeclarator<'_>,
-        pattern: &oxc_ast::ast::ArrayPattern<'_>,
     ) -> Result<(), Vec<Diagnostic>> {
         let Some(init) = &declarator.init else {
             return Err(vec![refuse(
@@ -2766,31 +2942,164 @@ impl Context<'_> {
             )]);
         };
         let source = self.lower_expression(table, function, init)?;
+        self.bind_pattern(table, function, &declarator.id, source)
+    }
 
-        let mut names = Vec::with_capacity(pattern.elements.len());
-        for element in &pattern.elements {
-            let Some(element) = element.as_ref() else {
-                return Err(vec![refuse(
-                    "unsupported-pattern",
-                    pattern.span,
-                    "a hole in an array pattern is not lowered yet",
-                )]);
-            };
-            let BindingPattern::BindingIdentifier(id) = element else {
-                return Err(vec![refuse(
-                    "unsupported-pattern",
-                    pattern.span,
-                    "an array pattern that binds anything but a plain name is not lowered yet",
-                )]);
-            };
-            names.push(id);
+    fn bind_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &BindingPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.declare(
+                    id.name.as_str(),
+                    Binding::written(source, function.type_of(source)),
+                );
+                Ok(())
+            }
+            BindingPattern::ArrayPattern(array) => {
+                self.bind_array_pattern(table, function, array, source)
+            }
+            BindingPattern::ObjectPattern(object) => {
+                self.bind_object_pattern(table, function, object, source)
+            }
+            BindingPattern::AssignmentPattern(default) => {
+                let value =
+                    self.defaulted(table, function, source, &default.right, default.span)?;
+                self.bind_pattern(table, function, &default.left, value)
+            }
+        }
+    }
+
+    fn defaulted(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        read: ValueId,
+        fallback: &Expression<'_>,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let held = function.type_of(read);
+        if !types::may_be_undefined(table, held) {
+            return Ok(read);
+        }
+        let Some(kept) = types::without_member(table, held, &TypeKind::Undefined) else {
+            let given = self.lower_expression(table, function, fallback)?;
+            return Ok(self.widened(table, function, given, span));
+        };
+
+        let missing = self.tests_undefined(table, function, read, span);
+        let fallback_entry = function.add_block(empty_block());
+        let kept_entry = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition: missing,
+                then_block: fallback_entry,
+                then_arguments: Vec::new(),
+                else_block: kept_entry,
+                else_arguments: Vec::new(),
+            },
+        );
+        let join = function.add_block(empty_block());
+
+        let before = self.scope.clone();
+        self.current = fallback_entry;
+        self.statements.clear();
+        let given = self.lower_expression_expecting(table, function, fallback, Some(kept))?;
+        let given = self.settled(table, function, given, Some(kept), span);
+        let fallback_exit = self.current;
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: Vec::new(),
+            },
+        );
+        if self.scope != before {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                span,
+                "a default in a pattern that writes to a name is not lowered yet",
+            )]);
         }
 
-        for (position, id) in names.iter().enumerate() {
-            let index = self.index_constant(table, function, position, id.span);
-            let value = self.read_element_at(table, function, source, index, id.span)?;
-            let held = function.type_of(value);
-            self.declare(id.name.as_str(), Binding::written(value, held));
+        self.current = kept_entry;
+        self.statements.clear();
+        let narrowed = self.assign(function, kept, Rvalue::Narrow(read), span);
+        let kept_exit = self.current;
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: Vec::new(),
+            },
+        );
+
+        let wanted = table.union(vec![function.type_of(given), kept]);
+        let from_fallback = self.appended(function, fallback_exit, given, wanted, span);
+        let from_kept = self.appended(function, kept_exit, narrowed, wanted, span);
+        let bound = function.fresh_value(wanted);
+        function.block_mut(join).parameters = vec![bound];
+        function.block_mut(fallback_exit).terminator = Terminator::Jump {
+            target: join,
+            arguments: vec![from_fallback],
+        };
+        function.block_mut(kept_exit).terminator = Terminator::Jump {
+            target: join,
+            arguments: vec![from_kept],
+        };
+
+        self.current = join;
+        self.statements.clear();
+        Ok(bound)
+    }
+
+    fn tests_undefined(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        let nothing = table.intern(TypeKind::Undefined);
+        let nothing = self.assign(
+            function,
+            nothing,
+            Rvalue::Constant(Constant::Undefined),
+            span,
+        );
+        let boolean = table.intern(TypeKind::Boolean);
+        self.assign(
+            function,
+            boolean,
+            Rvalue::Binary {
+                op: BinaryOp::StrictEqual,
+                left: value,
+                right: nothing,
+            },
+            span,
+        )
+    }
+
+    fn bind_array_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ArrayPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for (position, element) in pattern.elements.iter().enumerate() {
+            let Some(element) = element.as_ref() else {
+                continue;
+            };
+            let at = element.span();
+            let index = self.index_constant(table, function, position, at);
+            let value = self.read_element_at(table, function, source, index, at)?;
+            self.bind_pattern(table, function, element, value)?;
         }
 
         if let Some(rest) = &pattern.rest {
@@ -2801,7 +3110,7 @@ impl Context<'_> {
                     "a rest in an array pattern that binds anything but a plain name is not lowered yet",
                 )]);
             };
-            let from = u32::try_from(names.len()).expect("a pattern is small");
+            let from = u32::try_from(pattern.elements.len()).expect("a pattern is small");
             let ty = types::rest_of(table, function.type_of(source), from)
                 .map_err(|reason| vec![refuse("unsupported-pattern", pattern.span, reason)])?;
             let value = self.assign(
@@ -2816,6 +3125,86 @@ impl Context<'_> {
             self.declare(id.name.as_str(), Binding::written(value, ty));
         }
         Ok(())
+    }
+
+    fn bind_object_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ObjectPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut taken = Vec::with_capacity(pattern.properties.len());
+        for property in &pattern.properties {
+            let name = self.pattern_key(property)?;
+            let value = self.read_field_at(table, function, source, &name, property.span)?;
+            taken.push(name);
+            self.bind_pattern(table, function, &property.value, value)?;
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let BindingPattern::BindingIdentifier(id) = &rest.argument else {
+                return Err(vec![refuse(
+                    "unsupported-pattern",
+                    rest.span,
+                    "a rest in an object pattern that binds anything but a plain name is not lowered yet",
+                )]);
+            };
+            let ty = types::object_rest_of(table, function.type_of(source), &taken)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Rest {
+                    object: source,
+                    taken,
+                },
+                id.span,
+            );
+            self.declare(id.name.as_str(), Binding::written(value, ty));
+        }
+        Ok(())
+    }
+
+    fn pattern_key(
+        &self,
+        property: &oxc_ast::ast::BindingProperty<'_>,
+    ) -> Result<String, Vec<Diagnostic>> {
+        if property.computed {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                property.span,
+                "a computed key in an object pattern is not lowered yet",
+            )]);
+        }
+        property.key.static_name().map(Into::into).ok_or_else(|| {
+            vec![refuse(
+                "unsupported-pattern",
+                property.span,
+                "a key in an object pattern that is not a plain name is not lowered yet",
+            )]
+        })
+    }
+
+    fn read_field_at(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        object: ValueId,
+        name: &str,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = types::field_result(table, function.type_of(object), name)
+            .map_err(|reason| vec![refuse("unsupported-pattern", span, reason)])?;
+        Ok(self.assign(
+            function,
+            ty,
+            Rvalue::ReadField {
+                object,
+                name: name.to_string(),
+            },
+            span,
+        ))
     }
 
     fn index_constant(
