@@ -266,6 +266,31 @@ pub struct Given {
 }
 
 #[must_use]
+pub fn leaving_without_a_value_fits(table: &TypeTable, returns: TypeId) -> bool {
+    matches!(table.kind(returns), TypeKind::Void) || table.admits_undefined(returns)
+}
+
+pub fn awaited(table: &TypeTable, declared: TypeId) -> Result<TypeId, String> {
+    match table.kind(declared) {
+        TypeKind::Promise(held) => Ok(*held),
+        _ => Err(
+            "an async function whose declared return is not a promise is not lowered yet"
+                .to_string(),
+        ),
+    }
+}
+
+pub fn declared_return(table: &TypeTable, signature: TypeId) -> Result<TypeId, String> {
+    match table.kind(signature) {
+        TypeKind::Function { returns, .. } => Ok(*returns),
+        TypeKind::Overloaded(_) => {
+            Err("a function with more than one signature is not lowered yet".to_string())
+        }
+        _ => Err("the provider gives no signature for this function".to_string()),
+    }
+}
+
+#[must_use]
 pub fn contextual_fields(
     table: &TypeTable,
     expected: TypeId,

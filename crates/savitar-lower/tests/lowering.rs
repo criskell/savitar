@@ -25,12 +25,26 @@ impl ByName {
     }
 }
 
+impl ByName {
+    fn is_a_function_name_ending_at(&self, at: usize) -> bool {
+        let prefix = &self.source[..=at.min(self.source.len() - 1)];
+        let Some(start) = prefix.rfind("function ") else {
+            return false;
+        };
+        let name = &prefix[start + "function ".len()..];
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|letter| letter.is_alphanumeric() || letter == '_')
+    }
+}
+
 impl TypeProvider for ByName {
     fn name(&self) -> &'static str {
         "by-name"
     }
 
-    fn type_at(&self, _table: &mut TypeTable, _file: &str, span: Span) -> Answer {
+    fn type_at(&self, table: &mut TypeTable, _file: &str, span: Span) -> Answer {
         let at = span.start as usize;
         for (name, answer) in self.answers.borrow().iter() {
             let ends_here = self.source[..=at.min(self.source.len() - 1)].ends_with(name.as_str());
@@ -38,8 +52,16 @@ impl TypeProvider for ByName {
                 return answer.clone();
             }
         }
+        if self.is_a_function_name_ending_at(at) {
+            let unknown = table.intern(TypeKind::Unknown);
+            return Answer::Known(table.function(Vec::new(), unknown));
+        }
         Answer::OutOfScope
     }
+}
+
+fn returning(table: &mut TypeTable, returns: savitar_types::TypeId) -> Answer {
+    Answer::Known(table.function(Vec::new(), returns))
 }
 
 const ADD: &str = "function add(left: number, right: number): number {\n  const sum = left + right;\n  return sum;\n}\n";
@@ -51,6 +73,7 @@ fn a_straight_line_function_lowers_to_valid_code() {
     let provider = ByName::new(
         ADD,
         vec![
+            ("add", returning(&mut table, number)),
             ("left", Answer::Known(number)),
             ("right", Answer::Known(number)),
         ],
@@ -200,7 +223,30 @@ fn an_object_literal_lowers_to_a_shape_built_from_its_values() {
     let source = "function make(name: string): { label: string; count: number } {\n  const built = { label: name, count: 1 };\n  return built;\n}\n";
     let mut table = TypeTable::new();
     let text = table.intern(TypeKind::String);
-    let provider = ByName::new(source, vec![("name", Answer::Known(text))]);
+    let number = table.intern(TypeKind::Number);
+    let shape = table.object(vec![
+        Field {
+            name: "label".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "count".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("make", returning(&mut table, shape)),
+            ("name", Answer::Known(text)),
+        ],
+    );
     let file = SourceFile::new("make.ts", source);
 
     let report = lower(&file, &provider, &mut table);
@@ -230,6 +276,7 @@ fn a_value_that_differs_between_branches_arrives_as_a_block_parameter() {
     let provider = ByName::new(
         source,
         vec![
+            ("pick", returning(&mut table, number)),
             ("flag", Answer::Known(boolean)),
             ("left", Answer::Known(number)),
             ("right", Answer::Known(number)),
@@ -509,6 +556,7 @@ fn a_compound_assignment_on_a_string_joins_instead_of_adding() {
     let provider = ByName::new(
         source,
         vec![
+            ("join", returning(&mut table, text)),
             ("left", Answer::Known(text)),
             ("right", Answer::Known(text)),
         ],
@@ -650,6 +698,7 @@ fn a_conditional_expression_joins_both_arms_through_a_parameter() {
     let provider = ByName::new(
         source,
         vec![
+            ("pick", returning(&mut table, number)),
             ("flag", Answer::Known(boolean)),
             ("left", Answer::Known(number)),
             ("right", Answer::Known(number)),
@@ -744,6 +793,165 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
                 }
             )),
         "the free name should become a global read, not a refusal"
+    );
+}
+
+#[test]
+fn a_returned_value_the_declared_type_does_not_admit_is_refused() {
+    let source = "function count(label: string): number {\n  return label;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("count", returning(&mut table, number)),
+            ("label", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("count.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-return");
+}
+
+#[test]
+fn a_returned_literal_arrives_at_the_return_as_the_declared_type() {
+    let source = "function one(): number {\n  return 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("one", returning(&mut table, number))]);
+    let file = SourceFile::new("one.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Terminator::Return(Some(returned)) = only_block(function).terminator else {
+        panic!("expected a return with a value");
+    };
+    assert_eq!(function.type_of(returned), number);
+}
+
+#[test]
+fn a_function_that_can_reach_its_end_without_a_value_is_refused() {
+    let source = "function count(flag: boolean): number {\n  if (flag) {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("count", returning(&mut table, number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("count.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-return");
+    assert!(
+        report.diagnostics[0].message.contains("reach its end"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_bare_return_where_a_value_is_declared_is_refused() {
+    let source = "function count(flag: boolean): number {\n  return;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("count", returning(&mut table, number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("count.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-return");
+}
+
+#[test]
+fn an_async_function_returns_what_its_promise_holds() {
+    let source = "async function later(label: string): Promise<string> {\n  return label;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let promised = table.intern(TypeKind::Promise(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("later", returning(&mut table, promised)),
+            ("label", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("later.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let Terminator::Return(Some(returned)) = only_block(function).terminator else {
+        panic!("expected a return with a value");
+    };
+    assert_eq!(
+        function.type_of(returned),
+        text,
+        "the value returned inside an async function fits what the promise holds"
+    );
+}
+
+#[test]
+fn an_async_function_whose_declared_return_is_not_a_promise_is_refused() {
+    let source = "async function later(label: string): Promise<string> {\n  return label;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("later", returning(&mut table, text)),
+            ("label", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("later.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-function");
+    assert!(
+        report.diagnostics[0].message.contains("not a promise"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_generator_function_is_refused_rather_than_lowered_as_a_plain_one() {
+    let source = "function* counting(): Generator<number> {\n  return;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, Vec::new());
+    let file = SourceFile::new("counting.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-function");
+    assert!(
+        report.diagnostics[0].message.contains("generator"),
+        "{}",
+        report.diagnostics[0].message
     );
 }
 
@@ -1088,7 +1296,13 @@ fn an_empty_array_literal_takes_its_element_type_from_the_declaration() {
     let mut table = TypeTable::new();
     let text = table.intern(TypeKind::String);
     let array = table.intern(TypeKind::Array(text));
-    let provider = ByName::new(source, vec![("out", Answer::Known(array))]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("collect", returning(&mut table, array)),
+            ("out", Answer::Known(array)),
+        ],
+    );
     let file = SourceFile::new("collect.ts", source);
 
     let report = lower(&file, &provider, &mut table);
@@ -1134,6 +1348,7 @@ fn a_template_literal_turns_every_hole_into_text() {
     let provider = ByName::new(
         source,
         vec![
+            ("label", returning(&mut table, text)),
             ("name", Answer::Known(text)),
             ("count", Answer::Known(number)),
         ],
@@ -1163,7 +1378,8 @@ fn a_template_literal_turns_every_hole_into_text() {
 fn a_template_literal_without_holes_is_a_text_constant() {
     let source = "function fixed(): string {\n  return `ready`;\n}\n";
     let mut table = TypeTable::new();
-    let provider = ByName::new(source, Vec::new());
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("fixed", returning(&mut table, text))]);
     let file = SourceFile::new("fixed.ts", source);
 
     let report = lower(&file, &provider, &mut table);
@@ -1171,16 +1387,23 @@ fn a_template_literal_without_holes_is_a_text_constant() {
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     let function = &report.functions[0];
     let block = function.block(savitar_ir::BlockId::from_index(0));
-    let [
-        Statement::Assign {
-            value: Rvalue::Constant(savitar_ir::Constant::String(text)),
-            ..
-        },
-    ] = block.statements.as_slice()
-    else {
-        panic!("expected one text constant, got {:?}", block.statements);
-    };
-    assert_eq!(text, "ready");
+    let constants: Vec<&str> = block
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                value: Rvalue::Constant(savitar_ir::Constant::String(held)),
+                ..
+            } => Some(held.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        constants,
+        vec!["ready"],
+        "a template with no holes is one constant, got {:?}",
+        block.statements
+    );
 }
 
 #[test]
@@ -1217,6 +1440,7 @@ fn an_or_carries_both_sides_into_the_join() {
     let provider = ByName::new(
         source,
         vec![
+            ("fallback", returning(&mut table, text)),
             ("left", Answer::Known(text)),
             ("right", Answer::Known(text)),
         ],
@@ -1476,6 +1700,7 @@ fn a_member_the_shape_does_not_declare_is_asked_of_the_provider() {
     let provider = ByName::new(
         source,
         vec![
+            ("size", returning(&mut table, number)),
             ("items", Answer::Known(items)),
             ("length", Answer::Known(number)),
         ],
@@ -2182,7 +2407,7 @@ fn returns_without_a_value(function: &savitar_ir::Function) -> usize {
 
 #[test]
 fn a_switch_over_a_discriminant_becomes_a_chain_of_strict_equality_tests() {
-    let source = "function describe(outcome: Outcome): string {\n  switch (outcome.kind) {\n    case \"ok\":\n      return outcome.body;\n    case \"error\":\n      return outcome.detail;\n  }\n}\n";
+    let source = "function describe(outcome: Outcome): string | number {\n  switch (outcome.kind) {\n    case \"ok\":\n      return outcome.body;\n    case \"error\":\n      return outcome.detail;\n  }\n}\n";
     let mut table = TypeTable::new();
     let text = table.intern(TypeKind::String);
     let number = table.intern(TypeKind::Number);
@@ -2190,9 +2415,11 @@ fn a_switch_over_a_discriminant_becomes_a_chain_of_strict_equality_tests() {
     let ok_kind = table.intern(TypeKind::StringLiteral("ok".to_string()));
     let error_kind = table.intern(TypeKind::StringLiteral("error".to_string()));
     let discriminant = table.union(vec![ok_kind, error_kind]);
+    let either = table.union(vec![text, number]);
     let provider = ByName::new(
         source,
         vec![
+            ("describe", returning(&mut table, either)),
             ("outcome", Answer::Known(outcome)),
             ("kind", Answer::Known(discriminant)),
             ("body", Answer::Known(text)),
@@ -2212,6 +2439,23 @@ fn a_switch_over_a_discriminant_becomes_a_chain_of_strict_equality_tests() {
         "one strict equality per case label"
     );
 
+    let read: Vec<_> = function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::ReadField { name, .. },
+                ..
+            } if name != "kind" => Some(function.type_of(*target)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![text, number],
+        "each case reads the field of the member it matched"
+    );
     let returned: Vec<_> = function
         .blocks()
         .filter_map(|(_, block)| match block.terminator {
@@ -2219,7 +2463,11 @@ fn a_switch_over_a_discriminant_becomes_a_chain_of_strict_equality_tests() {
             _ => None,
         })
         .collect();
-    assert_eq!(returned, vec![text, number]);
+    assert_eq!(
+        returned,
+        vec![either, either],
+        "each return carries the declared type, widened where the branch was narrower"
+    );
 }
 
 #[test]
@@ -2376,6 +2624,7 @@ fn a_name_a_break_changed_arrives_at_the_join_as_a_parameter() {
     let provider = ByName::new(
         source,
         vec![
+            ("size", returning(&mut table, number)),
             ("kind", Answer::Known(text)),
             ("small", Answer::Known(number)),
             ("large", Answer::Known(number)),

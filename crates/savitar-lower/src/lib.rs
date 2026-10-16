@@ -61,6 +61,7 @@ enum Written<'target, 'source> {
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
+    returns: TypeId,
     scope: Scope,
     statements: Vec<Statement>,
     current: BlockId,
@@ -138,16 +139,42 @@ fn lower_function(
     declaration: &oxc_ast::ast::Function<'_>,
     body: &FunctionBody<'_>,
 ) -> Result<Function, Vec<Diagnostic>> {
+    if declaration.generator {
+        return Err(vec![refuse(
+            "unsupported-function",
+            declaration.span,
+            "a generator function is not lowered yet",
+        )]);
+    }
+    let Some(id) = declaration.id.as_ref() else {
+        return Err(vec![refuse(
+            "unsupported-function",
+            declaration.span,
+            "a function with no name is not lowered yet, because its signature is asked for by name",
+        )]);
+    };
+
     let mut function = Function::new(name);
     let entry = function.add_block(empty_block());
     let mut context = Context {
         file,
         provider,
+        returns: table.intern(TypeKind::Unknown),
         scope: Scope::new(),
         statements: Vec::new(),
         current: entry,
         enclosing: Vec::new(),
         breaks: Vec::new(),
+    };
+
+    let signature = context.type_at(table, id.span)?;
+    let declared = types::declared_return(table, signature)
+        .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?;
+    context.returns = if declaration.r#async {
+        types::awaited(table, declared)
+            .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?
+    } else {
+        declared
     };
 
     for parameter in &declaration.params.items {
@@ -165,6 +192,13 @@ fn lower_function(
 
     let flow = context.lower_statements(table, &mut function, &body.statements)?;
     if flow == Flow::Continues {
+        if !types::leaving_without_a_value_fits(table, context.returns) {
+            return Err(vec![refuse(
+                "unsupported-return",
+                body.span,
+                "this function can reach its end without returning a value the declared type admits",
+            )]);
+        }
         context.seal(&mut function, Terminator::Return(None));
     }
 
@@ -288,8 +322,33 @@ impl Context<'_> {
             }
             AstStatement::ReturnStatement(statement) => {
                 let returned = match &statement.argument {
-                    Some(argument) => Some(self.lower_expression(table, function, argument)?),
-                    None => None,
+                    Some(argument) => {
+                        let wanted = self.returns;
+                        let value = self.lower_expression_expecting(
+                            table,
+                            function,
+                            argument,
+                            Some(wanted),
+                        )?;
+                        if !savitar_types::assignable(table, function.type_of(value), wanted) {
+                            return Err(vec![refuse(
+                                "unsupported-return",
+                                statement.span,
+                                "Savitar cannot show this value fits the declared return type",
+                            )]);
+                        }
+                        Some(self.coerced(function, table, value, wanted, statement.span))
+                    }
+                    None => {
+                        if !types::leaving_without_a_value_fits(table, self.returns) {
+                            return Err(vec![refuse(
+                                "unsupported-return",
+                                statement.span,
+                                "this `return` carries no value, and the declared return type admits none",
+                            )]);
+                        }
+                        None
+                    }
                 };
                 self.seal(function, Terminator::Return(returned));
                 Ok(Flow::Returned)
