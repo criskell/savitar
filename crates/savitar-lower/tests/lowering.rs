@@ -7849,3 +7849,84 @@ fn a_patterned_parameter_after_one_that_branches_still_reads_from_its_own_value(
     assert_eq!(function.type_of(function.parameters()[1]), line);
     assert_eq!(function.type_of(returned_value(function)), number);
 }
+
+#[test]
+fn a_break_out_of_a_block_that_shadows_a_name_leaves_the_outer_value_alone() {
+    let source = "function shade(start: number, step: number, flag: boolean): number {\n  let value = start;\n  while (flag) {\n    {\n      let value = step;\n      value = value + 1;\n      break;\n    }\n  }\n  return value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("shade", returning(&mut table, number)),
+            ("start", Answer::Known(number)),
+            ("step", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("shade.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(
+        carrying.len(),
+        1,
+        "the block stepped its own `value`, so the two ways out of the loop agree on the outer one"
+    );
+    let (header, _) = carrying[0];
+    assert_eq!(
+        returned_value(function),
+        function.block(header).parameters[0],
+        "the outer `value` leaves the loop as the header carried it in"
+    );
+}
+
+#[test]
+fn a_continue_from_a_block_that_shadows_a_name_carries_the_outer_value_back() {
+    let source = "function shade(start: number, step: number, flag: boolean): number {\n  let value = start;\n  while (flag) {\n    {\n      let value = step;\n      value = value + 1;\n      continue;\n    }\n  }\n  return value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("shade", returning(&mut table, number)),
+            ("start", Answer::Known(number)),
+            ("step", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("shade.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let (header, _) = parameterised(function)[0];
+    let carried = function.block(header).parameters[0];
+    let back: Vec<Vec<savitar_ir::ValueId>> = function
+        .blocks()
+        .filter_map(|(_, block)| match &block.terminator {
+            Terminator::Jump { target, arguments } if *target == header => Some(arguments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        back.len(),
+        2,
+        "the entry and the `continue` reach the header"
+    );
+    assert_eq!(
+        back[1],
+        vec![carried],
+        "the `continue` carries the outer `value` back untouched, not the one the block declared"
+    );
+}

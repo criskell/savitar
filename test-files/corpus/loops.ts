@@ -123,3 +123,21 @@ export function statusFor(line: LogLine, fallback: number): number {
   }
   return status;
 }
+
+export function retryDelay(attempts: readonly number[], ceiling: number): number {
+  let delay = 1;
+  for (const attempt of attempts) {
+    if (attempt < 0) {
+      const delay = ceiling * 2;
+      if (delay > ceiling) {
+        break;
+      }
+    }
+    delay = delay * 2;
+    if (delay >= ceiling) {
+      delay = ceiling;
+      break;
+    }
+  }
+  return delay;
+}

@@ -63,7 +63,106 @@ impl Binding {
     }
 }
 
-type Scope = HashMap<String, Binding>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct Key {
+    name: String,
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Scope {
+    standing: HashMap<String, Vec<(usize, Binding)>>,
+}
+
+impl Scope {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, name: &str) -> Option<Binding> {
+        self.standing
+            .get(name)
+            .and_then(|held| held.last())
+            .map(|&(_, binding)| binding)
+    }
+
+    fn holds(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    fn innermost(&self, name: &str) -> Option<Key> {
+        let &(depth, _) = self.standing.get(name).and_then(|held| held.last())?;
+        Some(Key {
+            name: name.to_string(),
+            depth,
+        })
+    }
+
+    fn at(&self, key: &Key) -> Option<Binding> {
+        self.standing
+            .get(&key.name)?
+            .iter()
+            .find(|&&(depth, _)| depth == key.depth)
+            .map(|&(_, binding)| binding)
+    }
+
+    fn held_at(&self, key: &Key) -> Binding {
+        self.at(key)
+            .expect("a declaration standing where a path starts stands on every path from there")
+    }
+
+    fn put(&mut self, key: &Key, binding: Binding) {
+        let held = self.standing.entry(key.name.clone()).or_default();
+        match held.iter_mut().find(|slot| slot.0 == key.depth) {
+            Some(slot) => slot.1 = binding,
+            None => {
+                held.push((key.depth, binding));
+                held.sort_by_key(|slot| slot.0);
+            }
+        }
+    }
+
+    fn store(&mut self, name: &str, binding: Binding) {
+        if let Some(slot) = self.standing.get_mut(name).and_then(|held| held.last_mut()) {
+            slot.1 = binding;
+        }
+    }
+
+    fn drop_one(&mut self, key: &Key) {
+        let Some(held) = self.standing.get_mut(&key.name) else {
+            return;
+        };
+        held.retain(|slot| slot.0 != key.depth);
+        if held.is_empty() {
+            self.standing.remove(&key.name);
+        }
+    }
+
+    fn keys(&self) -> Vec<Key> {
+        let mut keys: Vec<Key> = self
+            .standing
+            .iter()
+            .flat_map(|(name, held)| {
+                held.iter().map(move |&(depth, _)| Key {
+                    name: name.clone(),
+                    depth,
+                })
+            })
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn entries(&self) -> Vec<(Key, Binding)> {
+        self.keys()
+            .into_iter()
+            .map(|key| {
+                let binding = self.held_at(&key);
+                (key, binding)
+            })
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -146,7 +245,7 @@ struct Looping {
     exit: BlockId,
     leading: Vec<ValueId>,
     landing: Vec<ValueId>,
-    carried: Vec<String>,
+    carried: Vec<Key>,
     at_header: Scope,
 }
 
@@ -173,11 +272,12 @@ fn every_change_is_carried(
     scope: &Scope,
     span: oxc_span::Span,
 ) -> Result<(), Vec<Diagnostic>> {
-    for (name, binding) in scope {
-        let Some(held) = looping.at_header.get(name) else {
+    for (key, binding) in scope.entries() {
+        let Some(held) = looping.at_header.at(&key) else {
             continue;
         };
-        if held.value != binding.value && !looping.carried.contains(name) {
+        if held.value != binding.value && !looping.carried.contains(&key) {
+            let name = &key.name;
             return Err(vec![refuse(
                 "malformed-ir",
                 span,
@@ -277,7 +377,7 @@ struct Context<'a> {
     statements: Vec<Statement>,
     current: BlockId,
     enclosing: Vec<Breakable>,
-    shadowed: Vec<(String, Option<Binding>)>,
+    shadowed: Vec<Key>,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -393,9 +493,7 @@ fn lower_function(
         if let BindingPattern::BindingIdentifier(id) = &parameter.pattern {
             let ty = context.type_at(table, id.span)?;
             let value = function.declare_parameter(ty);
-            context
-                .scope
-                .insert(id.name.to_string(), Binding::written(value, ty));
+            context.declare(id.name.as_str(), Binding::written(value, ty));
             continue;
         }
         if parameter.initializer.is_some() {
@@ -907,7 +1005,7 @@ impl Context<'_> {
         let held = self.bound(name, at)?;
         let stored = self.kept(table, function, value, held.declared, name, span)?;
         self.scope
-            .insert(name.to_string(), Binding::written(stored, held.declared));
+            .store(name, Binding::written(stored, held.declared));
         Ok(())
     }
 
@@ -1311,7 +1409,7 @@ impl Context<'_> {
         body: &AstStatement<'_>,
         stepping: &[&Expression<'_>],
         span: oxc_span::Span,
-    ) -> Result<Vec<String>, Vec<Diagnostic>> {
+    ) -> Result<Vec<Key>, Vec<Diagnostic>> {
         let mut found = assigned::assigned_names(std::slice::from_ref(body));
         for expression in stepping {
             found.extend(assigned::assigned_names_in(expression));
@@ -1330,7 +1428,11 @@ impl Context<'_> {
                     ),
                 )]);
             }
-            carried.push(name);
+            carried.push(
+                self.scope
+                    .innermost(&name)
+                    .expect("the name was just read out of this scope"),
+            );
         }
         Ok(carried)
     }
@@ -1339,7 +1441,7 @@ impl Context<'_> {
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
-        carried: Vec<String>,
+        carried: Vec<Key>,
         entering: &[ValueId],
         repeating: Repeating,
         span: oxc_span::Span,
@@ -1351,8 +1453,8 @@ impl Context<'_> {
             parameters.push(function.fresh_value(function.type_of(*value)));
             arguments.push(*value);
         }
-        for name in &carried {
-            let incoming = self.scope[name];
+        for key in &carried {
+            let incoming = self.scope.held_at(key);
             let entering = incoming
                 .value
                 .expect("a carried name was proved written before the loop");
@@ -1387,10 +1489,9 @@ impl Context<'_> {
         );
         self.current = header;
         self.statements.clear();
-        for (name, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
-            let declared = self.scope[name].declared;
-            self.scope
-                .insert(name.clone(), Binding::written(*parameter, declared));
+        for (key, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
+            let declared = self.scope.held_at(key).declared;
+            self.scope.put(key, Binding::written(*parameter, declared));
         }
         Looping {
             header,
@@ -1475,8 +1576,8 @@ impl Context<'_> {
         for (site, scope) in &edges {
             every_change_is_carried(looping, scope, span)?;
             let mut arguments = looping.leading.clone();
-            for name in &looping.carried {
-                let binding = scope[name];
+            for key in &looping.carried {
+                let binding = scope.held_at(key);
                 let leaving = carried_value(binding);
                 arguments.push(self.appended(function, *site, leaving, binding.declared, span));
             }
@@ -1492,14 +1593,13 @@ impl Context<'_> {
         self.current = looping.repeat;
         self.statements.clear();
         self.scope = looping.at_header.clone();
-        for (name, parameter) in looping
+        for (key, parameter) in looping
             .carried
             .iter()
             .zip(looping.landing.iter().skip(looping.leading.len()))
         {
-            let declared = looping.at_header[name].declared;
-            self.scope
-                .insert(name.clone(), Binding::written(*parameter, declared));
+            let declared = looping.at_header.held_at(key).declared;
+            self.scope.put(key, Binding::written(*parameter, declared));
         }
     }
 
@@ -1670,8 +1770,8 @@ impl Context<'_> {
                 statement.span,
             );
             let mut back = vec![stepped];
-            for name in &looping.carried {
-                let binding = self.scope[name];
+            for key in &looping.carried {
+                let binding = self.scope.held_at(key);
                 back.push(self.coerced(
                     function,
                     table,
@@ -1734,8 +1834,8 @@ impl Context<'_> {
             let condition = self.lower_expression(table, function, &statement.test)?;
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
-            for name in &looping.carried {
-                let binding = self.scope[name];
+            for key in &looping.carried {
+                let binding = self.scope.held_at(key);
                 back.push(self.coerced(
                     function,
                     table,
@@ -1861,8 +1961,8 @@ impl Context<'_> {
             }
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
-            for name in &looping.carried {
-                let binding = self.scope[name];
+            for key in &looping.carried {
+                let binding = self.scope.held_at(key);
                 back.push(self.coerced(
                     function,
                     table,
@@ -2024,7 +2124,7 @@ impl Context<'_> {
 
     fn name_in_scope(&self, side: &Expression<'_>) -> Option<String> {
         match side {
-            Expression::Identifier(id) if self.scope.contains_key(id.name.as_str()) => {
+            Expression::Identifier(id) if self.scope.holds(id.name.as_str()) => {
                 Some(id.name.to_string())
             }
             _ => None,
@@ -2060,7 +2160,7 @@ impl Context<'_> {
         let Some(tested) = tested else {
             return;
         };
-        let Some(&binding) = self.scope.get(&tested.name) else {
+        let Some(binding) = self.scope.get(&tested.name) else {
             return;
         };
         let Some(standing) = binding.value else {
@@ -2115,10 +2215,8 @@ impl Context<'_> {
             return;
         }
         let value = self.assign(function, narrowed, Rvalue::Narrow(standing), span);
-        self.scope.insert(
-            tested.name.clone(),
-            Binding::written(value, binding.declared),
-        );
+        self.scope
+            .store(&tested.name, Binding::written(value, binding.declared));
     }
 
     fn switch_subject(&self, discriminant: &Expression<'_>) -> Option<Subject> {
@@ -2232,15 +2330,13 @@ impl Context<'_> {
         let mut merged = before.clone();
 
         if then_flow.continues() && else_flow.continues() {
-            let mut names: Vec<&String> = before.keys().collect();
-            names.sort();
-            for name in names {
-                let declared = before[name].declared;
-                let from_then = then_scope[name].value;
-                let from_else = else_scope[name].value;
+            for key in before.keys() {
+                let declared = before.held_at(&key).declared;
+                let from_then = then_scope.held_at(&key).value;
+                let from_else = else_scope.held_at(&key).value;
                 if from_then == from_else {
-                    merged.insert(
-                        name.clone(),
+                    merged.put(
+                        &key,
                         Binding {
                             value: from_then,
                             declared,
@@ -2249,7 +2345,7 @@ impl Context<'_> {
                     continue;
                 }
                 let (Some(from_then), Some(from_else)) = (from_then, from_else) else {
-                    merged.insert(name.clone(), Binding::awaiting_a_write(declared));
+                    merged.put(&key, Binding::awaiting_a_write(declared));
                     continue;
                 };
                 let wanted = table.union(vec![
@@ -2264,7 +2360,7 @@ impl Context<'_> {
                 parameters.push(parameter);
                 then_arguments.push(carried_then);
                 else_arguments.push(carried_else);
-                merged.insert(name.clone(), Binding::written(parameter, declared));
+                merged.put(&key, Binding::written(parameter, declared));
             }
         } else if then_flow.continues() {
             merged = then_scope;
@@ -2606,17 +2702,18 @@ impl Context<'_> {
         edges: &[(BlockId, Scope)],
         span: oxc_span::Span,
     ) -> Scope {
-        let mut names: Vec<&String> = shape.keys().collect();
-        names.sort();
         let mut parameters = Vec::new();
         let mut passed: Vec<Vec<ValueId>> = vec![Vec::new(); edges.len()];
         let mut merged = shape.clone();
-        for name in names {
-            let declared = shape[name].declared;
-            let first = edges[0].1[name].value;
-            if edges.iter().all(|(_, scope)| scope[name].value == first) {
-                merged.insert(
-                    name.clone(),
+        for key in shape.keys() {
+            let declared = shape.held_at(&key).declared;
+            let first = edges[0].1.held_at(&key).value;
+            if edges
+                .iter()
+                .all(|(_, scope)| scope.held_at(&key).value == first)
+            {
+                merged.put(
+                    &key,
                     Binding {
                         value: first,
                         declared,
@@ -2626,10 +2723,10 @@ impl Context<'_> {
             }
             let Some(standing) = edges
                 .iter()
-                .map(|(_, scope)| scope[name].value)
+                .map(|(_, scope)| scope.held_at(&key).value)
                 .collect::<Option<Vec<ValueId>>>()
             else {
-                merged.insert(name.clone(), Binding::awaiting_a_write(declared));
+                merged.put(&key, Binding::awaiting_a_write(declared));
                 continue;
             };
             let members: Vec<TypeId> = standing
@@ -2643,7 +2740,7 @@ impl Context<'_> {
             }
             let parameter = function.fresh_value(wanted);
             parameters.push(parameter);
-            merged.insert(name.clone(), Binding::written(parameter, declared));
+            merged.put(&key, Binding::written(parameter, declared));
         }
 
         function.block_mut(join).parameters = parameters;
@@ -2708,7 +2805,7 @@ impl Context<'_> {
     }
 
     fn bound(&self, name: &str, span: oxc_span::Span) -> Result<Binding, Vec<Diagnostic>> {
-        self.scope.get(name).copied().ok_or_else(|| {
+        self.scope.get(name).ok_or_else(|| {
             vec![refuse(
                 "unsupported-reference",
                 span,
@@ -2718,8 +2815,12 @@ impl Context<'_> {
     }
 
     fn declare(&mut self, name: &str, binding: Binding) {
-        let outer = self.scope.insert(name.to_string(), binding);
-        self.shadowed.push((name.to_string(), outer));
+        let key = Key {
+            name: name.to_string(),
+            depth: self.shadowed.len(),
+        };
+        self.scope.put(&key, binding);
+        self.shadowed.push(key);
     }
 
     fn standing_declarations(&self) -> usize {
@@ -2727,11 +2828,8 @@ impl Context<'_> {
     }
 
     fn leave_declarations(&mut self, standing: usize) {
-        for (name, outer) in self.shadowed.split_off(standing).into_iter().rev() {
-            match outer {
-                Some(binding) => self.scope.insert(name, binding),
-                None => self.scope.remove(&name),
-            };
+        for key in self.shadowed.split_off(standing).into_iter().rev() {
+            self.scope.drop_one(&key);
         }
     }
 
@@ -3421,7 +3519,7 @@ impl Context<'_> {
                 Ok(self.assign(function, ty, Rvalue::Constant(Constant::Null), literal.span))
             }
             Expression::Identifier(id) => {
-                if let Some(&known) = self.scope.get(id.name.as_str()) {
+                if let Some(known) = self.scope.get(id.name.as_str()) {
                     return known.value_or_refuse(id.name.as_str(), id.span);
                 }
                 if id.name == "undefined" {
