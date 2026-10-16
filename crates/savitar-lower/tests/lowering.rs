@@ -411,7 +411,7 @@ fn both_branches_returning_leaves_no_join_at_all() {
 }
 
 #[test]
-fn a_name_that_leaves_the_branches_with_two_types_carries_their_union() {
+fn writing_text_to_a_name_that_holds_a_number_is_refused_instead_of_retyping_the_name() {
     let source = "function mixed(flag: boolean, left: number, right: string): void {\n  let held = left;\n  if (flag) {\n    held = right;\n  }\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -429,18 +429,14 @@ fn a_name_that_leaves_the_branches_with_two_types_carries_their_union() {
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
-    let function = &report.functions[0];
-    assert_eq!(verify(function), vec![]);
-
-    let joins: Vec<_> = function
-        .blocks()
-        .filter(|(_, block)| !block.parameters.is_empty())
-        .collect();
-    assert_eq!(joins.len(), 1, "the join should take the merged name");
-    let held = joins[0].1.parameters[0];
-    let merged = table.union(vec![number, text]);
-    assert_eq!(function.type_of(held), merged);
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+    assert!(
+        report.diagnostics[0].message.contains("`held` holds"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }
 
 #[test]
@@ -4893,4 +4889,72 @@ fn a_name_assigned_in_the_initialiser_of_a_nested_for_is_carried_by_the_outer_lo
 
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_boolean_literal_written_in_a_loop_body_still_fits_the_header_parameter() {
+    let source = "function spin(flag: boolean, limit: number): boolean {\n  let done = flag;\n  let seen = 0;\n  while (seen < limit) {\n    done = false;\n    seen = seen + 1;\n  }\n  return done;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("spin", returning(&mut table, boolean)),
+            ("flag", Answer::Known(boolean)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("spin.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(carrying.len(), 1, "a `while` repeats at its own header");
+    let header = function.block(carrying[0].0);
+    let carried: Vec<&TypeKind> = header
+        .parameters
+        .iter()
+        .map(|parameter| table.kind(function.type_of(*parameter)))
+        .collect();
+    assert_eq!(carried, vec![&TypeKind::Boolean, &TypeKind::Number]);
+}
+
+#[test]
+fn a_name_declared_wider_than_its_value_takes_a_write_of_either_member() {
+    let source = "function pick(flag: boolean, left: number, right: string): number | string {\n  let held: number | string = left;\n  if (flag) {\n    held = right;\n  }\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let boolean = table.intern(TypeKind::Boolean);
+    let either = table.union(vec![number, text]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, either)),
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(text)),
+            ("held", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let carrying = parameterised(function);
+    assert_eq!(carrying.len(), 1, "the two arms meet at one join");
+    let merged = function.block(carrying[0].0).parameters[0];
+    assert_eq!(
+        function.type_of(merged),
+        either,
+        "the write took the type the name holds, not the type it carried"
+    );
 }

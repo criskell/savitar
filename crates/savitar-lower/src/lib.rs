@@ -31,7 +31,13 @@ pub struct LowerReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-type Scope = HashMap<String, ValueId>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Binding {
+    value: ValueId,
+    declared: TypeId,
+}
+
+type Scope = HashMap<String, Binding>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -92,11 +98,11 @@ fn every_change_is_carried(
     scope: &Scope,
     span: oxc_span::Span,
 ) -> Result<(), Vec<Diagnostic>> {
-    for (name, value) in scope {
-        if !looping.at_header.contains_key(name) {
+    for (name, binding) in scope {
+        let Some(held) = looping.at_header.get(name) else {
             continue;
-        }
-        if looping.at_header.get(name) != Some(value) && !looping.carried.contains(name) {
+        };
+        if held.value != binding.value && !looping.carried.contains(name) {
             return Err(vec![refuse(
                 "malformed-ir",
                 span,
@@ -256,7 +262,13 @@ fn lower_function(
         };
         let ty = context.type_at(table, id.span)?;
         let value = function.declare_parameter(ty);
-        context.scope.insert(id.name.to_string(), value);
+        context.scope.insert(
+            id.name.to_string(),
+            Binding {
+                value,
+                declared: ty,
+            },
+        );
     }
 
     let flow = context.lower_statements(table, &mut function, &body.statements)?;
@@ -538,18 +550,53 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let held = self.bound(id.name.as_str(), id.span)?;
         let stored = match written {
-            Written::Value(expression) => self.lower_expression(table, function, expression)?,
+            Written::Value(expression) => {
+                self.lower_expression_expecting(table, function, expression, Some(held.declared))?
+            }
             Written::Combined(op, expression) => {
                 let value = self.lower_expression(table, function, expression)?;
-                self.combine(table, function, op, held, value, span)?
+                self.combine(table, function, op, held.value, value, span)?
             }
             Written::Stepped(op) => {
                 let one = self.literal_one(table, function, span);
-                self.combine(table, function, op, held, one, span)?
+                self.combine(table, function, op, held.value, one, span)?
             }
         };
-        self.scope.insert(id.name.to_string(), stored);
+        let stored = self.kept(
+            table,
+            function,
+            stored,
+            held.declared,
+            id.name.as_str(),
+            span,
+        )?;
+        self.scope.insert(
+            id.name.to_string(),
+            Binding {
+                value: stored,
+                declared: held.declared,
+            },
+        );
         Ok(())
+    }
+
+    fn kept(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        declared: TypeId,
+        name: &str,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        if !savitar_types::assignable(table, function.type_of(value), declared) {
+            return Err(vec![refuse(
+                "unsupported-assignment",
+                span,
+                format!("Savitar cannot show this value fits the type `{name}` holds"),
+            )]);
+        }
+        Ok(self.coerced(function, table, value, declared, span))
     }
 
     fn lower_field_write(
@@ -941,10 +988,12 @@ impl Context<'_> {
 
     fn open_loop(
         &mut self,
+        table: &mut TypeTable,
         function: &mut Function,
         carried: Vec<String>,
         entering: &[ValueId],
         repeating: Repeating,
+        span: oxc_span::Span,
     ) -> Looping {
         let header = function.add_block(empty_block());
         let mut parameters = Vec::with_capacity(entering.len() + carried.len());
@@ -955,8 +1004,8 @@ impl Context<'_> {
         }
         for name in &carried {
             let incoming = self.scope[name];
-            parameters.push(function.fresh_value(function.type_of(incoming)));
-            arguments.push(incoming);
+            parameters.push(function.fresh_value(incoming.declared));
+            arguments.push(self.coerced(function, table, incoming.value, incoming.declared, span));
         }
         function.block_mut(header).parameters = parameters.clone();
 
@@ -987,7 +1036,14 @@ impl Context<'_> {
         self.current = header;
         self.statements.clear();
         for (name, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
-            self.scope.insert(name.clone(), *parameter);
+            let declared = self.scope[name].declared;
+            self.scope.insert(
+                name.clone(),
+                Binding {
+                    value: *parameter,
+                    declared,
+                },
+            );
         }
         Looping {
             header,
@@ -1070,7 +1126,14 @@ impl Context<'_> {
             every_change_is_carried(looping, scope, span)?;
             let mut arguments = looping.leading.clone();
             for name in &looping.carried {
-                arguments.push(scope[name]);
+                let binding = scope[name];
+                arguments.push(self.appended(
+                    function,
+                    *site,
+                    binding.value,
+                    binding.declared,
+                    span,
+                ));
             }
             function.block_mut(*site).terminator = Terminator::Jump {
                 target: looping.repeat,
@@ -1089,7 +1152,14 @@ impl Context<'_> {
             .iter()
             .zip(looping.landing.iter().skip(looping.leading.len()))
         {
-            self.scope.insert(name.clone(), *parameter);
+            let declared = looping.at_header[name].declared;
+            self.scope.insert(
+                name.clone(),
+                Binding {
+                    value: *parameter,
+                    declared,
+                },
+            );
         }
     }
 
@@ -1179,7 +1249,14 @@ impl Context<'_> {
         let start = self.assign(function, number, Rvalue::Widen(zero), statement.span);
 
         let carried = self.carried_names(&statement.body, &[]);
-        let looping = self.open_loop(function, carried, &[start], Repeating::ThroughLatch);
+        let looping = self.open_loop(
+            table,
+            function,
+            carried,
+            &[start],
+            Repeating::ThroughLatch,
+            statement.span,
+        );
         let index = looping.leading[0];
 
         let length = self.assign(
@@ -1228,7 +1305,13 @@ impl Context<'_> {
             },
             statement.span,
         );
-        self.scope.insert(bound.name.to_string(), current);
+        self.scope.insert(
+            bound.name.to_string(),
+            Binding {
+                value: current,
+                declared: element,
+            },
+        );
 
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
         let repeats = jumped.repeats();
@@ -1260,7 +1343,14 @@ impl Context<'_> {
             );
             let mut back = vec![stepped];
             for name in &looping.carried {
-                back.push(self.scope[name]);
+                let binding = self.scope[name];
+                back.push(self.coerced(
+                    function,
+                    table,
+                    binding.value,
+                    binding.declared,
+                    statement.span,
+                ));
             }
             self.seal(
                 function,
@@ -1288,7 +1378,14 @@ impl Context<'_> {
         statement: &oxc_ast::ast::DoWhileStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let carried = self.carried_names(&statement.body, &[&statement.test]);
-        let looping = self.open_loop(function, carried, &[], Repeating::ThroughLatch);
+        let looping = self.open_loop(
+            table,
+            function,
+            carried,
+            &[],
+            Repeating::ThroughLatch,
+            statement.span,
+        );
 
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
         let repeats = jumped.repeats();
@@ -1307,7 +1404,14 @@ impl Context<'_> {
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
             for name in &looping.carried {
-                back.push(self.scope[name]);
+                let binding = self.scope[name];
+                back.push(self.coerced(
+                    function,
+                    table,
+                    binding.value,
+                    binding.declared,
+                    statement.span,
+                ));
             }
             let block = function.add_block(empty_block());
             self.seal(
@@ -1383,7 +1487,14 @@ impl Context<'_> {
             stepping.push(update);
         }
         let carried = self.carried_names(&statement.body, &stepping);
-        let looping = self.open_loop(function, carried, &[], Repeating::ThroughLatch);
+        let looping = self.open_loop(
+            table,
+            function,
+            carried,
+            &[],
+            Repeating::ThroughLatch,
+            statement.span,
+        );
 
         let condition = self.lower_expression(table, function, test)?;
         let body = function.add_block(empty_block());
@@ -1419,7 +1530,14 @@ impl Context<'_> {
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
             for name in &looping.carried {
-                back.push(self.scope[name]);
+                let binding = self.scope[name];
+                back.push(self.coerced(
+                    function,
+                    table,
+                    binding.value,
+                    binding.declared,
+                    statement.span,
+                ));
             }
             self.seal(
                 function,
@@ -1449,7 +1567,14 @@ impl Context<'_> {
         statement: &oxc_ast::ast::WhileStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let carried = self.carried_names(&statement.body, &[]);
-        let looping = self.open_loop(function, carried, &[], Repeating::AtHeader);
+        let looping = self.open_loop(
+            table,
+            function,
+            carried,
+            &[],
+            Repeating::AtHeader,
+            statement.span,
+        );
 
         let condition = self.lower_expression(table, function, &statement.test)?;
         let body = function.add_block(empty_block());
@@ -1569,10 +1694,10 @@ impl Context<'_> {
         let Some(tested) = tested else {
             return;
         };
-        let Some(&value) = self.scope.get(&tested.name) else {
+        let Some(&binding) = self.scope.get(&tested.name) else {
             return;
         };
-        let held = function.type_of(value);
+        let held = function.type_of(binding.value);
         let asserted = holds == tested.equal;
         let narrowed = match &tested.fact {
             Fact::Nullish(kind) => {
@@ -1603,8 +1728,14 @@ impl Context<'_> {
         if narrowed == held {
             return;
         }
-        let value = self.assign(function, narrowed, Rvalue::Narrow(value), span);
-        self.scope.insert(tested.name.clone(), value);
+        let value = self.assign(function, narrowed, Rvalue::Narrow(binding.value), span);
+        self.scope.insert(
+            tested.name.clone(),
+            Binding {
+                value,
+                declared: binding.declared,
+            },
+        );
     }
 
     fn lower_if(
@@ -1682,10 +1813,17 @@ impl Context<'_> {
             let mut names: Vec<&String> = before.keys().collect();
             names.sort();
             for name in names {
-                let from_then = then_scope[name];
-                let from_else = else_scope[name];
+                let declared = before[name].declared;
+                let from_then = then_scope[name].value;
+                let from_else = else_scope[name].value;
                 if from_then == from_else {
-                    merged.insert(name.clone(), from_then);
+                    merged.insert(
+                        name.clone(),
+                        Binding {
+                            value: from_then,
+                            declared,
+                        },
+                    );
                     continue;
                 }
                 let wanted = table.union(vec![
@@ -1700,7 +1838,13 @@ impl Context<'_> {
                 parameters.push(parameter);
                 then_arguments.push(carried_then);
                 else_arguments.push(carried_else);
-                merged.insert(name.clone(), parameter);
+                merged.insert(
+                    name.clone(),
+                    Binding {
+                        value: parameter,
+                        declared,
+                    },
+                );
             }
         } else if then_flow.continues() {
             merged = then_scope;
@@ -1950,23 +2094,36 @@ impl Context<'_> {
         let mut passed: Vec<Vec<ValueId>> = vec![Vec::new(); edges.len()];
         let mut merged = shape.clone();
         for name in names {
-            let first = edges[0].1[name];
-            if edges.iter().all(|(_, scope)| scope[name] == first) {
-                merged.insert(name.clone(), first);
+            let declared = shape[name].declared;
+            let first = edges[0].1[name].value;
+            if edges.iter().all(|(_, scope)| scope[name].value == first) {
+                merged.insert(
+                    name.clone(),
+                    Binding {
+                        value: first,
+                        declared,
+                    },
+                );
                 continue;
             }
             let members: Vec<TypeId> = edges
                 .iter()
-                .map(|(_, scope)| function.type_of(scope[name]))
+                .map(|(_, scope)| function.type_of(scope[name].value))
                 .collect();
             let wanted = table.union(members);
             for (position, (exit, scope)) in edges.iter().enumerate() {
-                let carried = self.appended(function, *exit, scope[name], wanted, span);
+                let carried = self.appended(function, *exit, scope[name].value, wanted, span);
                 passed[position].push(carried);
             }
             let parameter = function.fresh_value(wanted);
             parameters.push(parameter);
-            merged.insert(name.clone(), parameter);
+            merged.insert(
+                name.clone(),
+                Binding {
+                    value: parameter,
+                    declared,
+                },
+            );
         }
 
         function.block_mut(join).parameters = parameters;
@@ -2030,7 +2187,7 @@ impl Context<'_> {
         self.assign(function, wide, Rvalue::Widen(value), span)
     }
 
-    fn bound(&self, name: &str, span: oxc_span::Span) -> Result<ValueId, Vec<Diagnostic>> {
+    fn bound(&self, name: &str, span: oxc_span::Span) -> Result<Binding, Vec<Diagnostic>> {
         self.scope.get(name).copied().ok_or_else(|| {
             vec![refuse(
                 "unsupported-reference",
@@ -2354,7 +2511,13 @@ impl Context<'_> {
             None if widening => self.widened(table, function, value, declarator.span),
             None => value,
         };
-        self.scope.insert(id.name.to_string(), value);
+        self.scope.insert(
+            id.name.to_string(),
+            Binding {
+                value,
+                declared: function.type_of(value),
+            },
+        );
         Ok(())
     }
 
@@ -2396,7 +2559,13 @@ impl Context<'_> {
         for (position, id) in names.iter().enumerate() {
             let index = self.index_constant(table, function, position, id.span);
             let value = self.read_element_at(table, function, source, index, id.span)?;
-            self.scope.insert(id.name.to_string(), value);
+            self.scope.insert(
+                id.name.to_string(),
+                Binding {
+                    value,
+                    declared: function.type_of(value),
+                },
+            );
         }
 
         if let Some(rest) = &pattern.rest {
@@ -2419,7 +2588,13 @@ impl Context<'_> {
                 },
                 id.span,
             );
-            self.scope.insert(id.name.to_string(), value);
+            self.scope.insert(
+                id.name.to_string(),
+                Binding {
+                    value,
+                    declared: ty,
+                },
+            );
         }
         Ok(())
     }
@@ -2504,7 +2679,7 @@ impl Context<'_> {
             }
             Expression::Identifier(id) => {
                 if let Some(known) = self.scope.get(id.name.as_str()) {
-                    return Ok(*known);
+                    return Ok(known.value);
                 }
                 if id.name == "undefined" {
                     let ty = table.intern(TypeKind::Undefined);
