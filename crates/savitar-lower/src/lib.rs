@@ -116,6 +116,7 @@ struct Tested {
 enum Fact {
     Nullish(TypeKind),
     Primitive(String),
+    Truth,
     Discriminant {
         field: String,
         literals: Vec<TypeKind>,
@@ -1548,16 +1549,30 @@ impl Context<'_> {
     }
 
     fn tested_fact(&self, test: &Expression<'_>) -> Option<Tested> {
-        let Expression::BinaryExpression(binary) = test else {
-            return None;
-        };
-        let equal = match binary.operator {
-            BinaryOperator::StrictEquality => true,
-            BinaryOperator::StrictInequality => false,
-            _ => return None,
-        };
-        self.fact_between(&binary.left, &binary.right, equal)
-            .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+        match test {
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                let inner = self.tested_fact(&unary.argument)?;
+                Some(Tested {
+                    equal: !inner.equal,
+                    ..inner
+                })
+            }
+            Expression::Identifier(_) => Some(Tested {
+                name: self.name_in_scope(test)?,
+                fact: Fact::Truth,
+                equal: true,
+            }),
+            Expression::BinaryExpression(binary) => {
+                let equal = match binary.operator {
+                    BinaryOperator::StrictEquality => true,
+                    BinaryOperator::StrictInequality => false,
+                    _ => return None,
+                };
+                self.fact_between(&binary.left, &binary.right, equal)
+                    .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+            }
+            _ => None,
+        }
     }
 
     fn fact_between(
@@ -1667,6 +1682,9 @@ impl Context<'_> {
                     types::without_literals(table, held, literals)
                 }
             }
+            Fact::Truth => asserted
+                .then(|| types::without_always_false(table, held))
+                .flatten(),
         };
         let Some(narrowed) = narrowed else {
             return;

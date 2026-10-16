@@ -83,3 +83,30 @@ export function verbCost(verb: Verb, base: number): number {
       return writtenCost(verb, base);
   }
 }
+
+export type Mode = "" | "fast" | "safe";
+
+export function hostOf(host: string | undefined, fallback: string): string {
+  if (host) {
+    return host;
+  }
+  return fallback;
+}
+
+export function pathLength(path: string | undefined): number {
+  if (!path) {
+    return 0;
+  }
+  return textLength(path);
+}
+
+export function retries(limit: number | undefined, fallback: number): number {
+  return limit ? limit : fallback;
+}
+
+export function modeOf(mode: Mode, fallback: "fast" | "safe"): "fast" | "safe" {
+  if (mode) {
+    return mode;
+  }
+  return fallback;
+}

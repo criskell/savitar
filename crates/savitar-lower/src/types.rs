@@ -157,6 +157,21 @@ pub fn without_literals(
 }
 
 #[must_use]
+pub fn without_always_false(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
+    keeping(table, id, |table, member| !is_always_false(table, member))
+}
+
+fn is_always_false(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Undefined | TypeKind::Null => true,
+        TypeKind::BooleanLiteral(held) => !held,
+        TypeKind::NumberLiteral(bits) => f64::from_bits(*bits) == 0.0,
+        TypeKind::StringLiteral(held) => held.is_empty(),
+        _ => false,
+    }
+}
+
+#[must_use]
 pub fn label_literal(table: &TypeTable, label: TypeId) -> Option<TypeKind> {
     match table.kind(label) {
         kind @ (TypeKind::StringLiteral(_)

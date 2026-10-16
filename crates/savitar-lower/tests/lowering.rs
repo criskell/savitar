@@ -4970,6 +4970,149 @@ fn an_optional_discriminant_field_narrows_nothing_because_it_may_be_absent() {
 }
 
 #[test]
+fn the_truthy_branch_drops_undefined_null_false_zero_and_the_empty_string() {
+    let source = "function use(value: Loose): number {\n  if (value) {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let empty = table.intern(TypeKind::StringLiteral(String::new()));
+    let letter = table.intern(TypeKind::StringLiteral("a".to_string()));
+    let zero = table.number_literal(0.0);
+    let one = table.number_literal(1.0);
+    let no = table.intern(TypeKind::BooleanLiteral(false));
+    let yes = table.intern(TypeKind::BooleanLiteral(true));
+    let nothing = table.intern(TypeKind::Undefined);
+    let nil = table.intern(TypeKind::Null);
+    let loose = table.union(vec![empty, letter, zero, one, no, yes, nothing, nil]);
+    let truthy = table.union(vec![letter, one, yes]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(loose)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&truthy),
+        "only the members that no value of them makes true are dropped"
+    );
+}
+
+#[test]
+fn the_truth_of_a_name_leaves_string_number_and_boolean_alone_because_each_holds_a_false_value() {
+    let source = "function use(value: string | number | boolean): number {\n  if (value) {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let flag = table.intern(TypeKind::Boolean);
+    let any_of_three = table.union(vec![text, number, flag]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(any_of_three)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        Vec::new(),
+        "the empty string, zero and false still fit their own types"
+    );
+}
+
+#[test]
+fn the_falsy_branch_of_a_name_narrows_nothing_because_a_false_value_keeps_its_type() {
+    let source = "function use(value: string | undefined): number {\n  if (value) {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Undefined);
+    let either = table.union(vec![text, nothing]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![text],
+        "only the branch where the name holds is narrowed"
+    );
+}
+
+#[test]
+fn a_negated_name_narrows_the_branch_where_it_holds() {
+    let source = "function use(value: string | undefined): number {\n  if (!value) {\n    return 0;\n  }\n  return width(value);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Undefined);
+    let either = table.union(vec![text, nothing]);
+    let widths = taking(&mut table, text, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("width", Answer::Known(widths)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![text],
+        "`!` swaps the branches and nothing else"
+    );
+}
+
+#[test]
+fn a_ternary_narrows_the_arm_where_the_name_holds() {
+    let source = "function use(value: string | undefined): number {\n  return value ? width(value) : 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Undefined);
+    let either = table.union(vec![text, nothing]);
+    let widths = taking(&mut table, text, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("width", Answer::Known(widths)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&text));
+}
+
+#[test]
 fn a_switch_case_narrows_the_discriminant_to_the_member_its_label_names() {
     let source = "function use(frame: Frame): number {\n  switch (frame.kind) {\n    case \"binary\":\n      return count(frame);\n    default:\n      return 0;\n  }\n}\n";
     let mut table = TypeTable::new();
