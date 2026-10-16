@@ -5606,3 +5606,195 @@ fn a_name_a_block_shadows_goes_back_to_the_outer_value_after_the_block() {
         "the block stepped its own `value`, and the outer one never moved"
     );
 }
+
+fn route_shape(table: &mut TypeTable) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    table.object(vec![
+        Field {
+            name: "handler".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "timeout".to_string(),
+            type_id: number,
+            optional: true,
+            method: false,
+            readonly: false,
+        },
+    ])
+}
+
+fn read_fields_of(function: &savitar_ir::Function) -> Vec<String> {
+    only_block(function)
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                value: Rvalue::ReadField { name, .. },
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_object_pattern_reads_each_field_the_shape_declares() {
+    let source = "function pick(route: Route): string {\n  const { handler } = route;\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(read_fields_of(function), vec!["handler".to_string()]);
+    let Terminator::Return(Some(returned)) = only_block(function).terminator else {
+        panic!("expected a return");
+    };
+    assert_eq!(
+        function.type_of(returned),
+        text,
+        "the bound name takes the type the field declares"
+    );
+}
+
+#[test]
+fn an_object_pattern_that_renames_binds_the_new_name_to_the_field_read() {
+    let source = "function pick(route: Route): string {\n  const { handler: run } = route;\n  return run;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(read_fields_of(function), vec!["handler".to_string()]);
+    let Terminator::Return(Some(returned)) = only_block(function).terminator else {
+        panic!("expected a return");
+    };
+    assert_eq!(function.type_of(returned), text);
+}
+
+#[test]
+fn an_object_pattern_over_an_optional_field_carries_undefined_in_the_bound_name() {
+    let source = "function wait(route: Route): number | undefined {\n  const { timeout } = route;\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("wait", returning(&mut table, maybe)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Terminator::Return(Some(returned)) = only_block(function).terminator else {
+        panic!("expected a return");
+    };
+    assert!(
+        table.admits_undefined(function.type_of(returned)),
+        "an optional field is read as the field type with undefined"
+    );
+}
+
+#[test]
+fn an_object_pattern_over_a_field_the_shape_never_declares_is_refused() {
+    let source = "function pick(route: Route): string {\n  const { missing } = route;\n  return missing;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("missing"),
+        "{:?}",
+        report.diagnostics[0]
+    );
+}
+
+#[test]
+fn an_object_pattern_over_something_with_no_declared_shape_is_refused() {
+    let source =
+        "function pick(count: number): number {\n  const { size } = count;\n  return size;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, number)),
+            ("count", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn an_object_pattern_with_a_computed_key_is_refused() {
+    let source = "function pick(route: Route, key: string): string {\n  const { [key]: found } = route;\n  return found;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+            ("key", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}

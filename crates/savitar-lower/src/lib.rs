@@ -2666,15 +2666,8 @@ impl Context<'_> {
         declarator: &VariableDeclarator<'_>,
         widening: bool,
     ) -> Result<(), Vec<Diagnostic>> {
-        if let BindingPattern::ArrayPattern(pattern) = &declarator.id {
-            return self.lower_array_pattern(table, function, declarator, pattern);
-        }
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                declarator.span,
-                "a binding that is not a plain name is not lowered yet",
-            )]);
+            return self.lower_destructuring(table, function, declarator);
         };
         let Some(init) = &declarator.init else {
             return Err(vec![refuse(
@@ -2712,12 +2705,11 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn lower_array_pattern(
+    fn lower_destructuring(
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
         declarator: &VariableDeclarator<'_>,
-        pattern: &oxc_ast::ast::ArrayPattern<'_>,
     ) -> Result<(), Vec<Diagnostic>> {
         let Some(init) = &declarator.init else {
             return Err(vec![refuse(
@@ -2727,9 +2719,49 @@ impl Context<'_> {
             )]);
         };
         let source = self.lower_expression(table, function, init)?;
+        self.bind_pattern(table, function, &declarator.id, source)
+    }
 
-        let mut names = Vec::with_capacity(pattern.elements.len());
-        for element in &pattern.elements {
+    fn bind_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &BindingPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match pattern {
+            BindingPattern::BindingIdentifier(id) => {
+                self.declare(
+                    id.name.as_str(),
+                    Binding {
+                        value: source,
+                        declared: function.type_of(source),
+                    },
+                );
+                Ok(())
+            }
+            BindingPattern::ArrayPattern(array) => {
+                self.bind_array_pattern(table, function, array, source)
+            }
+            BindingPattern::ObjectPattern(object) => {
+                self.bind_object_pattern(table, function, object, source)
+            }
+            BindingPattern::AssignmentPattern(default) => Err(vec![refuse(
+                "unsupported-pattern",
+                default.span,
+                "a default value in a pattern is not lowered yet",
+            )]),
+        }
+    }
+
+    fn bind_array_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ArrayPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for (position, element) in pattern.elements.iter().enumerate() {
             let Some(element) = element.as_ref() else {
                 return Err(vec![refuse(
                     "unsupported-pattern",
@@ -2737,26 +2769,10 @@ impl Context<'_> {
                     "a hole in an array pattern is not lowered yet",
                 )]);
             };
-            let BindingPattern::BindingIdentifier(id) = element else {
-                return Err(vec![refuse(
-                    "unsupported-pattern",
-                    pattern.span,
-                    "an array pattern that binds anything but a plain name is not lowered yet",
-                )]);
-            };
-            names.push(id);
-        }
-
-        for (position, id) in names.iter().enumerate() {
-            let index = self.index_constant(table, function, position, id.span);
-            let value = self.read_element_at(table, function, source, index, id.span)?;
-            self.declare(
-                id.name.as_str(),
-                Binding {
-                    value,
-                    declared: function.type_of(value),
-                },
-            );
+            let at = element.span();
+            let index = self.index_constant(table, function, position, at);
+            let value = self.read_element_at(table, function, source, index, at)?;
+            self.bind_pattern(table, function, element, value)?;
         }
 
         if let Some(rest) = &pattern.rest {
@@ -2767,7 +2783,7 @@ impl Context<'_> {
                     "a rest in an array pattern that binds anything but a plain name is not lowered yet",
                 )]);
             };
-            let from = u32::try_from(names.len()).expect("a pattern is small");
+            let from = u32::try_from(pattern.elements.len()).expect("a pattern is small");
             let ty = types::rest_of(table, function.type_of(source), from)
                 .map_err(|reason| vec![refuse("unsupported-pattern", pattern.span, reason)])?;
             let value = self.assign(
@@ -2788,6 +2804,70 @@ impl Context<'_> {
             );
         }
         Ok(())
+    }
+
+    fn bind_object_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ObjectPattern<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for property in &pattern.properties {
+            let name = self.pattern_key(property)?;
+            let value = self.read_field_at(table, function, source, &name, property.span)?;
+            self.bind_pattern(table, function, &property.value, value)?;
+        }
+
+        if let Some(rest) = &pattern.rest {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                rest.span,
+                "a rest in an object pattern is not lowered yet",
+            )]);
+        }
+        Ok(())
+    }
+
+    fn pattern_key(
+        &self,
+        property: &oxc_ast::ast::BindingProperty<'_>,
+    ) -> Result<String, Vec<Diagnostic>> {
+        if property.computed {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                property.span,
+                "a computed key in an object pattern is not lowered yet",
+            )]);
+        }
+        property.key.static_name().map(Into::into).ok_or_else(|| {
+            vec![refuse(
+                "unsupported-pattern",
+                property.span,
+                "a key in an object pattern that is not a plain name is not lowered yet",
+            )]
+        })
+    }
+
+    fn read_field_at(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        object: ValueId,
+        name: &str,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = types::field_result(table, function.type_of(object), name)
+            .map_err(|reason| vec![refuse("unsupported-pattern", span, reason)])?;
+        Ok(self.assign(
+            function,
+            ty,
+            Rvalue::ReadField {
+                object,
+                name: name.to_string(),
+            },
+            span,
+        ))
     }
 
     fn index_constant(
