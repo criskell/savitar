@@ -54,6 +54,32 @@ pub fn without_nullish(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
     Some(table.union(kept))
 }
 
+#[must_use]
+pub fn without_member(table: &mut TypeTable, id: TypeId, dropped: &TypeKind) -> Option<TypeId> {
+    if table.kind(id) == dropped {
+        return None;
+    }
+    let TypeKind::Union(members) = table.kind(id).clone() else {
+        return Some(id);
+    };
+    let kept: Vec<TypeId> = members
+        .into_iter()
+        .filter(|&member| table.kind(member) != dropped)
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(table.union(kept))
+}
+
+#[must_use]
+pub fn holds_member(table: &TypeTable, id: TypeId, wanted: &TypeKind) -> bool {
+    match table.kind(id) {
+        TypeKind::Union(members) => members.iter().any(|&member| table.kind(member) == wanted),
+        held => held == wanted,
+    }
+}
+
 fn is_nullish(table: &TypeTable, id: TypeId) -> bool {
     matches!(table.kind(id), TypeKind::Null | TypeKind::Undefined)
 }

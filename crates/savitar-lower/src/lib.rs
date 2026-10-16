@@ -1127,6 +1127,65 @@ impl Context<'_> {
         Ok(Flow::Continues)
     }
 
+    fn tested_for_nullish(&self, test: &Expression<'_>) -> Option<(String, TypeKind, bool)> {
+        let Expression::BinaryExpression(binary) = test else {
+            return None;
+        };
+        let equal = match binary.operator {
+            BinaryOperator::StrictEquality => true,
+            BinaryOperator::StrictInequality => false,
+            _ => return None,
+        };
+        let named = |side: &Expression<'_>| match side {
+            Expression::Identifier(id) if self.scope.contains_key(id.name.as_str()) => {
+                Some(id.name.to_string())
+            }
+            _ => None,
+        };
+        let nullish = |side: &Expression<'_>| match side {
+            Expression::Identifier(id) if id.name == "undefined" => Some(TypeKind::Undefined),
+            Expression::NullLiteral(_) => Some(TypeKind::Null),
+            _ => None,
+        };
+        if let (Some(name), Some(kind)) = (named(&binary.left), nullish(&binary.right)) {
+            return Some((name, kind, equal));
+        }
+        if let (Some(name), Some(kind)) = (named(&binary.right), nullish(&binary.left)) {
+            return Some((name, kind, equal));
+        }
+        None
+    }
+
+    fn narrow_by_test(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        tested: Option<&(String, TypeKind, bool)>,
+        holds: bool,
+        span: oxc_span::Span,
+    ) {
+        let Some((name, kind, equal)) = tested else {
+            return;
+        };
+        let Some(&value) = self.scope.get(name) else {
+            return;
+        };
+        let held = function.type_of(value);
+        let narrowed = if holds == *equal {
+            types::holds_member(table, held, kind).then(|| table.intern(kind.clone()))
+        } else {
+            types::without_member(table, held, kind)
+        };
+        let Some(narrowed) = narrowed else {
+            return;
+        };
+        if narrowed == held {
+            return;
+        }
+        let value = self.assign(function, narrowed, Rvalue::Narrow(value), span);
+        self.scope.insert(name.clone(), value);
+    }
+
     fn lower_if(
         &mut self,
         table: &mut TypeTable,
@@ -1134,6 +1193,7 @@ impl Context<'_> {
         statement: &oxc_ast::ast::IfStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let condition = self.lower_expression(table, function, &statement.test)?;
+        let tested = self.tested_for_nullish(&statement.test);
         let before = self.scope.clone();
 
         let then_entry = function.add_block(empty_block());
@@ -1154,6 +1214,7 @@ impl Context<'_> {
         self.current = then_entry;
         self.statements.clear();
         self.scope = before.clone();
+        self.narrow_by_test(table, function, tested.as_ref(), true, statement.span);
         let then_flow = self.lower_statement(table, function, &statement.consequent)?;
         let then_exit = self.current;
         if then_flow.continues() {
@@ -1169,6 +1230,7 @@ impl Context<'_> {
 
         self.current = else_entry;
         self.statements.clear();
+        self.narrow_by_test(table, function, tested.as_ref(), false, statement.span);
         let else_flow = match &statement.alternate {
             Some(alternate) => self.lower_statement(table, function, alternate)?,
             None => Flow::Continues,
@@ -1525,6 +1587,8 @@ impl Context<'_> {
         expected: Option<TypeId>,
     ) -> Result<ValueId, Vec<Diagnostic>> {
         let condition = self.lower_expression(table, function, &conditional.test)?;
+        let tested = self.tested_for_nullish(&conditional.test);
+        let before = self.scope.clone();
         let then_entry = function.add_block(empty_block());
         let else_entry = function.add_block(empty_block());
         let join = function.add_block(empty_block());
@@ -1541,6 +1605,7 @@ impl Context<'_> {
 
         self.current = then_entry;
         self.statements.clear();
+        self.narrow_by_test(table, function, tested.as_ref(), true, conditional.span);
         let then_value =
             self.lower_expression_expecting(table, function, &conditional.consequent, expected)?;
         let then_exit = self.current;
@@ -1548,10 +1613,13 @@ impl Context<'_> {
 
         self.current = else_entry;
         self.statements.clear();
+        self.scope = before.clone();
+        self.narrow_by_test(table, function, tested.as_ref(), false, conditional.span);
         let else_value =
             self.lower_expression_expecting(table, function, &conditional.alternate, expected)?;
         let else_exit = self.current;
         let else_statements = std::mem::take(&mut self.statements);
+        self.scope = before;
 
         let merged = table.union(vec![
             function.type_of(then_value),

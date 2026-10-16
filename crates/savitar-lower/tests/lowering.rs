@@ -887,6 +887,131 @@ fn overloaded(
     table.overloaded(built)
 }
 
+fn maybe_number(table: &mut TypeTable) -> (savitar_types::TypeId, savitar_types::TypeId) {
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    (number, maybe)
+}
+
+#[test]
+fn a_name_tested_against_undefined_is_narrowed_where_it_cannot_be_undefined() {
+    let source = "function use(value: number | undefined): number {\n  if (value === undefined) {\n    return 0;\n  }\n  return value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, maybe) = maybe_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .flat_map(|(_, block)| block.statements.iter())
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Narrow(_),
+                    ..
+                }
+            )),
+        "the branch that excludes undefined narrows the name"
+    );
+}
+
+#[test]
+fn a_ternary_tested_against_undefined_narrows_the_arm_that_excludes_it() {
+    let source = "function use(value: number | undefined): number {\n  return value === undefined ? 0 : value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, maybe) = maybe_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_ternary_tested_the_other_way_round_narrows_the_other_arm() {
+    let source = "function use(value: number | undefined): number {\n  return value !== undefined ? value + 1 : 0;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, maybe) = maybe_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_name_tested_against_null_is_narrowed_the_same_way() {
+    let source = "function use(value: number | null): number {\n  return value === null ? 0 : value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let null = table.intern(TypeKind::Null);
+    let maybe = table.union(vec![number, null]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn the_branch_where_the_name_is_undefined_is_narrowed_to_undefined() {
+    let source = "function use(value: number | undefined): number {\n  if (value === undefined) {\n    return value + 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, maybe) = maybe_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0].message.contains("two numbers"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
 #[test]
 fn a_new_expression_takes_the_form_that_fits_and_the_type_it_builds() {
     let source = "function make(start: number): Counter {\n  return new Counter(start);\n}\n";
