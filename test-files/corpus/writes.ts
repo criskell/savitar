@@ -139,3 +139,13 @@ export function countChunk(body: Body): number {
   }
   return 0;
 }
+
+export interface Limits {
+  requests: number;
+  burst?: number;
+}
+
+export function allowBurst(limits: Limits, burst: number): number {
+  limits.burst = burst;
+  return limits.requests;
+}

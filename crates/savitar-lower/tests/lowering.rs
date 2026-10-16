@@ -7831,11 +7831,10 @@ fn writing_a_field_on_a_union_with_a_member_that_has_no_shape_is_refused_without
 }
 
 #[test]
-fn writing_a_value_to_a_field_one_union_member_marks_optional_keeps_what_it_proved() {
+fn writing_a_value_to_a_field_one_union_member_marks_optional_takes_the_field_type() {
     let source = "function set(holder: Small | Loose): void {\n  holder.amount = 2;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
-    let two = table.intern(TypeKind::NumberLiteral(2.0f64.to_bits()));
     let small = table.object(vec![named_field("amount", number, false)]);
     let loose = table.object(vec![named_field("amount", number, true)]);
     let holder = table.union(vec![small, loose]);
@@ -7855,10 +7854,10 @@ fn writing_a_value_to_a_field_one_union_member_marks_optional_keeps_what_it_prov
         );
     };
     assert_eq!(name, "amount");
-    assert_eq!(
-        function.type_of(*value),
-        two,
-        "the slots disagree, so nothing settles the value and the proof runs against each"
+    assert_eq!(function.type_of(*value), number);
+    assert!(
+        !table.admits_undefined(function.type_of(*value)),
+        "the field is optional in one member, and a write still takes the type it declares"
     );
 }
 
@@ -8071,4 +8070,43 @@ fn passing_undefined_where_a_default_waits_is_refused_although_the_entry_admits_
         report.diagnostics[0].rule, "unsupported-argument",
         "the signature carries the parameter type without undefined, and the call proof reads it"
     );
+}
+
+#[test]
+fn writing_undefined_to_an_optional_field_is_refused_because_a_write_takes_the_field_type() {
+    let source = "function clear(route: Route): void {\n  route.timeout = undefined;\n}\n";
+    let mut table = TypeTable::new();
+    let route = route_shape(&mut table);
+    let provider = ByName::new(source, vec![("route", Answer::Known(route))]);
+    let file = SourceFile::new("clear.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn writing_a_value_to_an_optional_field_is_lowered_with_the_type_the_field_declares() {
+    let source = "function set(route: Route): void {\n  route.timeout = 5;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(source, vec![("route", Answer::Known(route))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "timeout");
+    assert_eq!(function.type_of(*value), number);
 }

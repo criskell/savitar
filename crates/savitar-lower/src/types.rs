@@ -531,9 +531,6 @@ pub fn field_slot(
                 "`{name}` is declared readonly and admits no write"
             )));
         }
-        if field.optional {
-            return Ok(table.optional(field.type_id));
-        }
         return Ok(field.type_id);
     }
     Err(SlotRefusal::Declined(format!(
