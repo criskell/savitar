@@ -3677,8 +3677,26 @@ fn a_case_label_no_one_can_type_is_refused_rather_than_guessed() {
     assert_eq!(report.diagnostics[0].rule, "no-type-answer");
 }
 
+fn blocks_jumping_to(function: &savitar_ir::Function, wanted: savitar_ir::BlockId) -> Vec<usize> {
+    function
+        .blocks()
+        .filter_map(|(_, block)| match &block.terminator {
+            Terminator::Jump { target, arguments } if *target == wanted => Some(arguments.len()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parameterised(function: &savitar_ir::Function) -> Vec<(savitar_ir::BlockId, usize)> {
+    function
+        .blocks()
+        .filter(|(_, block)| !block.parameters.is_empty())
+        .map(|(id, block)| (id, block.parameters.len()))
+        .collect()
+}
+
 #[test]
-fn a_break_inside_a_loop_is_refused_instead_of_leaving_the_loop_wrong() {
+fn a_break_out_of_a_loop_meets_the_normal_exit_at_a_second_join() {
     let source = "function first(values: readonly number[], start: number): number {\n  let found = start;\n  for (const value of values) {\n    found = value;\n    break;\n  }\n  return found;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -3694,12 +3712,135 @@ fn a_break_inside_a_loop_is_refused_instead_of_leaving_the_loop_wrong() {
 
     let report = lower(&file, &provider, &mut table);
 
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(
+        carrying.len(),
+        2,
+        "the header carries the iteration, the exit carries what the two ways out disagree on"
+    );
+    let (header, header_parameters) = carrying[0];
+    assert_eq!(header_parameters, 2, "the index and `found` are carried");
+    let (exit, exit_parameters) = carrying[1];
+    assert_eq!(exit_parameters, 1, "`found` leaves the loop as a parameter");
+    assert_eq!(
+        blocks_jumping_to(function, exit),
+        vec![1, 1],
+        "the normal exit and the `break` both carry `found`"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![2],
+        "the body always breaks, so only the entry reaches the header"
+    );
+}
+
+#[test]
+fn a_loop_whose_body_only_breaks_grows_no_back_edge() {
+    let source = "function once(flag: boolean, start: number): number {\n  let found = start;\n  while (flag) {\n    found = start;\n    break;\n  }\n  return found;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("once.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1],
+        "only the entry reaches the header, because the body never runs twice"
+    );
+}
+
+#[test]
+fn a_break_in_one_arm_of_an_if_inside_a_loop_still_reaches_the_exit() {
+    let source = "function until(limit: number, stop: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    if (seen === stop) {\n      break;\n    }\n    seen = seen + 1;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("stop", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("until.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1, 1],
+        "the entry and the back edge both carry `seen`"
+    );
+}
+
+#[test]
+fn a_break_inside_a_switch_inside_a_loop_leaves_only_the_switch() {
+    let source = "function tally(kind: string, step: number): number {\n  let sum = 0;\n  while (sum < step) {\n    switch (kind) {\n      case \"add\":\n        sum = sum + step;\n        break;\n      default:\n        sum = sum + 1;\n    }\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("step", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("tally.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1, 1],
+        "the `break` ends the `switch`, so the loop still comes back"
+    );
+}
+
+#[test]
+fn a_labelled_break_is_refused_rather_than_guessed_at() {
+    let source = "function scan(limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    break outer;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("scan.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
     assert!(
-        report.diagnostics[0].message.contains("out of a loop"),
-        "{}",
-        report.diagnostics[0].message
+        report.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("labelled `break`")),
+        "{:?}",
+        report.diagnostics
     );
 }
 

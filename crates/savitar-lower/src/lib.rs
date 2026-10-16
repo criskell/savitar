@@ -49,7 +49,7 @@ impl Flow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Breakable {
     Switch(BlockId),
-    Loop,
+    Loop { exit: BlockId },
 }
 
 enum Written<'target, 'source> {
@@ -962,6 +962,7 @@ impl Context<'_> {
         );
 
         let body = function.add_block(empty_block());
+        let leaving = function.add_block(empty_block());
         let exit = function.add_block(empty_block());
         self.seal(
             function,
@@ -969,8 +970,18 @@ impl Context<'_> {
                 condition: in_range,
                 then_block: body,
                 then_arguments: Vec::new(),
-                else_block: exit,
+                else_block: leaving,
                 else_arguments: Vec::new(),
+            },
+        );
+        let at_leaving = self.scope.clone();
+        self.current = leaving;
+        self.statements.clear();
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: exit,
+                arguments: Vec::new(),
             },
         );
 
@@ -987,10 +998,13 @@ impl Context<'_> {
         );
         self.scope.insert(bound.name.to_string(), current);
 
-        self.enclosing.push(Breakable::Loop);
+        let outer_breaks = std::mem::take(&mut self.breaks);
+        self.enclosing.push(Breakable::Loop { exit });
         let body_flow = self.lower_statement(table, function, &statement.body)?;
         self.enclosing.pop();
+        let breaks = std::mem::replace(&mut self.breaks, outer_breaks);
         if body_flow == Flow::Continues {
+            self.every_change_is_carried(&at_header, &carried, statement.span)?;
             let one_type = table.number_literal(1.0);
             let one = self.assign(
                 function,
@@ -1012,18 +1026,6 @@ impl Context<'_> {
             for name in &carried {
                 back_arguments.push(self.scope[name]);
             }
-            for (name, value) in &self.scope {
-                if !at_header.contains_key(name) {
-                    continue;
-                }
-                if at_header.get(name) != Some(value) && !carried.contains(name) {
-                    return Err(vec![refuse(
-                        "malformed-ir",
-                        statement.span,
-                        format!("`{name}` changes in the loop but carries no header parameter"),
-                    )]);
-                }
-            }
             self.seal(
                 function,
                 Terminator::Jump {
@@ -1033,7 +1035,9 @@ impl Context<'_> {
             );
         }
 
-        self.scope = at_header;
+        let mut edges = vec![(leaving, at_leaving)];
+        edges.extend(breaks);
+        self.scope = self.joined(table, function, exit, &at_header, &edges, statement.span);
         self.current = exit;
         self.statements.clear();
         Ok(Flow::Continues)
@@ -1077,6 +1081,7 @@ impl Context<'_> {
 
         let condition = self.lower_expression(table, function, &statement.test)?;
         let body = function.add_block(empty_block());
+        let leaving = function.add_block(empty_block());
         let exit = function.add_block(empty_block());
         self.seal(
             function,
@@ -1084,33 +1089,34 @@ impl Context<'_> {
                 condition,
                 then_block: body,
                 then_arguments: Vec::new(),
-                else_block: exit,
+                else_block: leaving,
                 else_arguments: Vec::new(),
+            },
+        );
+        let at_leaving = self.scope.clone();
+        self.current = leaving;
+        self.statements.clear();
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: exit,
+                arguments: Vec::new(),
             },
         );
 
         self.current = body;
         self.statements.clear();
-        self.enclosing.push(Breakable::Loop);
+        let outer_breaks = std::mem::take(&mut self.breaks);
+        self.enclosing.push(Breakable::Loop { exit });
         let body_flow = self.lower_statement(table, function, &statement.body)?;
         self.enclosing.pop();
+        let breaks = std::mem::replace(&mut self.breaks, outer_breaks);
 
         if body_flow == Flow::Continues {
+            self.every_change_is_carried(&at_header, &carried, statement.span)?;
             let mut back_arguments = Vec::with_capacity(carried.len());
             for name in &carried {
                 back_arguments.push(self.scope[name]);
-            }
-            for (name, value) in &self.scope {
-                if !at_header.contains_key(name) {
-                    continue;
-                }
-                if at_header.get(name) != Some(value) && !carried.contains(name) {
-                    return Err(vec![refuse(
-                        "malformed-ir",
-                        statement.span,
-                        format!("`{name}` changes in the loop but carries no header parameter"),
-                    )]);
-                }
             }
             self.seal(
                 function,
@@ -1121,7 +1127,9 @@ impl Context<'_> {
             );
         }
 
-        self.scope = at_header;
+        let mut edges = vec![(leaving, at_leaving)];
+        edges.extend(breaks);
+        self.scope = self.joined(table, function, exit, &at_header, &edges, statement.span);
         self.current = exit;
         self.statements.clear();
         Ok(Flow::Continues)
@@ -1336,11 +1344,18 @@ impl Context<'_> {
                 self.breaks.push((self.current, self.scope.clone()));
                 Ok(Flow::Broke)
             }
-            Some(Breakable::Loop) => Err(vec![refuse(
-                "unsupported-statement",
-                span,
-                "a `break` out of a loop is not lowered yet; only a `break` in a `switch` is",
-            )]),
+            Some(Breakable::Loop { exit }) => {
+                let target = *exit;
+                self.seal(
+                    function,
+                    Terminator::Jump {
+                        target,
+                        arguments: Vec::new(),
+                    },
+                );
+                self.breaks.push((self.current, self.scope.clone()));
+                Ok(Flow::Broke)
+            }
             None => Err(vec![refuse(
                 "unsupported-statement",
                 span,
@@ -1465,11 +1480,26 @@ impl Context<'_> {
             return Ok(Flow::Returned);
         }
 
-        let mut names: Vec<&String> = before.keys().collect();
+        self.scope = self.joined(table, function, join, &before, &edges, statement.span);
+        self.current = join;
+        self.statements.clear();
+        Ok(Flow::Continues)
+    }
+
+    fn joined(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        join: BlockId,
+        shape: &Scope,
+        edges: &[(BlockId, Scope)],
+        span: oxc_span::Span,
+    ) -> Scope {
+        let mut names: Vec<&String> = shape.keys().collect();
         names.sort();
         let mut parameters = Vec::new();
         let mut passed: Vec<Vec<ValueId>> = vec![Vec::new(); edges.len()];
-        let mut merged = before.clone();
+        let mut merged = shape.clone();
         for name in names {
             let first = edges[0].1[name];
             if edges.iter().all(|(_, scope)| scope[name] == first) {
@@ -1482,7 +1512,7 @@ impl Context<'_> {
                 .collect();
             let wanted = table.union(members);
             for (position, (exit, scope)) in edges.iter().enumerate() {
-                let carried = self.appended(function, *exit, scope[name], wanted, statement.span);
+                let carried = self.appended(function, *exit, scope[name], wanted, span);
                 passed[position].push(carried);
             }
             let parameter = function.fresh_value(wanted);
@@ -1497,11 +1527,28 @@ impl Context<'_> {
                 arguments,
             };
         }
+        merged
+    }
 
-        self.scope = merged;
-        self.current = join;
-        self.statements.clear();
-        Ok(Flow::Continues)
+    fn every_change_is_carried(
+        &self,
+        at_header: &Scope,
+        carried: &[String],
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for (name, value) in &self.scope {
+            if !at_header.contains_key(name) {
+                continue;
+            }
+            if at_header.get(name) != Some(value) && !carried.contains(name) {
+                return Err(vec![refuse(
+                    "malformed-ir",
+                    span,
+                    format!("`{name}` changes in the loop but carries no header parameter"),
+                )]);
+            }
+        }
+        Ok(())
     }
 
     fn appended(
