@@ -7847,3 +7847,286 @@ fn an_object_pattern_over_a_union_reads_the_index_signature_of_the_member_withou
     assert_eq!(verify(function), vec![]);
     assert_eq!(function.type_of(returned_value(function)), maybe);
 }
+
+fn incident_union(table: &mut TypeTable) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let timeout = table.intern(TypeKind::StringLiteral("timeout".to_string()));
+    let crash = table.intern(TypeKind::StringLiteral("crash".to_string()));
+    let first = table.object(vec![
+        Field {
+            name: "kind".to_string(),
+            type_id: timeout,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "after".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let second = table.object(vec![
+        Field {
+            name: "kind".to_string(),
+            type_id: crash,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "message".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    table.union(vec![first, second])
+}
+
+fn rest_target(function: &savitar_ir::Function) -> savitar_ir::ValueId {
+    only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Rest { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the rest should be taken from the object")
+}
+
+#[test]
+fn a_rest_over_a_union_is_the_union_of_the_rest_of_every_member() {
+    let source = "function body(incident: Incident): unknown {\n  const { kind, ...rest } = incident;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let incident = incident_union(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, unknown)),
+            ("incident", Answer::Known(incident)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let after = table.object(vec![Field {
+        name: "after".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let message = table.object(vec![Field {
+        name: "message".to_string(),
+        type_id: text,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let kept = table.union(vec![after, message]);
+    assert_eq!(function.type_of(rest_target(function)), kept);
+}
+
+#[test]
+fn a_rest_over_a_union_keeps_the_fields_the_pattern_left_in_each_member_apart() {
+    let source = "function body(incident: Incident): unknown {\n  const { kind, ...rest } = incident;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let incident = incident_union(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, unknown)),
+            ("incident", Answer::Known(incident)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    let function = &report.functions[0];
+    let TypeKind::Union(members) = table.kind(function.type_of(rest_target(function))).clone()
+    else {
+        panic!("the rest over a union should hold a union");
+    };
+    assert_eq!(members.len(), 2);
+    for member in members {
+        let TypeKind::Object { fields, .. } = table.kind(member).clone() else {
+            panic!("every member of the rest should hold a shape");
+        };
+        assert_eq!(fields.len(), 1);
+        assert!(fields.iter().all(|field| field.name != "kind"));
+        assert!(
+            fields[0].type_id == number || fields[0].type_id == text,
+            "each member keeps only what it declared"
+        );
+    }
+}
+
+#[test]
+fn a_rest_over_a_union_is_refused_when_a_member_declares_no_field_the_pattern_took() {
+    let source = "function body(incident: Incident): unknown {\n  const { kind, ...rest } = incident;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let number = table.intern(TypeKind::Number);
+    let timeout = table.intern(TypeKind::StringLiteral("timeout".to_string()));
+    let first = table.object(vec![
+        Field {
+            name: "kind".to_string(),
+            type_id: timeout,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "after".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let second = table.object(vec![Field {
+        name: "after".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let incident = table.union(vec![first, second]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, unknown)),
+            ("incident", Answer::Known(incident)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn a_rest_over_a_union_is_refused_when_one_member_carries_an_index_signature() {
+    let source = "function body(bag: Bag): unknown {\n  const { total, ...rest } = bag;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let number = table.intern(TypeKind::Number);
+    let named = table.object(vec![
+        Field {
+            name: "total".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "hits".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let counted = counted_by_text(&mut table, false);
+    let bag = table.union(vec![named, counted]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, unknown)),
+            ("bag", Answer::Known(bag)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("index signature"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_rest_over_a_union_is_refused_when_one_member_keeps_a_method() {
+    let source = "function body(bag: Bag): unknown {\n  const { total, ...rest } = bag;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let number = table.intern(TypeKind::Number);
+    let reader = table.function(Vec::new(), number);
+    let plain = table.object(vec![
+        Field {
+            name: "total".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "hits".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let ticking = table.object(vec![
+        Field {
+            name: "total".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "tick".to_string(),
+            type_id: reader,
+            optional: false,
+            method: true,
+            readonly: false,
+        },
+    ]);
+    let bag = table.union(vec![plain, ticking]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, unknown)),
+            ("bag", Answer::Known(bag)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("method"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}

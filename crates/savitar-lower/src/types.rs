@@ -708,6 +708,16 @@ pub fn object_rest_of(
     source: TypeId,
     taken: &[String],
 ) -> Result<TypeId, String> {
+    if let TypeKind::Union(members) = table.kind(source).clone() {
+        let mut held = Vec::with_capacity(members.len());
+        for member in members {
+            let one = object_rest_of(table, member, taken).map_err(|reason| {
+                format!("one member of this union keeps no rest of its own: {reason}")
+            })?;
+            held.push(one);
+        }
+        return Ok(table.union(held));
+    }
     let TypeKind::Object { fields, indexes } = table.kind(source).clone() else {
         return Err("a rest in an object pattern needs a declared shape to take from".to_string());
     };

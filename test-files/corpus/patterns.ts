@@ -194,3 +194,16 @@ export function retriesOf(settings: Record<string, number>): number {
   const { retries = 3 } = settings;
   return retries;
 }
+
+export type Incident =
+  | { kind: "timeout"; route: string; afterMillis: number }
+  | { kind: "crash"; route: string; message: string };
+
+export type IncidentBody =
+  | { route: string; afterMillis: number }
+  | { route: string; message: string };
+
+export function bodyOf(incident: Incident): IncidentBody {
+  const { kind, ...body } = incident;
+  return body;
+}
