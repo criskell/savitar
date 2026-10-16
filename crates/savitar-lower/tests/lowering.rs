@@ -7002,3 +7002,50 @@ fn an_object_pattern_over_a_union_is_refused_rather_than_read_from_one_member() 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
 }
+
+#[test]
+fn a_default_inside_a_patterned_parameter_branches_out_of_the_entry_block() {
+    let source = "function wait({ timeout = 30 }: Route): number {\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let signature = signature_taking(&mut table, vec![route], number);
+    let provider = ByName::new(source, vec![("wait", signature)]);
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_patterned_parameter_after_one_that_branches_still_reads_from_its_own_value() {
+    let source = "function wait({ timeout = 30 }: Route, { bytes }: RequestLine): number {\n  return timeout + bytes;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let line = table.object(vec![Field {
+        name: "bytes".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let signature = signature_taking(&mut table, vec![route, line], number);
+    let provider = ByName::new(source, vec![("wait", signature)]);
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 2);
+    assert_eq!(function.type_of(function.parameters()[1]), line);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
