@@ -6681,3 +6681,221 @@ fn an_assignment_to_a_pattern_with_a_rest_writes_the_slice_to_the_name() {
     );
     assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
 }
+
+fn signature_taking(
+    table: &mut TypeTable,
+    slots: Vec<savitar_types::TypeId>,
+    returns: savitar_types::TypeId,
+) -> Answer {
+    let parameters = slots
+        .into_iter()
+        .map(|type_id| savitar_types::Parameter {
+            type_id,
+            rest: false,
+            optional: false,
+        })
+        .collect();
+    Answer::Known(table.function(parameters, returns))
+}
+
+#[test]
+fn a_parameter_bound_by_an_object_pattern_reads_its_fields_from_the_whole_value() {
+    let source = "function pick({ handler }: Route): string {\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let signature = signature_taking(&mut table, vec![route], text);
+    let provider = ByName::new(source, vec![("pick", signature)]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.parameters().len(),
+        1,
+        "the pattern takes one incoming value, however many names it binds"
+    );
+    assert_eq!(function.type_of(function.parameters()[0]), route);
+    assert_eq!(read_fields_of(function), vec!["handler".to_string()]);
+    assert_eq!(function.type_of(returned_value(function)), text);
+}
+
+#[test]
+fn a_parameter_bound_by_an_array_pattern_reads_its_positions_from_the_whole_value() {
+    let source = "function pick([, second]: [number, string]): string {\n  return second;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let signature = signature_taking(&mut table, vec![pair], text);
+    let provider = ByName::new(source, vec![("pick", signature)]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert_eq!(function.type_of(returned_value(function)), text);
+}
+
+#[test]
+fn a_patterned_parameter_beside_a_named_one_keeps_both_in_the_order_declared() {
+    let source =
+        "function pick(count: number, { handler }: Route): string {\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let signature = signature_taking(&mut table, vec![number, route], text);
+    let provider = ByName::new(
+        source,
+        vec![("pick", signature), ("count", Answer::Known(number))],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 2);
+    assert_eq!(function.type_of(function.parameters()[0]), number);
+    assert_eq!(function.type_of(function.parameters()[1]), route);
+}
+
+#[test]
+fn a_parameter_bound_by_a_pattern_with_a_default_on_the_parameter_itself_is_refused() {
+    let source = "function pick({ handler }: Route = { handler: \"none\" }): string {\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let signature = signature_taking(&mut table, vec![route], text);
+    let provider = ByName::new(source, vec![("pick", signature)]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn a_parameter_bound_by_a_pattern_whose_field_the_shape_never_declares_is_refused() {
+    let source = "function pick({ missing }: Route): string {\n  return missing;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let signature = signature_taking(&mut table, vec![route], text);
+    let provider = ByName::new(source, vec![("pick", signature)]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn a_for_of_over_an_object_pattern_binds_the_fields_of_each_element() {
+    let source = "function total(routes: readonly Route[]): string {\n  let last = \"\";\n  for (const { handler } of routes) {\n    last = handler;\n  }\n  return last;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let routes = table.intern(TypeKind::ReadonlyArray(route));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("total", returning(&mut table, text)),
+            ("routes", Answer::Known(routes)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.type_of(returned_value(function)),
+        text,
+        "the name the loop writes keeps the type it was declared with"
+    );
+}
+
+#[test]
+fn a_for_of_over_an_array_pattern_binds_each_position_of_each_element() {
+    let source = "function total(pairs: readonly [string, number][]): number {\n  let sum = 0;\n  for (const [, millis] of pairs) {\n    sum = sum + millis;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![text, number], false);
+    let pairs = table.intern(TypeKind::ReadonlyArray(pair));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("total", returning(&mut table, number)),
+            ("pairs", Answer::Known(pairs)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_for_of_over_a_pattern_with_a_default_joins_inside_the_loop_body() {
+    let source = "function total(routes: readonly Route[]): number {\n  let sum = 0;\n  for (const { timeout = 30 } of routes) {\n    sum = sum + timeout;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let routes = table.intern(TypeKind::ReadonlyArray(route));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("total", returning(&mut table, number)),
+            ("routes", Answer::Known(routes)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_for_of_over_a_pattern_whose_field_the_element_never_declares_is_refused() {
+    let source = "function total(routes: readonly Route[]): string {\n  let last = \"\";\n  for (const { missing } of routes) {\n    last = missing;\n  }\n  return last;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let routes = table.intern(TypeKind::ReadonlyArray(route));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("total", returning(&mut table, text)),
+            ("routes", Answer::Known(routes)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}

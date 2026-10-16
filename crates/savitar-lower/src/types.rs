@@ -560,6 +560,25 @@ pub fn declared_return(table: &TypeTable, signature: TypeId) -> Result<TypeId, S
     }
 }
 
+pub fn declared_parameter(
+    table: &TypeTable,
+    signature: TypeId,
+    position: usize,
+) -> Result<TypeId, String> {
+    let TypeKind::Function { parameters, .. } = table.kind(signature) else {
+        return Err("the provider gives no signature for this function".to_string());
+    };
+    let Some(parameter) = parameters.get(position) else {
+        return Err("the signature declares no type for this parameter".to_string());
+    };
+    if parameter.optional || parameter.rest {
+        return Err(
+            "an optional or rest parameter bound by a pattern is not lowered yet".to_string(),
+        );
+    }
+    Ok(parameter.type_id)
+}
+
 #[must_use]
 pub fn contextual_fields(
     table: &TypeTable,

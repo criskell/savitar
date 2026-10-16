@@ -134,3 +134,33 @@ export function swapped(pair: [number, number]): [number, number] {
   [left, right] = pair;
   return [right, left];
 }
+
+export function routeOf({ method, path }: RequestLine): string {
+  return method + " " + path;
+}
+
+export function totalBytes(lines: readonly RequestLine[]): number {
+  let sum = 0;
+  for (const { bytes } of lines) {
+    sum = sum + bytes;
+  }
+  return sum;
+}
+
+export function totalTimeout(routes: readonly Route[]): number {
+  let sum = 0;
+  for (const { timeout = 30 } of routes) {
+    sum = sum + timeout;
+  }
+  return sum;
+}
+
+export function labelsOf(samples: readonly Sample[]): string {
+  let joined = "";
+  for (const { label, millis } of samples) {
+    if (millis > 100) {
+      joined = joined + label;
+    }
+  }
+  return joined;
+}

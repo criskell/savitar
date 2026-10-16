@@ -317,23 +317,34 @@ fn lower_function(
         declared
     };
 
-    for parameter in &declaration.params.items {
-        let BindingPattern::BindingIdentifier(id) = &parameter.pattern else {
+    let mut patterned = Vec::new();
+    for (position, parameter) in declaration.params.items.iter().enumerate() {
+        if let BindingPattern::BindingIdentifier(id) = &parameter.pattern {
+            let ty = context.type_at(table, id.span)?;
+            let value = function.declare_parameter(ty);
+            context.scope.insert(
+                id.name.to_string(),
+                Binding {
+                    value,
+                    declared: ty,
+                },
+            );
+            continue;
+        }
+        if parameter.initializer.is_some() {
             return Err(vec![refuse(
                 "unsupported-pattern",
                 parameter.span,
-                "a parameter that is not a plain name is not lowered yet",
+                "a default on a parameter bound by a pattern is not lowered yet",
             )]);
-        };
-        let ty = context.type_at(table, id.span)?;
+        }
+        let ty = types::declared_parameter(table, signature, position)
+            .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?;
         let value = function.declare_parameter(ty);
-        context.scope.insert(
-            id.name.to_string(),
-            Binding {
-                value,
-                declared: ty,
-            },
-        );
+        patterned.push((&parameter.pattern, value));
+    }
+    for (pattern, value) in patterned {
+        context.bind_pattern(table, &mut function, pattern, value)?;
     }
 
     let flow = context.lower_statements(table, &mut function, &body.statements)?;
@@ -1464,14 +1475,6 @@ impl Context<'_> {
                 "a `for of` must bind exactly one name",
             )]);
         };
-        let BindingPattern::BindingIdentifier(bound) = &declarator.id else {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                statement.span,
-                "a `for of` over a pattern is not lowered yet",
-            )]);
-        };
-
         let iterated = self.lower_expression(table, function, &statement.right)?;
         let element = match table.kind(function.type_of(iterated)).clone() {
             TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => element,
@@ -1552,13 +1555,7 @@ impl Context<'_> {
             statement.span,
         );
         let standing = self.standing_declarations();
-        self.declare(
-            bound.name.as_str(),
-            Binding {
-                value: current,
-                declared: element,
-            },
-        );
+        self.bind_pattern(table, function, &declarator.id, current)?;
 
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
         let repeats = jumped.repeats();
