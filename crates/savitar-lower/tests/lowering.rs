@@ -8130,3 +8130,56 @@ fn a_rest_over_a_union_is_refused_when_one_member_keeps_a_method() {
         report.diagnostics[0].message
     );
 }
+
+#[test]
+fn a_read_over_a_union_of_an_array_and_a_readonly_array_is_refused_because_neither_member_carries_a_shape()
+ {
+    let source = "function size(items: Items): number {\n  return items.length;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mutable = table.intern(TypeKind::Array(number));
+    let frozen = table.intern(TypeKind::ReadonlyArray(number));
+    let items = table.union(vec![mutable, frozen]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("items", Answer::Known(items)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("no declared shape"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_read_over_one_array_alone_still_reaches_the_provider_so_only_the_union_is_measured() {
+    let source = "function size(items: readonly number[]): number {\n  return items.length;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let frozen = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("items", Answer::Known(frozen)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
