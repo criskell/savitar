@@ -5720,3 +5720,156 @@ fn the_right_operand_of_nullish_coalescing_keeps_the_name_whole_because_it_runs_
         "only the branch that keeps the left value narrows, and it drops the missing members"
     );
 }
+
+fn fields_read(function: &savitar_ir::Function, wanted: &str) -> Vec<savitar_types::TypeId> {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::ReadField { name, .. },
+                ..
+            } if name == wanted => Some(function.type_of(*target)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_field_read_from_a_union_takes_the_union_of_that_field_in_every_member() {
+    let source =
+        "function use(holder: Small | Large): string | number {\n  return holder.amount;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let large = table.object(vec![named_field("amount", text, false)]);
+    let holder = table.union(vec![small, large]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, either)),
+            ("holder", Answer::Known(holder)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(fields_read(function, "amount"), vec![either]);
+}
+
+#[test]
+fn a_field_read_from_a_union_is_refused_when_one_member_declares_no_such_field() {
+    let source = "function use(holder: Small | Plain): number {\n  return holder.amount;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let plain = table.object(vec![named_field("label", text, false)]);
+    let holder = table.union(vec![small, plain]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("holder", Answer::Known(holder)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("no field `amount`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_field_that_one_member_of_a_union_marks_optional_is_read_carrying_undefined() {
+    let source =
+        "function use(holder: Small | Loose): number | undefined {\n  return holder.amount;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let loose = table.object(vec![named_field("amount", number, true)]);
+    let holder = table.union(vec![small, loose]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, maybe)),
+            ("holder", Answer::Known(holder)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(fields_read(function, "amount"), vec![maybe]);
+}
+
+#[test]
+fn a_field_read_from_a_union_ignores_a_narrower_answer_from_the_provider() {
+    let source = "function use(frame: Frame): string {\n  return frame.kind;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(tags.0)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        fields_read(function, "kind"),
+        vec![shapes.tags],
+        "the provider answered the tag of one member, and Savitar kept its own union"
+    );
+}
+
+#[test]
+fn a_field_read_from_a_union_that_holds_undefined_is_refused_rather_than_narrowed_by_the_provider()
+{
+    let source = "function use(frame: Frame | undefined): string {\n  return frame.kind;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let maybe = table.optional(shapes.union);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(maybe)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}

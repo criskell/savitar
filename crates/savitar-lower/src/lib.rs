@@ -402,6 +402,9 @@ impl Context<'_> {
             Ok(id) => return Ok(id),
             Err(reason) => reason,
         };
+        if types::is_union(table, object) {
+            return Err(vec![refuse("unsupported-read", member.span, shaped)]);
+        }
         match self.answer_at(table, member.property.span) {
             Answer::Known(id) => Ok(id),
             Answer::Unsupported(detail) => {

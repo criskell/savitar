@@ -142,3 +142,21 @@ export function replyReason(reply: Reply, fallback: string): string {
   }
   return failureText(reply);
 }
+
+export function replyStatus(reply: Reply): number {
+  return reply.status;
+}
+
+export type TextLog = { level: "info" | "warn"; line: string };
+
+export type ErrorLog = { level: "error"; line: string; code: number };
+
+export type LogEntry = TextLog | ErrorLog;
+
+export function logLevel(entry: LogEntry): string {
+  return entry.level;
+}
+
+export function logWidth(entry: LogEntry): number {
+  return textLength(entry.line);
+}

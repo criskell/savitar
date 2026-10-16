@@ -376,7 +376,21 @@ pub fn unary_result(table: &mut TypeTable, op: UnaryOp, operand: TypeId) -> Resu
     }
 }
 
+#[must_use]
+pub fn is_union(table: &TypeTable, id: TypeId) -> bool {
+    matches!(table.kind(id), TypeKind::Union(_))
+}
+
 pub fn field_result(table: &mut TypeTable, object: TypeId, name: &str) -> Result<TypeId, String> {
+    if let TypeKind::Union(members) = table.kind(object).clone() {
+        let mut held = Vec::with_capacity(members.len());
+        for member in members {
+            let one = field_result(table, member, name)
+                .map_err(|reason| format!("one member of this union answers nothing: {reason}"))?;
+            held.push(one);
+        }
+        return Ok(table.union(held));
+    }
     let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
         return Err(format!(
             "`{name}` is read from something with no declared shape"
