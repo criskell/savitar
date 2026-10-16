@@ -6126,3 +6126,31 @@ fn a_field_read_from_a_union_that_holds_undefined_is_refused_rather_than_narrowe
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-read");
 }
+
+#[test]
+fn a_discriminant_tested_over_a_member_path_narrows_nothing_because_no_name_holds_the_path() {
+    let source = "function use(holder: Holder): number {\n  if (holder.frame.kind === \"binary\") {\n    return holder.frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let holder = table.object(vec![named_field("frame", shapes.union, false)]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("holder", Answer::Known(holder)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("no field `size`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
