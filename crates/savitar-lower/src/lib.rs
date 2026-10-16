@@ -117,6 +117,7 @@ enum Fact {
     Nullish(TypeKind),
     Primitive(String),
     Truth,
+    Declares(String),
     Discriminant {
         field: String,
         literals: Vec<TypeKind>,
@@ -1557,20 +1558,21 @@ impl Context<'_> {
                     ..inner
                 })
             }
+            Expression::ParenthesizedExpression(inner) => self.tested_fact(&inner.expression),
             Expression::Identifier(_) => Some(Tested {
                 name: self.name_in_scope(test)?,
                 fact: Fact::Truth,
                 equal: true,
             }),
-            Expression::BinaryExpression(binary) => {
-                let equal = match binary.operator {
-                    BinaryOperator::StrictEquality => true,
-                    BinaryOperator::StrictInequality => false,
-                    _ => return None,
-                };
-                self.fact_between(&binary.left, &binary.right, equal)
-                    .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
-            }
+            Expression::BinaryExpression(binary) => match binary.operator {
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
+                    let equal = binary.operator == BinaryOperator::StrictEquality;
+                    self.fact_between(&binary.left, &binary.right, equal)
+                        .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+                }
+                BinaryOperator::In => self.fact_about_a_field(&binary.left, &binary.right),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -1608,6 +1610,21 @@ impl Context<'_> {
             });
         }
         None
+    }
+
+    fn fact_about_a_field(
+        &self,
+        named: &Expression<'_>,
+        holder: &Expression<'_>,
+    ) -> Option<Tested> {
+        let Expression::StringLiteral(field) = named else {
+            return None;
+        };
+        Some(Tested {
+            name: self.name_in_scope(holder)?,
+            fact: Fact::Declares(field.value.to_string()),
+            equal: true,
+        })
     }
 
     fn name_in_scope(&self, side: &Expression<'_>) -> Option<String> {
@@ -1685,6 +1702,13 @@ impl Context<'_> {
             Fact::Truth => asserted
                 .then(|| types::without_always_false(table, held))
                 .flatten(),
+            Fact::Declares(field) => {
+                if asserted {
+                    types::with_only_declaring(table, held, field)
+                } else {
+                    types::without_declaring(table, held, field)
+                }
+            }
         };
         let Some(narrowed) = narrowed else {
             return;
@@ -2938,6 +2962,7 @@ fn binary_op(operator: BinaryOperator) -> Option<BinaryOp> {
         BinaryOperator::GreaterEqualThan => BinaryOp::GreaterOrEqual,
         BinaryOperator::StrictEquality => BinaryOp::StrictEqual,
         BinaryOperator::StrictInequality => BinaryOp::StrictNotEqual,
+        BinaryOperator::In => BinaryOp::In,
         _ => return None,
     })
 }

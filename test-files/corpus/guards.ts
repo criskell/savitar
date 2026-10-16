@@ -110,3 +110,35 @@ export function modeOf(mode: Mode, fallback: "fast" | "safe"): "fast" | "safe" {
   }
   return fallback;
 }
+
+export type Ok = { status: number; body: JsonBody };
+
+export type Failure = { status: number; reason: string };
+
+export type Reply = Ok | Failure;
+
+export function okSize(reply: Ok): number {
+  return reply.body.size;
+}
+
+export function failureSize(reply: Failure): number {
+  return reply.reason.length;
+}
+
+export function failureText(reply: Failure): string {
+  return reply.reason;
+}
+
+export function replySize(reply: Reply): number {
+  if ("body" in reply) {
+    return okSize(reply);
+  }
+  return failureSize(reply);
+}
+
+export function replyReason(reply: Reply, fallback: string): string {
+  if (!("reason" in reply)) {
+    return fallback;
+  }
+  return failureText(reply);
+}

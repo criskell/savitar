@@ -157,6 +157,34 @@ pub fn without_literals(
 }
 
 #[must_use]
+pub fn with_only_declaring(table: &mut TypeTable, id: TypeId, field: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        declares_field(table, member, field) != Some(false)
+    })
+}
+
+#[must_use]
+pub fn without_declaring(table: &mut TypeTable, id: TypeId, field: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        declares_field(table, member, field) != Some(true)
+    })
+}
+
+fn declares_field(table: &TypeTable, member: TypeId, field: &str) -> Option<bool> {
+    let TypeKind::Object { fields, indexes } = table.kind(member) else {
+        return None;
+    };
+    if !indexes.is_empty() {
+        return None;
+    }
+    match fields.iter().find(|one| one.name == field) {
+        Some(found) if found.optional => None,
+        Some(_) => Some(true),
+        None => Some(false),
+    }
+}
+
+#[must_use]
 pub fn without_always_false(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
     keeping(table, id, |table, member| !is_always_false(table, member))
 }
@@ -296,6 +324,31 @@ pub fn binary_result(
             })
         }
         BinaryOp::StrictEqual | BinaryOp::StrictNotEqual => Ok(table.intern(TypeKind::Boolean)),
+        BinaryOp::In => {
+            if !is_textual(table, left) {
+                return Err("`in` takes the name of a field on the left".to_string());
+            }
+            if !holds_fields(table, right) {
+                return Err("`in` needs a value with fields on the right".to_string());
+            }
+            Ok(table.intern(TypeKind::Boolean))
+        }
+    }
+}
+
+fn holds_fields(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Object { .. }
+        | TypeKind::NonPrimitive
+        | TypeKind::Array(_)
+        | TypeKind::ReadonlyArray(_)
+        | TypeKind::Tuple { .. }
+        | TypeKind::Promise(_)
+        | TypeKind::Function { .. }
+        | TypeKind::Overloaded(_)
+        | TypeKind::Constructor(_) => true,
+        TypeKind::Union(members) => members.iter().all(|&member| holds_fields(table, member)),
+        _ => false,
     }
 }
 

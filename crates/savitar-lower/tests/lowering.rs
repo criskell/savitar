@@ -4970,6 +4970,180 @@ fn an_optional_discriminant_field_narrows_nothing_because_it_may_be_absent() {
 }
 
 #[test]
+fn an_in_test_keeps_only_the_members_that_declare_the_field() {
+    let source = "function use(frame: Frame): number {\n  if (\"size\" in frame) {\n    return count(frame);\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let counts = taking(&mut table, shapes.binary, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("count", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.binary),
+        "the branch that holds keeps the member that declares the field"
+    );
+}
+
+#[test]
+fn an_in_test_drops_the_members_that_declare_the_field_in_the_other_branch() {
+    let source = "function use(frame: Frame): string {\n  if (\"size\" in frame) {\n    return \"\";\n  }\n  return label(frame);\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let labels = taking(&mut table, shapes.text, text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(shapes.union)),
+            ("label", Answer::Known(labels)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&shapes.text),
+        "the branch that fails keeps what does not declare the field"
+    );
+}
+
+#[test]
+fn a_member_with_an_index_signature_stays_in_both_branches_of_an_in_test() {
+    let source = "function use(value: Holder): number {\n  if (\"size\" in value) {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let bag = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: false,
+        }],
+    );
+    let sized = table.object(vec![named_field("size", number, false)]);
+    let either = table.union(vec![bag, sized]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![bag],
+        "an index signature may answer any field, so it decides neither branch"
+    );
+}
+
+#[test]
+fn a_member_whose_field_is_optional_stays_in_both_branches_of_an_in_test() {
+    let source = "function use(value: Holder): number {\n  if (\"size\" in value) {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let maybe = table.object(vec![named_field("size", number, true)]);
+    let surely = table.object(vec![
+        named_field("size", number, false),
+        named_field("label", text, false),
+    ]);
+    let either = table.union(vec![maybe, surely]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![maybe],
+        "an optional field may be absent, so it decides neither branch"
+    );
+}
+
+#[test]
+fn a_negated_in_test_narrows_the_branch_where_the_field_is_declared() {
+    let source = "function use(frame: Frame): number {\n  if (!(\"size\" in frame)) {\n    return 0;\n  }\n  return count(frame);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let counts = taking(&mut table, shapes.binary, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("count", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&shapes.binary));
+}
+
+#[test]
+fn the_in_operator_is_refused_when_the_right_side_carries_no_field() {
+    let source = "function use(value: string): boolean {\n  return \"size\" in value;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let flag = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, flag)),
+            ("value", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("fields on the right"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
 fn the_truthy_branch_drops_undefined_null_false_zero_and_the_empty_string() {
     let source = "function use(value: Loose): number {\n  if (value) {\n    return 1;\n  }\n  return 0;\n}\n";
     let mut table = TypeTable::new();
