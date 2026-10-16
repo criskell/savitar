@@ -4631,10 +4631,100 @@ fn a_ternary_narrows_both_arms_by_typeof() {
 }
 
 #[test]
-fn typeof_object_is_left_wide_because_null_also_answers_object() {
-    let source = "function use(value: string | number): number {\n  if (typeof value === \"object\") {\n    return 0;\n  }\n  return value + 1;\n}\n";
+fn typeof_object_keeps_null_in_the_branch_that_holds_because_typeof_null_answers_object() {
+    let source = "function use(value: string | Shape | null): number {\n  if (typeof value === \"object\") {\n    return count(value);\n  }\n  return 0;\n}\n";
     let mut table = TypeTable::new();
-    let (number, either) = text_or_number(&mut table);
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Null);
+    let shape = table.object(vec![named_field("size", number, false)]);
+    let shape_or_null = table.union(vec![shape, nothing]);
+    let counts = taking(&mut table, shape_or_null, number);
+    let any_of_three = table.union(vec![text, shape, nothing]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(any_of_three)),
+            ("count", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&shape_or_null),
+        "the branch that holds keeps null next to the shape"
+    );
+}
+
+#[test]
+fn typeof_object_drops_null_in_the_branch_that_fails() {
+    let source = "function use(value: string | Shape | null): number {\n  if (typeof value === \"object\") {\n    return 0;\n  }\n  return width(value);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Null);
+    let shape = table.object(vec![named_field("size", number, false)]);
+    let widths = taking(&mut table, text, number);
+    let any_of_three = table.union(vec![text, shape, nothing]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(any_of_three)),
+            ("width", Answer::Known(widths)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&text),
+        "the branch that fails drops every member whose typeof answers object, null included"
+    );
+}
+
+#[test]
+fn typeof_function_narrows_to_the_member_that_declares_a_call() {
+    let source = "function use(value: string | Handler): number {\n  if (typeof value === \"function\") {\n    return run(value);\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let handler = table.function(Vec::new(), number);
+    let runs = taking(&mut table, handler, number);
+    let either = table.union(vec![text, handler]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("run", Answer::Known(runs)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&handler),
+        "the branch that holds keeps only the callable member"
+    );
+}
+
+#[test]
+fn the_void_type_is_never_decided_by_typeof_because_it_may_carry_anything() {
+    let source = "function use(value: string | void): number {\n  if (typeof value === \"object\") {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Void);
+    let either = table.union(vec![text, nothing]);
     let provider = ByName::new(
         source,
         vec![
@@ -4646,12 +4736,38 @@ fn typeof_object_is_left_wide_because_null_also_answers_object() {
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
-    assert!(
-        report.diagnostics[0].message.contains("two numbers"),
-        "{}",
-        report.diagnostics[0].message
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![nothing],
+        "void stays in the branch that holds and in the branch that fails"
+    );
+}
+
+#[test]
+fn the_object_keyword_is_never_decided_by_typeof_because_it_includes_function() {
+    let source = "function use(value: string | object): number {\n  if (typeof value === \"object\") {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let anything = table.intern(TypeKind::NonPrimitive);
+    let either = table.union(vec![text, anything]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        vec![anything],
+        "the object keyword stays in both branches, because a function is an object"
     );
 }
 

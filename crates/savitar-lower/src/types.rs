@@ -84,7 +84,7 @@ pub fn holds_member(table: &TypeTable, id: TypeId, wanted: &TypeKind) -> bool {
 pub fn narrowing_typeof_word(word: &str) -> bool {
     matches!(
         word,
-        "string" | "number" | "boolean" | "bigint" | "symbol" | "undefined"
+        "string" | "number" | "boolean" | "bigint" | "symbol" | "undefined" | "object" | "function"
     )
 }
 
