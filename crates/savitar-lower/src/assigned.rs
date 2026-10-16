@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
-use oxc_ast::ast::{AssignmentTarget, Expression, SimpleAssignmentTarget, Statement};
+use oxc_ast::ast::{
+    AssignmentTarget, Expression, ForStatementInit, SimpleAssignmentTarget, Statement,
+};
 
 #[must_use]
 pub fn assigned_names(statements: &[Statement<'_>]) -> BTreeSet<String> {
@@ -44,12 +46,31 @@ fn walk_statement(statement: &Statement<'_>, found: &mut BTreeSet<String>) {
             walk_statement(&statement.body, found);
         }
         Statement::ForStatement(statement) => {
+            match &statement.init {
+                Some(ForStatementInit::VariableDeclaration(declaration)) => {
+                    for declarator in &declaration.declarations {
+                        if let Some(init) = &declarator.init {
+                            walk_expression(init, found);
+                        }
+                    }
+                }
+                Some(init) => {
+                    if let Some(expression) = init.as_expression() {
+                        walk_expression(expression, found);
+                    }
+                }
+                None => {}
+            }
             if let Some(test) = &statement.test {
                 walk_expression(test, found);
             }
             if let Some(update) = &statement.update {
                 walk_expression(update, found);
             }
+            walk_statement(&statement.body, found);
+        }
+        Statement::ForOfStatement(statement) => {
+            walk_expression(&statement.right, found);
             walk_statement(&statement.body, found);
         }
         Statement::SwitchStatement(statement) => {

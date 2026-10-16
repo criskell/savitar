@@ -4852,3 +4852,45 @@ fn an_optional_discriminant_field_narrows_nothing_because_it_may_be_absent() {
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-read");
 }
+
+#[test]
+fn a_name_assigned_inside_a_nested_for_of_is_carried_by_the_outer_loop() {
+    let source = "function total(rows: number[], limit: number): number {\n  let sum = 0;\n  while (sum < limit) {\n    for (const row of rows) {\n      sum = sum + row;\n    }\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let rows = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("rows", Answer::Known(rows)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("total.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_name_assigned_in_the_initialiser_of_a_nested_for_is_carried_by_the_outer_loop() {
+    let source = "function scan(limit: number, step: number, start: number): number {\n  let index = 0;\n  let counter = 0;\n  while (index < limit) {\n    for (index = start; counter < limit; counter = counter + step) {\n      counter = counter + step;\n    }\n  }\n  return index;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("step", Answer::Known(number)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("scan.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
