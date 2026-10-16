@@ -4958,3 +4958,38 @@ fn a_name_declared_wider_than_its_value_takes_a_write_of_either_member() {
         "the write took the type the name holds, not the type it carried"
     );
 }
+
+#[test]
+fn a_name_a_block_shadows_goes_back_to_the_outer_value_after_the_block() {
+    let source = "function shade(start: number, limit: number): number {\n  let value = start;\n  {\n    let value = limit;\n    value = value + 1;\n  }\n  return value;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("shade", returning(&mut table, number)),
+            ("start", Answer::Known(number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("shade.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let entry = function.entry().expect("the function should have a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!(
+            "expected a return, got {:?}",
+            function.block(entry).terminator
+        );
+    };
+    assert_eq!(
+        returned,
+        function.parameters()[0],
+        "the block stepped its own `value`, and the outer one never moved"
+    );
+}

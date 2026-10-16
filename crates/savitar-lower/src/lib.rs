@@ -141,6 +141,7 @@ struct Context<'a> {
     enclosing: Vec<Breakable>,
     breaks: Vec<(BlockId, Scope)>,
     continues: Vec<(BlockId, Scope)>,
+    shadowed: Vec<(String, Option<Binding>)>,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -240,6 +241,7 @@ fn lower_function(
         enclosing: Vec::new(),
         breaks: Vec::new(),
         continues: Vec::new(),
+        shadowed: Vec::new(),
     };
 
     let signature = context.type_at(table, id.span)?;
@@ -435,9 +437,9 @@ impl Context<'_> {
                 Ok(Flow::Returned)
             }
             AstStatement::BlockStatement(block) => {
-                let outer: Vec<String> = self.scope.keys().cloned().collect();
+                let standing = self.standing_declarations();
                 let flow = self.lower_statements(table, function, &block.body)?;
-                self.scope.retain(|name, _| outer.contains(name));
+                self.leave_declarations(standing);
                 Ok(flow)
             }
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
@@ -1305,8 +1307,9 @@ impl Context<'_> {
             },
             statement.span,
         );
-        self.scope.insert(
-            bound.name.to_string(),
+        let standing = self.standing_declarations();
+        self.declare(
+            bound.name.as_str(),
             Binding {
                 value: current,
                 declared: element,
@@ -1361,14 +1364,16 @@ impl Context<'_> {
             );
         }
 
-        Ok(self.close_loop(
+        let flow = self.close_loop(
             table,
             function,
             &looping,
             Some(leaving),
             jumped.breaks,
             statement.span,
-        ))
+        );
+        self.leave_declarations(standing);
+        Ok(flow)
     }
 
     fn lower_do_while(
@@ -1479,7 +1484,7 @@ impl Context<'_> {
             )]);
         };
 
-        let around: Vec<String> = self.scope.keys().cloned().collect();
+        let standing = self.standing_declarations();
         self.lower_for_init(table, function, statement)?;
 
         let mut stepping = vec![test];
@@ -1556,7 +1561,7 @@ impl Context<'_> {
             jumped.breaks,
             statement.span,
         );
-        self.scope.retain(|name, _| around.contains(name));
+        self.leave_declarations(standing);
         Ok(flow)
     }
 
@@ -2034,7 +2039,9 @@ impl Context<'_> {
             self.current = bodies[position];
             self.statements.clear();
             self.scope = before.clone();
+            let standing = self.standing_declarations();
             let flow = self.lower_statements(table, function, &case.consequent)?;
+            self.leave_declarations(standing);
             if !flow.continues() {
                 continue;
             }
@@ -2195,6 +2202,24 @@ impl Context<'_> {
                 format!("`{name}` is not bound in this function"),
             )]
         })
+    }
+
+    fn declare(&mut self, name: &str, binding: Binding) {
+        let outer = self.scope.insert(name.to_string(), binding);
+        self.shadowed.push((name.to_string(), outer));
+    }
+
+    fn standing_declarations(&self) -> usize {
+        self.shadowed.len()
+    }
+
+    fn leave_declarations(&mut self, standing: usize) {
+        for (name, outer) in self.shadowed.split_off(standing).into_iter().rev() {
+            match outer {
+                Some(binding) => self.scope.insert(name, binding),
+                None => self.scope.remove(&name),
+            };
+        }
     }
 
     fn combine(
@@ -2511,8 +2536,8 @@ impl Context<'_> {
             None if widening => self.widened(table, function, value, declarator.span),
             None => value,
         };
-        self.scope.insert(
-            id.name.to_string(),
+        self.declare(
+            id.name.as_str(),
             Binding {
                 value,
                 declared: function.type_of(value),
@@ -2559,8 +2584,8 @@ impl Context<'_> {
         for (position, id) in names.iter().enumerate() {
             let index = self.index_constant(table, function, position, id.span);
             let value = self.read_element_at(table, function, source, index, id.span)?;
-            self.scope.insert(
-                id.name.to_string(),
+            self.declare(
+                id.name.as_str(),
                 Binding {
                     value,
                     declared: function.type_of(value),
@@ -2588,8 +2613,8 @@ impl Context<'_> {
                 },
                 id.span,
             );
-            self.scope.insert(
-                id.name.to_string(),
+            self.declare(
+                id.name.as_str(),
                 Binding {
                     value,
                     declared: ty,
