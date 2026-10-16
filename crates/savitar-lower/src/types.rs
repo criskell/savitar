@@ -55,6 +55,35 @@ pub fn without_nullish(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
 }
 
 #[must_use]
+pub fn may_be_undefined(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Never
+        | TypeKind::Null
+        | TypeKind::Boolean
+        | TypeKind::Number
+        | TypeKind::BigInt
+        | TypeKind::String
+        | TypeKind::Symbol
+        | TypeKind::NonPrimitive
+        | TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_)
+        | TypeKind::Array(_)
+        | TypeKind::ReadonlyArray(_)
+        | TypeKind::Promise(_)
+        | TypeKind::Tuple { .. }
+        | TypeKind::Object { .. }
+        | TypeKind::Function { .. }
+        | TypeKind::Overloaded(_)
+        | TypeKind::Constructor(_) => false,
+        TypeKind::Union(members) => members
+            .iter()
+            .any(|&member| may_be_undefined(table, member)),
+        _ => true,
+    }
+}
+
+#[must_use]
 pub fn without_member(table: &mut TypeTable, id: TypeId, dropped: &TypeKind) -> Option<TypeId> {
     if table.kind(id) == dropped {
         return None;

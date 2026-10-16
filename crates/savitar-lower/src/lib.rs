@@ -2941,13 +2941,13 @@ impl Context<'_> {
         span: oxc_span::Span,
     ) -> Result<ValueId, Vec<Diagnostic>> {
         let held = function.type_of(read);
+        if !types::may_be_undefined(table, held) {
+            return Ok(read);
+        }
         let Some(kept) = types::without_member(table, held, &TypeKind::Undefined) else {
             let given = self.lower_expression(table, function, fallback)?;
             return Ok(self.widened(table, function, given, span));
         };
-        if kept == held {
-            return Ok(read);
-        }
 
         let missing = self.tests_undefined(table, function, read, span);
         let fallback_entry = function.add_block(empty_block());

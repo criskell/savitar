@@ -6899,3 +6899,106 @@ fn a_for_of_over_a_pattern_whose_field_the_element_never_declares_is_refused() {
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
 }
+
+#[test]
+fn a_default_over_a_read_typed_unknown_still_tests_undefined_because_unknown_admits_it() {
+    let source = "function pull(envelope: Envelope): unknown {\n  const { payload = 0 } = envelope;\n  return payload;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let envelope = table.object(vec![Field {
+        name: "payload".to_string(),
+        type_id: unknown,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pull", returning(&mut table, unknown)),
+            ("envelope", Answer::Known(envelope)),
+        ],
+    );
+    let file = SourceFile::new("pull.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        tests_undefined(function),
+        "unknown carries undefined, so the default has to be reached by a test"
+    );
+}
+
+#[test]
+fn a_default_over_a_read_typed_by_a_type_parameter_still_tests_undefined() {
+    let source = "function pull(envelope: Envelope): unknown {\n  const { payload = 0 } = envelope;\n  return payload;\n}\n";
+    let mut table = TypeTable::new();
+    let unknown = table.intern(TypeKind::Unknown);
+    let held = table.fresh_type_parameter();
+    let envelope = table.object(vec![Field {
+        name: "payload".to_string(),
+        type_id: held,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pull", returning(&mut table, unknown)),
+            ("envelope", Answer::Known(envelope)),
+        ],
+    );
+    let file = SourceFile::new("pull.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        tests_undefined(function),
+        "nothing says a type parameter excludes undefined, so the test stays"
+    );
+}
+
+#[test]
+fn an_object_pattern_over_a_union_is_refused_rather_than_read_from_one_member() {
+    let source =
+        "function pick(event: Event): string {\n  const { kind } = event;\n  return kind;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let started = table.intern(TypeKind::StringLiteral("started".to_string()));
+    let stopped = table.intern(TypeKind::StringLiteral("stopped".to_string()));
+    let first = table.object(vec![Field {
+        name: "kind".to_string(),
+        type_id: started,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let second = table.object(vec![Field {
+        name: "kind".to_string(),
+        type_id: stopped,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let event = table.union(vec![first, second]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("event", Answer::Known(event)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
