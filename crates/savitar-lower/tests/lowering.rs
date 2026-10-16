@@ -206,7 +206,7 @@ fn an_unbound_name_is_refused_rather_than_invented() {
 
 #[test]
 fn an_unsupported_statement_names_itself_instead_of_being_skipped() {
-    let source = "function loops(limit: number): number {\n  do {\n    return limit;\n  } while (true);\n}\n";
+    let source = "function loops(limit: number): number {\n  throw limit;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
     let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
@@ -3686,6 +3686,21 @@ fn blocks_jumping_to(function: &savitar_ir::Function, wanted: savitar_ir::BlockI
         .collect()
 }
 
+fn operators_in(function: &savitar_ir::Function, block: savitar_ir::BlockId) -> Vec<BinaryOp> {
+    function
+        .block(block)
+        .statements
+        .iter()
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                value: Rvalue::Binary { op, .. },
+                ..
+            } => Some(*op),
+            _ => None,
+        })
+        .collect()
+}
+
 fn parameterised(function: &savitar_ir::Function) -> Vec<(savitar_ir::BlockId, usize)> {
     function
         .blocks()
@@ -3821,6 +3836,105 @@ fn a_break_inside_a_switch_inside_a_loop_leaves_only_the_switch() {
         vec![1, 1],
         "the `break` ends the `switch`, so the loop still comes back"
     );
+}
+
+#[test]
+fn a_do_while_runs_its_body_before_the_test() {
+    let source = "function backoff(limit: number): number {\n  let waited = 1;\n  do {\n    waited = waited * 2;\n  } while (waited < limit);\n  return waited;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("backoff.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(carrying.len(), 2, "the body and the test each carry `waited`");
+    let (header, _) = carrying[0];
+    let (latch, _) = carrying[1];
+    assert!(
+        operators_in(function, header).contains(&BinaryOp::Multiply),
+        "the body is the block the loop is entered through"
+    );
+    assert!(
+        operators_in(function, latch).contains(&BinaryOp::Less),
+        "the test is the block the body falls into"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, latch),
+        vec![1],
+        "only the end of the body reaches the test"
+    );
+    let Terminator::Branch {
+        then_block,
+        then_arguments,
+        ..
+    } = &function.block(latch).terminator
+    else {
+        panic!("the test should branch, got {:?}", function.block(latch).terminator);
+    };
+    assert_eq!(*then_block, header, "the test decides on another iteration");
+    assert_eq!(then_arguments.len(), 1, "and carries `waited` back");
+}
+
+#[test]
+fn a_continue_in_a_do_while_still_runs_the_test() {
+    let source = "function tally(limit: number, flag: boolean): number {\n  let seen = 0;\n  do {\n    seen = seen + 1;\n    if (flag) {\n      continue;\n    }\n    seen = seen + 1;\n  } while (seen < limit);\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("tally.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let (latch, _) = parameterised(function)[1];
+    assert_eq!(
+        blocks_jumping_to(function, latch),
+        vec![1, 1],
+        "the `continue` and the end of the body both reach the test"
+    );
+}
+
+#[test]
+fn a_do_while_whose_body_returns_leaves_its_test_stranded() {
+    let source = "function once(limit: number): number {\n  do {\n    return limit;\n  } while (true);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("once.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        returns_without_a_value(function),
+        0,
+        "nothing leaves the loop, so no path falls off the end"
+    );
+
+    let dominance = savitar_ir::Dominance::of(function);
+    let stranded = function
+        .blocks()
+        .filter(|(id, _)| !dominance.reachable(*id))
+        .count();
+    assert_eq!(stranded, 2, "the test and the exit are both left stranded");
 }
 
 #[test]

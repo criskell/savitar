@@ -419,6 +419,9 @@ impl Context<'_> {
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
             AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
             AstStatement::ForStatement(statement) => self.lower_for(table, function, statement),
+            AstStatement::DoWhileStatement(statement) => {
+                self.lower_do_while(table, function, statement)
+            }
             AstStatement::ForOfStatement(statement) => {
                 self.lower_for_of(table, function, statement)
             }
@@ -1080,15 +1083,20 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         looping: &Looping,
-        leaving: (BlockId, Scope),
+        leaving: Option<(BlockId, Scope)>,
         breaks: Vec<(BlockId, Scope)>,
         span: oxc_span::Span,
-    ) {
-        let mut edges = vec![leaving];
+    ) -> Flow {
+        let mut edges: Vec<(BlockId, Scope)> = leaving.into_iter().collect();
         edges.extend(breaks);
+        if edges.is_empty() {
+            self.scope = looping.at_header.clone();
+            return Flow::Returned;
+        }
         self.scope = self.joined(table, function, looping.exit, &looping.at_header, &edges, span);
         self.current = looping.exit;
         self.statements.clear();
+        Flow::Continues
     }
 
     fn lower_for_of(
@@ -1241,15 +1249,66 @@ impl Context<'_> {
             );
         }
 
-        self.close_loop(
+        Ok(self.close_loop(
+            table,
+            function,
+            &looping,
+            Some(leaving),
+            jumped.breaks,
+            statement.span,
+        ))
+    }
+
+    fn lower_do_while(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::DoWhileStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let carried = self.carried_names(&statement.body, &[&statement.test]);
+        let looping = self.open_loop(function, carried, &[], Repeating::ThroughLatch);
+
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let repeats = jumped.repeats();
+        self.repeat_edges(
+            function,
+            &looping,
+            jumped.flow,
+            jumped.continues,
+            statement.span,
+        )?;
+
+        let mut leaving = None;
+        if repeats {
+            self.stand_at_latch(&looping);
+            let condition = self.lower_expression(table, function, &statement.test)?;
+            every_change_is_carried(&looping, &self.scope, statement.span)?;
+            let mut back = Vec::with_capacity(looping.carried.len());
+            for name in &looping.carried {
+                back.push(self.scope[name]);
+            }
+            let block = function.add_block(empty_block());
+            self.seal(
+                function,
+                Terminator::Branch {
+                    condition,
+                    then_block: looping.header,
+                    then_arguments: back,
+                    else_block: block,
+                    else_arguments: Vec::new(),
+                },
+            );
+            leaving = Some(self.leaving_edge(function, &looping, block));
+        }
+
+        Ok(self.close_loop(
             table,
             function,
             &looping,
             leaving,
             jumped.breaks,
             statement.span,
-        );
-        Ok(Flow::Continues)
+        ))
     }
 
     fn lower_for_init(
@@ -1349,16 +1408,16 @@ impl Context<'_> {
             );
         }
 
-        self.close_loop(
+        let flow = self.close_loop(
             table,
             function,
             &looping,
-            leaving,
+            Some(leaving),
             jumped.breaks,
             statement.span,
         );
         self.scope.retain(|name, _| around.contains(name));
-        Ok(Flow::Continues)
+        Ok(flow)
     }
 
     fn lower_while(
@@ -1395,15 +1454,14 @@ impl Context<'_> {
             jumped.continues,
             statement.span,
         )?;
-        self.close_loop(
+        Ok(self.close_loop(
             table,
             function,
             &looping,
-            leaving,
+            Some(leaving),
             jumped.breaks,
             statement.span,
-        );
-        Ok(Flow::Continues)
+        ))
     }
 
     fn tested_for_nullish(&self, test: &Expression<'_>) -> Option<(String, TypeKind, bool)> {
