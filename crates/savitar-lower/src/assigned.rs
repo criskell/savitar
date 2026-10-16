@@ -11,6 +11,13 @@ pub fn assigned_names(statements: &[Statement<'_>]) -> BTreeSet<String> {
     found
 }
 
+#[must_use]
+pub fn assigned_names_in(expression: &Expression<'_>) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    walk_expression(expression, &mut found);
+    found
+}
+
 fn walk_statement(statement: &Statement<'_>, found: &mut BTreeSet<String>) {
     match statement {
         Statement::ExpressionStatement(statement) => {
