@@ -664,7 +664,7 @@ impl Context<'_> {
                 format!("Savitar cannot show this value fits the type `{name}` holds"),
             )]);
         }
-        Ok(self.coerced(function, table, value, declared, span))
+        Ok(value)
     }
 
     fn lower_field_write(

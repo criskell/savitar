@@ -54,6 +54,30 @@ export function retry(ceiling: number, attempts: number): Attempt {
   return { tries: tries, waited: waited };
 }
 
+export function hostOrFallback(
+  given: string | undefined,
+  fallback: string,
+): number {
+  let host: string | undefined = given;
+  if (host === undefined) {
+    host = fallback;
+  }
+  return host.length;
+}
+
+export function longestToken(sessions: readonly Session[], user: string): number {
+  let found: string | undefined = undefined;
+  for (const session of sessions) {
+    if (session.user === user) {
+      found = session.token;
+    }
+  }
+  if (found === undefined) {
+    return 0;
+  }
+  return found.length;
+}
+
 export function tokenOf(
   sessions: readonly Session[],
   user: string,

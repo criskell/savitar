@@ -5568,7 +5568,118 @@ fn a_name_declared_wider_than_its_value_takes_a_write_of_either_member() {
     assert_eq!(
         function.type_of(merged),
         either,
-        "the write took the type the name holds, not the type it carried"
+        "the join unites the type the write left with the type the other arm carried"
+    );
+}
+
+#[test]
+fn a_write_leaves_the_name_holding_the_type_the_value_carried() {
+    let source = "function pin(given: string | undefined): string {\n  let host: string | undefined = given;\n  host = \"localhost\";\n  return host;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let maybe = table.optional(text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pin", returning(&mut table, text)),
+            ("given", Answer::Known(maybe)),
+            ("host", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("pin.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let entry = function.entry().expect("the function should have a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!(
+            "expected a return, got {:?}",
+            function.block(entry).terminator
+        );
+    };
+    assert_eq!(
+        table.kind(function.type_of(returned)),
+        &TypeKind::String,
+        "the name no longer carries the missing member the declared type admits"
+    );
+}
+
+#[test]
+fn a_name_narrowed_by_a_write_still_takes_a_write_of_another_member() {
+    let source = "function swap(left: number, right: string): string {\n  let held: number | string = left;\n  held = right;\n  held = right;\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("swap", returning(&mut table, text)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(text)),
+            ("held", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("swap.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_write_the_declared_type_does_not_admit_is_refused_even_after_a_narrowing_write() {
+    let source = "function slip(flag: boolean, right: string): string {\n  let held: string | undefined = right;\n  held = right;\n  held = flag;\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let boolean = table.intern(TypeKind::Boolean);
+    let maybe = table.optional(text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("slip", returning(&mut table, text)),
+            ("flag", Answer::Known(boolean)),
+            ("right", Answer::Known(text)),
+            ("held", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("slip.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn a_narrow_write_in_a_loop_body_still_fits_the_header_parameter_the_declared_type_sized() {
+    let source = "function latest(values: readonly string[]): string | undefined {\n  let seen: string | undefined = undefined;\n  for (const value of values) {\n    seen = value;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let maybe = table.optional(text);
+    let values = table.intern(TypeKind::ReadonlyArray(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("latest", returning(&mut table, maybe)),
+            ("values", Answer::Known(values)),
+            ("seen", Answer::Known(maybe)),
+        ],
+    );
+    let file = SourceFile::new("latest.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(
+        verify(function),
+        vec![],
+        "the header parameter keeps the declared type, and the narrow write widens on the edge"
     );
 }
 
