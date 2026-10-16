@@ -480,6 +480,36 @@ pub enum SlotRefusal {
     Declined(String),
 }
 
+pub fn field_slots(
+    table: &mut TypeTable,
+    object: TypeId,
+    name: &str,
+) -> Result<Vec<TypeId>, SlotRefusal> {
+    let TypeKind::Union(members) = table.kind(object).clone() else {
+        return field_slot(table, object, name).map(|slot| vec![slot]);
+    };
+    let mut slots: Vec<TypeId> = Vec::with_capacity(members.len());
+    for member in members {
+        for slot in field_slots(table, member, name).map_err(|refusal| in_a_member(&refusal))? {
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+fn in_a_member(refusal: &SlotRefusal) -> SlotRefusal {
+    match refusal {
+        SlotRefusal::Shapeless(reason) => {
+            SlotRefusal::Shapeless(format!("one member of this union takes no write: {reason}"))
+        }
+        SlotRefusal::Declined(reason) => {
+            SlotRefusal::Declined(format!("one member of this union takes no write: {reason}"))
+        }
+    }
+}
+
 pub fn field_slot(
     table: &mut TypeTable,
     object: TypeId,

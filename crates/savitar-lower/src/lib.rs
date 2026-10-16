@@ -894,10 +894,14 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let object = self.lower_expression(table, function, &member.object)?;
         let name = member.property.name.to_string();
-        let slot = self.field_slot(table, function.type_of(object), &name, member)?;
+        let slots = self.field_slots(table, function.type_of(object), &name, member)?;
+        let agreed = match slots.as_slice() {
+            [slot] => Some(*slot),
+            _ => None,
+        };
         let value = match written {
             Written::Value(expression) => {
-                self.lower_expression_expecting(table, function, expression, Some(slot))?
+                self.lower_expression_expecting(table, function, expression, agreed)?
             }
             Written::Combined(op, expression) => {
                 let held = self.read_field(table, function, object, &name, member)?;
@@ -910,7 +914,7 @@ impl Context<'_> {
                 self.combine(table, function, op, held, one, span)?
             }
         };
-        let value = self.fitted(table, function, value, slot, span)?;
+        let value = self.fitted_in_every(table, function, value, &slots, span)?;
         self.statements.push(Statement::WriteField {
             object,
             name,
@@ -957,27 +961,53 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn field_slot(
+    fn field_slots(
         &self,
         table: &mut TypeTable,
         object: TypeId,
         name: &str,
         member: &oxc_ast::ast::StaticMemberExpression<'_>,
-    ) -> Result<TypeId, Vec<Diagnostic>> {
-        let shapeless = match types::field_slot(table, object, name) {
-            Ok(slot) => return Ok(slot),
+    ) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
+        let shapeless = match types::field_slots(table, object, name) {
+            Ok(slots) => return Ok(slots),
             Err(types::SlotRefusal::Declined(reason)) => {
                 return Err(vec![refuse("unsupported-write", member.span, reason)]);
             }
             Err(types::SlotRefusal::Shapeless(reason)) => reason,
         };
+        if types::is_union(table, object) {
+            return Err(vec![refuse("unsupported-write", member.span, shapeless)]);
+        }
         match self.answer_at(table, member.property.span) {
-            Answer::Known(id) => Ok(id),
+            Answer::Known(id) => Ok(vec![id]),
             Answer::Unsupported(detail) => {
                 Err(vec![refuse("unsupported-type", member.span, detail)])
             }
             Answer::OutOfScope => Err(vec![refuse("unsupported-write", member.span, shapeless)]),
         }
+    }
+
+    fn fitted_in_every(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        slots: &[TypeId],
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        if let [slot] = slots {
+            return self.fitted(table, function, value, *slot, span);
+        }
+        for &slot in slots {
+            if !savitar_types::assignable(table, function.type_of(value), slot) {
+                return Err(vec![refuse(
+                    "unsupported-assignment",
+                    span,
+                    "Savitar cannot show this value fits the field in every member of this union",
+                )]);
+            }
+        }
+        Ok(value)
     }
 
     fn read_field(
