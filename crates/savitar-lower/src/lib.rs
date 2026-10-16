@@ -33,8 +33,34 @@ pub struct LowerReport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Binding {
-    value: ValueId,
+    value: Option<ValueId>,
     declared: TypeId,
+}
+
+impl Binding {
+    const fn written(value: ValueId, declared: TypeId) -> Self {
+        Self {
+            value: Some(value),
+            declared,
+        }
+    }
+
+    const fn awaiting_a_write(declared: TypeId) -> Self {
+        Self {
+            value: None,
+            declared,
+        }
+    }
+
+    fn value_or_refuse(self, name: &str, span: oxc_span::Span) -> Result<ValueId, Vec<Diagnostic>> {
+        self.value.ok_or_else(|| {
+            vec![refuse(
+                "unsupported-read",
+                span,
+                format!("`{name}` is read on a path where it was declared and never written"),
+            )]
+        })
+    }
 }
 
 type Scope = HashMap<String, Binding>;
@@ -91,6 +117,12 @@ impl Jumped {
     fn repeats(&self) -> bool {
         self.flow.continues() || !self.continues.is_empty()
     }
+}
+
+fn carried_value(binding: Binding) -> ValueId {
+    binding
+        .value
+        .expect("a carried name holds a value on every edge back")
 }
 
 fn every_change_is_carried(
@@ -327,13 +359,9 @@ fn lower_function(
         };
         let ty = context.type_at(table, id.span)?;
         let value = function.declare_parameter(ty);
-        context.scope.insert(
-            id.name.to_string(),
-            Binding {
-                value,
-                declared: ty,
-            },
-        );
+        context
+            .scope
+            .insert(id.name.to_string(), Binding::written(value, ty));
     }
 
     let flow = context.lower_statements(table, &mut function, &body.statements)?;
@@ -622,12 +650,14 @@ impl Context<'_> {
                 self.lower_expression_expecting(table, function, expression, Some(held.declared))?
             }
             Written::Combined(op, expression) => {
+                let standing = held.value_or_refuse(id.name.as_str(), id.span)?;
                 let value = self.lower_expression(table, function, expression)?;
-                self.combine(table, function, op, held.value, value, span)?
+                self.combine(table, function, op, standing, value, span)?
             }
             Written::Stepped(op) => {
+                let standing = held.value_or_refuse(id.name.as_str(), id.span)?;
                 let one = self.literal_one(table, function, span);
-                self.combine(table, function, op, held.value, one, span)?
+                self.combine(table, function, op, standing, one, span)?
             }
         };
         let stored = self.kept(
@@ -638,13 +668,8 @@ impl Context<'_> {
             id.name.as_str(),
             span,
         )?;
-        self.scope.insert(
-            id.name.to_string(),
-            Binding {
-                value: stored,
-                declared: held.declared,
-            },
-        );
+        self.scope
+            .insert(id.name.to_string(), Binding::written(stored, held.declared));
         Ok(())
     }
 
@@ -1043,15 +1068,33 @@ impl Context<'_> {
         )
     }
 
-    fn carried_names(&self, body: &AstStatement<'_>, stepping: &[&Expression<'_>]) -> Vec<String> {
+    fn carried_names(
+        &self,
+        body: &AstStatement<'_>,
+        stepping: &[&Expression<'_>],
+        span: oxc_span::Span,
+    ) -> Result<Vec<String>, Vec<Diagnostic>> {
         let mut found = assigned::assigned_names(std::slice::from_ref(body));
         for expression in stepping {
             found.extend(assigned::assigned_names_in(expression));
         }
-        found
-            .into_iter()
-            .filter(|name| self.scope.contains_key(name))
-            .collect()
+        let mut carried = Vec::new();
+        for name in found {
+            let Some(binding) = self.scope.get(&name) else {
+                continue;
+            };
+            if binding.value.is_none() {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    span,
+                    format!(
+                        "`{name}` is written in this loop and was never written before it, so the header has no value to carry in"
+                    ),
+                )]);
+            }
+            carried.push(name);
+        }
+        Ok(carried)
     }
 
     fn open_loop(
@@ -1072,8 +1115,11 @@ impl Context<'_> {
         }
         for name in &carried {
             let incoming = self.scope[name];
+            let entering = incoming
+                .value
+                .expect("a carried name was proved written before the loop");
             parameters.push(function.fresh_value(incoming.declared));
-            arguments.push(self.coerced(function, table, incoming.value, incoming.declared, span));
+            arguments.push(self.coerced(function, table, entering, incoming.declared, span));
         }
         function.block_mut(header).parameters = parameters.clone();
 
@@ -1105,13 +1151,8 @@ impl Context<'_> {
         self.statements.clear();
         for (name, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
             let declared = self.scope[name].declared;
-            self.scope.insert(
-                name.clone(),
-                Binding {
-                    value: *parameter,
-                    declared,
-                },
-            );
+            self.scope
+                .insert(name.clone(), Binding::written(*parameter, declared));
         }
         Looping {
             header,
@@ -1195,13 +1236,8 @@ impl Context<'_> {
             let mut arguments = looping.leading.clone();
             for name in &looping.carried {
                 let binding = scope[name];
-                arguments.push(self.appended(
-                    function,
-                    *site,
-                    binding.value,
-                    binding.declared,
-                    span,
-                ));
+                let leaving = carried_value(binding);
+                arguments.push(self.appended(function, *site, leaving, binding.declared, span));
             }
             function.block_mut(*site).terminator = Terminator::Jump {
                 target: looping.repeat,
@@ -1221,13 +1257,8 @@ impl Context<'_> {
             .zip(looping.landing.iter().skip(looping.leading.len()))
         {
             let declared = looping.at_header[name].declared;
-            self.scope.insert(
-                name.clone(),
-                Binding {
-                    value: *parameter,
-                    declared,
-                },
-            );
+            self.scope
+                .insert(name.clone(), Binding::written(*parameter, declared));
         }
     }
 
@@ -1316,7 +1347,7 @@ impl Context<'_> {
         );
         let start = self.assign(function, number, Rvalue::Widen(zero), statement.span);
 
-        let carried = self.carried_names(&statement.body, &[]);
+        let carried = self.carried_names(&statement.body, &[], statement.span)?;
         let looping = self.open_loop(
             table,
             function,
@@ -1374,13 +1405,7 @@ impl Context<'_> {
             statement.span,
         );
         let standing = self.standing_declarations();
-        self.declare(
-            bound.name.as_str(),
-            Binding {
-                value: current,
-                declared: element,
-            },
-        );
+        self.declare(bound.name.as_str(), Binding::written(current, element));
 
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
         let repeats = jumped.repeats();
@@ -1416,7 +1441,7 @@ impl Context<'_> {
                 back.push(self.coerced(
                     function,
                     table,
-                    binding.value,
+                    carried_value(binding),
                     binding.declared,
                     statement.span,
                 ));
@@ -1448,7 +1473,7 @@ impl Context<'_> {
         function: &mut Function,
         statement: &oxc_ast::ast::DoWhileStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        let carried = self.carried_names(&statement.body, &[&statement.test]);
+        let carried = self.carried_names(&statement.body, &[&statement.test], statement.span)?;
         let looping = self.open_loop(
             table,
             function,
@@ -1479,7 +1504,7 @@ impl Context<'_> {
                 back.push(self.coerced(
                     function,
                     table,
-                    binding.value,
+                    carried_value(binding),
                     binding.declared,
                     statement.span,
                 ));
@@ -1557,7 +1582,7 @@ impl Context<'_> {
         if let Some(update) = &statement.update {
             stepping.push(update);
         }
-        let carried = self.carried_names(&statement.body, &stepping);
+        let carried = self.carried_names(&statement.body, &stepping, statement.span)?;
         let looping = self.open_loop(
             table,
             function,
@@ -1605,7 +1630,7 @@ impl Context<'_> {
                 back.push(self.coerced(
                     function,
                     table,
-                    binding.value,
+                    carried_value(binding),
                     binding.declared,
                     statement.span,
                 ));
@@ -1637,7 +1662,7 @@ impl Context<'_> {
         function: &mut Function,
         statement: &oxc_ast::ast::WhileStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        let carried = self.carried_names(&statement.body, &[]);
+        let carried = self.carried_names(&statement.body, &[], statement.span)?;
         let looping = self.open_loop(
             table,
             function,
@@ -1801,7 +1826,10 @@ impl Context<'_> {
         let Some(&binding) = self.scope.get(&tested.name) else {
             return;
         };
-        let held = function.type_of(binding.value);
+        let Some(standing) = binding.value else {
+            return;
+        };
+        let held = function.type_of(standing);
         let asserted = holds == tested.equal;
         let narrowed = match &tested.fact {
             Fact::Nullish(kind) => {
@@ -1849,13 +1877,10 @@ impl Context<'_> {
         if narrowed == held {
             return;
         }
-        let value = self.assign(function, narrowed, Rvalue::Narrow(binding.value), span);
+        let value = self.assign(function, narrowed, Rvalue::Narrow(standing), span);
         self.scope.insert(
             tested.name.clone(),
-            Binding {
-                value,
-                declared: binding.declared,
-            },
+            Binding::written(value, binding.declared),
         );
     }
 
@@ -1986,6 +2011,10 @@ impl Context<'_> {
                     );
                     continue;
                 }
+                let (Some(from_then), Some(from_else)) = (from_then, from_else) else {
+                    merged.insert(name.clone(), Binding::awaiting_a_write(declared));
+                    continue;
+                };
                 let wanted = table.union(vec![
                     function.type_of(from_then),
                     function.type_of(from_else),
@@ -1998,13 +2027,7 @@ impl Context<'_> {
                 parameters.push(parameter);
                 then_arguments.push(carried_then);
                 else_arguments.push(carried_else);
-                merged.insert(
-                    name.clone(),
-                    Binding {
-                        value: parameter,
-                        declared,
-                    },
-                );
+                merged.insert(name.clone(), Binding::written(parameter, declared));
             }
         } else if then_flow.continues() {
             merged = then_scope;
@@ -2282,24 +2305,26 @@ impl Context<'_> {
                 );
                 continue;
             }
-            let members: Vec<TypeId> = edges
+            let Some(standing) = edges
                 .iter()
-                .map(|(_, scope)| function.type_of(scope[name].value))
+                .map(|(_, scope)| scope[name].value)
+                .collect::<Option<Vec<ValueId>>>()
+            else {
+                merged.insert(name.clone(), Binding::awaiting_a_write(declared));
+                continue;
+            };
+            let members: Vec<TypeId> = standing
+                .iter()
+                .map(|&value| function.type_of(value))
                 .collect();
             let wanted = table.union(members);
-            for (position, (exit, scope)) in edges.iter().enumerate() {
-                let carried = self.appended(function, *exit, scope[name].value, wanted, span);
+            for (position, ((exit, _), &value)) in edges.iter().zip(standing.iter()).enumerate() {
+                let carried = self.appended(function, *exit, value, wanted, span);
                 passed[position].push(carried);
             }
             let parameter = function.fresh_value(wanted);
             parameters.push(parameter);
-            merged.insert(
-                name.clone(),
-                Binding {
-                    value: parameter,
-                    declared,
-                },
-            );
+            merged.insert(name.clone(), Binding::written(parameter, declared));
         }
 
         function.block_mut(join).parameters = parameters;
@@ -2691,17 +2716,21 @@ impl Context<'_> {
                 "a binding that is not a plain name is not lowered yet",
             )]);
         };
-        let Some(init) = &declarator.init else {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                declarator.span,
-                "a declaration without an initialiser is not lowered yet",
-            )]);
-        };
         let declared = declarator
             .type_annotation
             .as_ref()
             .and_then(|_| self.type_at(table, id.span).ok());
+        let Some(init) = &declarator.init else {
+            let Some(declared) = declared else {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    declarator.span,
+                    "a declaration with neither an initialiser nor a type annotation gives the name no type to hold",
+                )]);
+            };
+            self.declare(id.name.as_str(), Binding::awaiting_a_write(declared));
+            return Ok(());
+        };
         let value = self.lower_expression_expecting(table, function, init, declared)?;
         let value = match declared {
             Some(declared) => {
@@ -2717,13 +2746,8 @@ impl Context<'_> {
             None if widening => self.widened(table, function, value, declarator.span),
             None => value,
         };
-        self.declare(
-            id.name.as_str(),
-            Binding {
-                value,
-                declared: function.type_of(value),
-            },
-        );
+        let held = function.type_of(value);
+        self.declare(id.name.as_str(), Binding::written(value, held));
         Ok(())
     }
 
@@ -2765,13 +2789,8 @@ impl Context<'_> {
         for (position, id) in names.iter().enumerate() {
             let index = self.index_constant(table, function, position, id.span);
             let value = self.read_element_at(table, function, source, index, id.span)?;
-            self.declare(
-                id.name.as_str(),
-                Binding {
-                    value,
-                    declared: function.type_of(value),
-                },
-            );
+            let held = function.type_of(value);
+            self.declare(id.name.as_str(), Binding::written(value, held));
         }
 
         if let Some(rest) = &pattern.rest {
@@ -2794,13 +2813,7 @@ impl Context<'_> {
                 },
                 id.span,
             );
-            self.declare(
-                id.name.as_str(),
-                Binding {
-                    value,
-                    declared: ty,
-                },
-            );
+            self.declare(id.name.as_str(), Binding::written(value, ty));
         }
         Ok(())
     }
@@ -2884,8 +2897,8 @@ impl Context<'_> {
                 Ok(self.assign(function, ty, Rvalue::Constant(Constant::Null), literal.span))
             }
             Expression::Identifier(id) => {
-                if let Some(known) = self.scope.get(id.name.as_str()) {
-                    return Ok(known.value);
+                if let Some(&known) = self.scope.get(id.name.as_str()) {
+                    return known.value_or_refuse(id.name.as_str(), id.span);
                 }
                 if id.name == "undefined" {
                     let ty = table.intern(TypeKind::Undefined);

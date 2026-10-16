@@ -54,6 +54,26 @@ export function retry(ceiling: number, attempts: number): Attempt {
   return { tries: tries, waited: waited };
 }
 
+export function windowOf(limit: number, floor: number): number {
+  let chosen: number;
+  if (limit > floor) {
+    chosen = limit;
+  } else {
+    chosen = floor;
+  }
+  return chosen;
+}
+
+export function outcomeOf(spent: number, limit: number): Outcome {
+  let outcome: Outcome;
+  if (spent > limit) {
+    outcome = "over";
+  } else {
+    outcome = "ok";
+  }
+  return outcome;
+}
+
 export function hostOrFallback(
   given: string | undefined,
   fallback: string,

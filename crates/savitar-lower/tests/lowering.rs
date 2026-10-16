@@ -5684,6 +5684,148 @@ fn a_narrow_write_in_a_loop_body_still_fits_the_header_parameter_the_declared_ty
 }
 
 #[test]
+fn a_declaration_without_an_initialiser_takes_the_annotated_type_and_waits_for_a_write() {
+    let source = "function pick(flag: boolean, left: number, right: number): number {\n  let chosen: number;\n  if (flag) {\n    chosen = left;\n  } else {\n    chosen = right;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, number)),
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(number)),
+            ("chosen", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_name_declared_and_never_written_is_refused_when_it_is_read() {
+    let source = "function early(): number {\n  let chosen: number;\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("early", returning(&mut table, number)),
+            ("chosen", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("early.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("never written"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_name_written_on_only_one_branch_is_still_refused_after_the_join() {
+    let source = "function half(flag: boolean, left: number): number {\n  let chosen: number;\n  if (flag) {\n    chosen = left;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("half", returning(&mut table, number)),
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("chosen", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("half.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn a_declaration_with_neither_an_initialiser_nor_an_annotation_is_refused() {
+    let source = "function loose(start: number): number {\n  let chosen;\n  chosen = start;\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("loose", returning(&mut table, number)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("loose.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+}
+
+#[test]
+fn a_compound_write_to_a_name_never_written_is_refused_because_it_reads_first() {
+    let source =
+        "function step(): number {\n  let chosen: number;\n  chosen += 1;\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("step", returning(&mut table, number)),
+            ("chosen", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("step.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn a_name_declared_before_a_loop_and_first_written_inside_it_is_refused() {
+    let source = "function last(values: readonly number[]): number {\n  let chosen: number;\n  for (const value of values) {\n    chosen = value;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let values = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("last", returning(&mut table, number)),
+            ("values", Answer::Known(values)),
+            ("chosen", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("last.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("no value to carry in"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
 fn a_name_a_block_shadows_goes_back_to_the_outer_value_after_the_block() {
     let source = "function shade(start: number, limit: number): number {\n  let value = start;\n  {\n    let value = limit;\n    value = value + 1;\n  }\n  return value;\n}\n";
     let mut table = TypeTable::new();
