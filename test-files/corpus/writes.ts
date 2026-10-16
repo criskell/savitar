@@ -112,3 +112,40 @@ export function tokenOf(
   }
   return found;
 }
+
+export interface Streamed {
+  kind: "streamed";
+  sent: number;
+  chunks: number;
+}
+
+export interface Buffered {
+  kind: "buffered";
+  sent: number;
+  body: string;
+}
+
+export type Body = Streamed | Buffered;
+
+export function recordSent(body: Body, bytes: number): number {
+  body.sent = body.sent + bytes;
+  return body.sent;
+}
+
+export function countChunk(body: Body): number {
+  if (body.kind === "streamed") {
+    body.chunks = body.chunks + 1;
+    return body.chunks;
+  }
+  return 0;
+}
+
+export interface Limits {
+  requests: number;
+  burst?: number;
+}
+
+export function allowBurst(limits: Limits, burst: number): number {
+  limits.burst = burst;
+  return limits.requests;
+}

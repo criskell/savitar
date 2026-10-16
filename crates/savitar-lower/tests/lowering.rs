@@ -7326,22 +7326,6 @@ fn a_patterned_parameter_beside_a_named_one_keeps_both_in_the_order_declared() {
 }
 
 #[test]
-fn a_parameter_bound_by_a_pattern_with_a_default_on_the_parameter_itself_is_refused() {
-    let source = "function pick({ handler }: Route = { handler: \"none\" }): string {\n  return handler;\n}\n";
-    let mut table = TypeTable::new();
-    let text = table.intern(TypeKind::String);
-    let route = route_shape(&mut table);
-    let signature = signature_taking(&mut table, vec![route], text);
-    let provider = ByName::new(source, vec![("pick", signature)]);
-    let file = SourceFile::new("pick.ts", source);
-
-    let report = lower(&file, &provider, &mut table);
-
-    assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
-}
-
-#[test]
 fn a_parameter_bound_by_a_pattern_whose_field_the_shape_never_declares_is_refused() {
     let source = "function pick({ missing }: Route): string {\n  return missing;\n}\n";
     let mut table = TypeTable::new();
@@ -8187,4 +8171,477 @@ fn a_read_over_one_array_alone_still_reaches_the_provider_so_only_the_union_is_m
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     let function = &report.functions[0];
     assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_parameter_bound_by_a_pattern_with_a_default_reads_the_pattern_from_the_joined_value() {
+    let source = "function pick({ handler }: Route = { handler: \"none\" }): string {\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let omitted = table.optional(route);
+    let signature = signature_taking(&mut table, vec![route], text);
+    let provider = ByName::new(source, vec![("pick", signature)]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert_eq!(function.type_of(function.parameters()[0]), omitted);
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), text);
+}
+
+fn readonly_field(name: &str, type_id: savitar_types::TypeId) -> Field {
+    Field {
+        name: name.to_string(),
+        type_id,
+        optional: false,
+        method: false,
+        readonly: true,
+    }
+}
+
+#[test]
+fn writing_a_field_every_union_member_types_the_same_way_lowers_to_one_field_write() {
+    let source = "function set(holder: Small | Large): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![
+        named_field("amount", number, false),
+        named_field("label", text, false),
+    ]);
+    let large = table.object(vec![named_field("amount", number, false)]);
+    let holder = table.union(vec![small, large]);
+    let provider = ByName::new(source, vec![("holder", Answer::Known(holder))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "amount");
+    assert_eq!(function.type_of(*value), number);
+}
+
+#[test]
+fn writing_a_field_that_differs_between_union_members_is_refused_rather_than_taking_their_union() {
+    let source = "function set(holder: Small | Large): void {\n  holder.amount = \"late\";\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let large = table.object(vec![named_field("amount", text, false)]);
+    let holder = table.union(vec![small, large]);
+    let provider = ByName::new(source, vec![("holder", Answer::Known(holder))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+    assert!(
+        report.diagnostics[0].message.contains("every member"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_field_on_a_union_ignores_a_narrower_answer_from_the_provider() {
+    let source = "function set(holder: Small | Large): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let large = table.object(vec![named_field("amount", text, false)]);
+    let holder = table.union(vec![small, large]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("holder", Answer::Known(holder)),
+            ("amount", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(
+        report.functions.is_empty(),
+        "the provider answered the field of one member, and the write must prove both"
+    );
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn writing_a_field_one_union_member_does_not_declare_is_refused() {
+    let source = "function set(holder: Small | Plain): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let plain = table.object(vec![named_field("label", text, false)]);
+    let holder = table.union(vec![small, plain]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("holder", Answer::Known(holder)),
+            ("amount", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("no field `amount`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_field_one_union_member_declares_readonly_is_refused() {
+    let source = "function set(holder: Small | Frozen): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let frozen = table.object(vec![readonly_field("amount", number)]);
+    let holder = table.union(vec![small, frozen]);
+    let provider = ByName::new(source, vec![("holder", Answer::Known(holder))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("readonly"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_field_on_a_union_with_a_member_that_has_no_shape_is_refused_without_the_provider() {
+    let source = "function set(holder: Small | string): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let holder = table.union(vec![small, text]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("holder", Answer::Known(holder)),
+            ("amount", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("no declared shape"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_value_to_a_field_one_union_member_marks_optional_takes_the_field_type() {
+    let source = "function set(holder: Small | Loose): void {\n  holder.amount = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let loose = table.object(vec![named_field("amount", number, true)]);
+    let holder = table.union(vec![small, loose]);
+    let provider = ByName::new(source, vec![("holder", Answer::Known(holder))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "amount");
+    assert_eq!(function.type_of(*value), number);
+    assert!(
+        !table.admits_undefined(function.type_of(*value)),
+        "the field is optional in one member, and a write still takes the type it declares"
+    );
+}
+
+#[test]
+fn writing_undefined_to_a_field_another_union_member_requires_is_refused() {
+    let source = "function clear(holder: Small | Loose): void {\n  holder.amount = undefined;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let loose = table.object(vec![named_field("amount", number, true)]);
+    let holder = table.union(vec![small, loose]);
+    let provider = ByName::new(source, vec![("holder", Answer::Known(holder))]);
+    let file = SourceFile::new("clear.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn a_compound_write_to_a_field_of_a_union_proves_the_joined_value_against_every_member() {
+    let source =
+        "function add(holder: Small | Large, more: number): void {\n  holder.amount += more;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let small = table.object(vec![named_field("amount", number, false)]);
+    let large = table.object(vec![named_field("amount", text, false)]);
+    let holder = table.union(vec![small, large]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("holder", Answer::Known(holder)),
+            ("more", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("add.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.rule == "unsupported-assignment"
+                || diagnostic.rule == "unsupported-operator"),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_parameter_with_a_default_admits_undefined_at_the_edge_and_not_in_the_body() {
+    let source = "function page(limit: number = 20): number {\n  return limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let omitted = table.optional(number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert_eq!(
+        function.type_of(function.parameters()[0]),
+        omitted,
+        "the call may omit the argument, so the parameter admits undefined"
+    );
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_parameter_default_that_does_not_fit_the_annotation_is_held_as_a_union_rather_than_coerced() {
+    let source = "function page(limit: number = \"ten\"): number | string {\n  return limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, either)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), either);
+}
+
+#[test]
+fn a_parameter_after_one_with_a_default_still_reads_from_its_own_value() {
+    let source = "function page(limit: number = 20, offset: number): number {\n  return limit + offset;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+            ("offset", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 2);
+    assert_eq!(function.type_of(function.parameters()[1]), number);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_parameter_that_only_admits_undefined_through_its_default_is_narrowed_before_it_is_read() {
+    let source = "function page(limit: number = 20): number {\n  return limit + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(
+        report.diagnostics.is_empty(),
+        "adding to the parameter proves it is no longer optional: {:?}",
+        report.diagnostics
+    );
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+fn taking_one_optional(
+    table: &mut TypeTable,
+    takes: savitar_types::TypeId,
+    returns: savitar_types::TypeId,
+) -> Answer {
+    Answer::Known(table.function(
+        vec![savitar_types::Parameter {
+            type_id: takes,
+            rest: false,
+            optional: true,
+        }],
+        returns,
+    ))
+}
+
+#[test]
+fn a_call_that_omits_the_argument_a_default_fills_is_lowered() {
+    let source = "function callIt(): number {\n  return given();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = taking_one_optional(&mut table, number, number);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn passing_undefined_where_a_default_waits_is_refused_although_the_entry_admits_undefined() {
+    let source = "function callIt(): number {\n  return given(undefined);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = taking_one_optional(&mut table, number, number);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(
+        report.diagnostics[0].rule, "unsupported-argument",
+        "the signature carries the parameter type without undefined, and the call proof reads it"
+    );
+}
+
+#[test]
+fn writing_undefined_to_an_optional_field_is_refused_because_a_write_takes_the_field_type() {
+    let source = "function clear(route: Route): void {\n  route.timeout = undefined;\n}\n";
+    let mut table = TypeTable::new();
+    let route = route_shape(&mut table);
+    let provider = ByName::new(source, vec![("route", Answer::Known(route))]);
+    let file = SourceFile::new("clear.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
+}
+
+#[test]
+fn writing_a_value_to_an_optional_field_is_lowered_with_the_type_the_field_declares() {
+    let source = "function set(route: Route): void {\n  route.timeout = 5;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(source, vec![("route", Answer::Known(route))]);
+    let file = SourceFile::new("set.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let Some(Statement::WriteField { name, value, .. }) = only_block(function).statements.last()
+    else {
+        panic!(
+            "expected a field write, got {:?}",
+            only_block(function).statements
+        );
+    };
+    assert_eq!(name, "timeout");
+    assert_eq!(function.type_of(*value), number);
 }

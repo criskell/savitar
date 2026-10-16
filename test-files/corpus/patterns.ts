@@ -207,3 +207,9 @@ export function bodyOf(incident: Incident): IncidentBody {
   const { kind, ...body } = incident;
   return body;
 }
+
+export function routeTimeout(
+  { timeout = 30 }: Route = { handler: "none" },
+): number {
+  return timeout;
+}

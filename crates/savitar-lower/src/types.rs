@@ -495,6 +495,36 @@ pub enum SlotRefusal {
     Declined(String),
 }
 
+pub fn field_slots(
+    table: &mut TypeTable,
+    object: TypeId,
+    name: &str,
+) -> Result<Vec<TypeId>, SlotRefusal> {
+    let TypeKind::Union(members) = table.kind(object).clone() else {
+        return field_slot(table, object, name).map(|slot| vec![slot]);
+    };
+    let mut slots: Vec<TypeId> = Vec::with_capacity(members.len());
+    for member in members {
+        for slot in field_slots(table, member, name).map_err(|refusal| in_a_member(&refusal))? {
+            if !slots.contains(&slot) {
+                slots.push(slot);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+fn in_a_member(refusal: &SlotRefusal) -> SlotRefusal {
+    match refusal {
+        SlotRefusal::Shapeless(reason) => {
+            SlotRefusal::Shapeless(format!("one member of this union takes no write: {reason}"))
+        }
+        SlotRefusal::Declined(reason) => {
+            SlotRefusal::Declined(format!("one member of this union takes no write: {reason}"))
+        }
+    }
+}
+
 pub fn field_slot(
     table: &mut TypeTable,
     object: TypeId,
@@ -515,9 +545,6 @@ pub fn field_slot(
             return Err(SlotRefusal::Declined(format!(
                 "`{name}` is declared readonly and admits no write"
             )));
-        }
-        if field.optional {
-            return Ok(table.optional(field.type_id));
         }
         return Ok(field.type_id);
     }
@@ -622,6 +649,7 @@ pub fn declared_parameter(
     table: &TypeTable,
     signature: TypeId,
     position: usize,
+    defaulted: bool,
 ) -> Result<TypeId, String> {
     let TypeKind::Function { parameters, .. } = table.kind(signature) else {
         return Err("the provider gives no signature for this function".to_string());
@@ -629,9 +657,13 @@ pub fn declared_parameter(
     let Some(parameter) = parameters.get(position) else {
         return Err("the signature declares no type for this parameter".to_string());
     };
-    if parameter.optional || parameter.rest {
+    if parameter.rest {
+        return Err("a rest parameter bound by a pattern is not lowered yet".to_string());
+    }
+    if parameter.optional && !defaulted {
         return Err(
-            "an optional or rest parameter bound by a pattern is not lowered yet".to_string(),
+            "an optional parameter bound by a pattern with no default is not lowered yet"
+                .to_string(),
         );
     }
     Ok(parameter.type_id)

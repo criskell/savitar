@@ -349,29 +349,35 @@ fn lower_function(
         declared
     };
 
-    let mut patterned = Vec::new();
+    let mut entering = Vec::new();
     for (position, parameter) in declaration.params.items.iter().enumerate() {
-        if let BindingPattern::BindingIdentifier(id) = &parameter.pattern {
-            let ty = context.type_at(table, id.span)?;
-            let value = function.declare_parameter(ty);
-            context
-                .scope
-                .insert(id.name.to_string(), Binding::written(value, ty));
+        let default = parameter.initializer.as_deref();
+        let declared = match &parameter.pattern {
+            BindingPattern::BindingIdentifier(id) => context.type_at(table, id.span)?,
+            _ => types::declared_parameter(table, signature, position, default.is_some())
+                .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?,
+        };
+        let Some(fallback) = default else {
+            let value = function.declare_parameter(declared);
+            match &parameter.pattern {
+                BindingPattern::BindingIdentifier(id) => {
+                    context
+                        .scope
+                        .insert(id.name.to_string(), Binding::written(value, declared));
+                }
+                pattern => entering.push((pattern, None, value, parameter.span)),
+            }
             continue;
-        }
-        if parameter.initializer.is_some() {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                parameter.span,
-                "a default on a parameter bound by a pattern is not lowered yet",
-            )]);
-        }
-        let ty = types::declared_parameter(table, signature, position)
-            .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?;
-        let value = function.declare_parameter(ty);
-        patterned.push((&parameter.pattern, value));
+        };
+        let omitted = table.optional(declared);
+        let value = function.declare_parameter(omitted);
+        entering.push((&parameter.pattern, Some(fallback), value, parameter.span));
     }
-    for (pattern, value) in patterned {
+    for (pattern, fallback, value, span) in entering {
+        let value = match fallback {
+            Some(fallback) => context.defaulted(table, &mut function, value, fallback, span)?,
+            None => value,
+        };
         context.bind_pattern(table, &mut function, pattern, value)?;
     }
 
@@ -894,10 +900,14 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let object = self.lower_expression(table, function, &member.object)?;
         let name = member.property.name.to_string();
-        let slot = self.field_slot(table, function.type_of(object), &name, member)?;
+        let slots = self.field_slots(table, function.type_of(object), &name, member)?;
+        let agreed = match slots.as_slice() {
+            [slot] => Some(*slot),
+            _ => None,
+        };
         let value = match written {
             Written::Value(expression) => {
-                self.lower_expression_expecting(table, function, expression, Some(slot))?
+                self.lower_expression_expecting(table, function, expression, agreed)?
             }
             Written::Combined(op, expression) => {
                 let held = self.read_field(table, function, object, &name, member)?;
@@ -910,7 +920,7 @@ impl Context<'_> {
                 self.combine(table, function, op, held, one, span)?
             }
         };
-        let value = self.fitted(table, function, value, slot, span)?;
+        let value = self.fitted_in_every(table, function, value, &slots, span)?;
         self.statements.push(Statement::WriteField {
             object,
             name,
@@ -957,27 +967,53 @@ impl Context<'_> {
         Ok(())
     }
 
-    fn field_slot(
+    fn field_slots(
         &self,
         table: &mut TypeTable,
         object: TypeId,
         name: &str,
         member: &oxc_ast::ast::StaticMemberExpression<'_>,
-    ) -> Result<TypeId, Vec<Diagnostic>> {
-        let shapeless = match types::field_slot(table, object, name) {
-            Ok(slot) => return Ok(slot),
+    ) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
+        let shapeless = match types::field_slots(table, object, name) {
+            Ok(slots) => return Ok(slots),
             Err(types::SlotRefusal::Declined(reason)) => {
                 return Err(vec![refuse("unsupported-write", member.span, reason)]);
             }
             Err(types::SlotRefusal::Shapeless(reason)) => reason,
         };
+        if types::is_union(table, object) {
+            return Err(vec![refuse("unsupported-write", member.span, shapeless)]);
+        }
         match self.answer_at(table, member.property.span) {
-            Answer::Known(id) => Ok(id),
+            Answer::Known(id) => Ok(vec![id]),
             Answer::Unsupported(detail) => {
                 Err(vec![refuse("unsupported-type", member.span, detail)])
             }
             Answer::OutOfScope => Err(vec![refuse("unsupported-write", member.span, shapeless)]),
         }
+    }
+
+    fn fitted_in_every(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        slots: &[TypeId],
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        if let [slot] = slots {
+            return self.fitted(table, function, value, *slot, span);
+        }
+        for &slot in slots {
+            if !savitar_types::assignable(table, function.type_of(value), slot) {
+                return Err(vec![refuse(
+                    "unsupported-assignment",
+                    span,
+                    "Savitar cannot show this value fits the field in every member of this union",
+                )]);
+            }
+        }
+        Ok(value)
     }
 
     fn read_field(
