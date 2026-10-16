@@ -148,6 +148,21 @@ pub fn element_result(
             }
             Ok(table.optional(element))
         }
+        TypeKind::Tuple { elements, .. } => {
+            if let TypeKind::NumberLiteral(bits) = *table.kind(index) {
+                let wanted = f64::from_bits(bits);
+                return elements
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, &element)| (position as f64 == wanted).then_some(element))
+                    .ok_or_else(|| "this index falls outside the tuple".to_string());
+            }
+            if !is_numeric(table, index) {
+                return Err("a tuple is indexed by a number".to_string());
+            }
+            let held = table.union(elements);
+            Ok(table.optional(held))
+        }
         TypeKind::Object { indexes, .. } if !indexes.is_empty() => {
             let matched = indexes.iter().find(|signature| {
                 signature.key == index || key_accepts(table, signature.key, index)
@@ -354,6 +369,19 @@ pub fn takes_type_arguments(table: &TypeTable, signature: TypeId) -> bool {
             ..
         } if !type_parameters.is_empty()
     )
+}
+
+pub fn rest_of(table: &mut TypeTable, source: TypeId, from: u32) -> Result<TypeId, String> {
+    match table.kind(source).clone() {
+        TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => {
+            Ok(table.intern(TypeKind::Array(element)))
+        }
+        TypeKind::Tuple { elements, .. } => {
+            let kept: Vec<TypeId> = elements.into_iter().skip(from as usize).collect();
+            Ok(table.tuple(kept, false))
+        }
+        _ => Err("a rest binding needs an array or a tuple to take from".to_string()),
+    }
 }
 
 pub struct Fitted {

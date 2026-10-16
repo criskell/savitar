@@ -91,6 +91,10 @@ pub enum Rvalue {
         array: ValueId,
         index: ValueId,
     },
+    Slice {
+        array: ValueId,
+        from: u32,
+    },
     NewObject {
         fields: Vec<(String, ValueId)>,
     },

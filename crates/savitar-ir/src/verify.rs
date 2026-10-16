@@ -193,6 +193,7 @@ fn rvalue_uses(value: &Rvalue) -> Vec<ValueId> {
         Rvalue::Binary { left, right, .. } => vec![*left, *right],
         Rvalue::ReadField { object, .. } => vec![*object],
         Rvalue::ReadElement { array, index } => vec![*array, *index],
+        Rvalue::Slice { array, .. } => vec![*array],
         Rvalue::NewObject { fields } => fields.iter().map(|(_, id)| *id).collect(),
         Rvalue::NewArray { elements } => elements.clone(),
         Rvalue::Call { callee, arguments } => {

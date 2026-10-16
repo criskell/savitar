@@ -1690,6 +1690,9 @@ impl Context<'_> {
         declarator: &VariableDeclarator<'_>,
         widening: bool,
     ) -> Result<(), Vec<Diagnostic>> {
+        if let BindingPattern::ArrayPattern(pattern) = &declarator.id {
+            return self.lower_array_pattern(table, function, declarator, pattern);
+        }
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
             return Err(vec![refuse(
                 "unsupported-pattern",
@@ -1725,6 +1728,102 @@ impl Context<'_> {
         };
         self.scope.insert(id.name.to_string(), value);
         Ok(())
+    }
+
+    fn lower_array_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        declarator: &VariableDeclarator<'_>,
+        pattern: &oxc_ast::ast::ArrayPattern<'_>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let Some(init) = &declarator.init else {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                declarator.span,
+                "a declaration without an initialiser is not lowered yet",
+            )]);
+        };
+        let source = self.lower_expression(table, function, init)?;
+
+        let mut names = Vec::with_capacity(pattern.elements.len());
+        for element in &pattern.elements {
+            let Some(element) = element.as_ref() else {
+                return Err(vec![refuse(
+                    "unsupported-pattern",
+                    pattern.span,
+                    "a hole in an array pattern is not lowered yet",
+                )]);
+            };
+            let BindingPattern::BindingIdentifier(id) = element else {
+                return Err(vec![refuse(
+                    "unsupported-pattern",
+                    pattern.span,
+                    "an array pattern that binds anything but a plain name is not lowered yet",
+                )]);
+            };
+            names.push(id);
+        }
+
+        for (position, id) in names.iter().enumerate() {
+            let index = self.index_constant(table, function, position, id.span);
+            let value = self.read_element_at(table, function, source, index, id.span)?;
+            self.scope.insert(id.name.to_string(), value);
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let BindingPattern::BindingIdentifier(id) = &rest.argument else {
+                return Err(vec![refuse(
+                    "unsupported-pattern",
+                    pattern.span,
+                    "a rest in an array pattern that binds anything but a plain name is not lowered yet",
+                )]);
+            };
+            let from = u32::try_from(names.len()).expect("a pattern is small");
+            let ty = types::rest_of(table, function.type_of(source), from)
+                .map_err(|reason| vec![refuse("unsupported-pattern", pattern.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Slice {
+                    array: source,
+                    from,
+                },
+                id.span,
+            );
+            self.scope.insert(id.name.to_string(), value);
+        }
+        Ok(())
+    }
+
+    fn index_constant(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        position: usize,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        let at = position as f64;
+        let ty = table.number_literal(at);
+        self.assign(
+            function,
+            ty,
+            Rvalue::Constant(Constant::Number(at.to_bits())),
+            span,
+        )
+    }
+
+    fn read_element_at(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        array: ValueId,
+        index: ValueId,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let ty = types::element_result(table, function.type_of(array), function.type_of(index))
+            .map_err(|reason| vec![refuse("unsupported-pattern", span, reason)])?;
+        Ok(self.assign(function, ty, Rvalue::ReadElement { array, index }, span))
     }
 
     fn lower_expression(

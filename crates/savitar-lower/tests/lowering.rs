@@ -2781,6 +2781,144 @@ fn the_object_and_the_index_are_evaluated_before_the_value() {
 }
 
 #[test]
+fn an_array_pattern_reads_each_position_and_slices_the_rest() {
+    let source = "function split(parts: string[]): string[] {\n  const [head, ...rest] = parts;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let texts = table.intern(TypeKind::Array(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("split", returning(&mut table, texts)),
+            ("parts", Answer::Known(texts)),
+        ],
+    );
+    let file = SourceFile::new("split.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let read = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::ReadElement { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the first position should be read");
+    assert!(
+        table.admits_undefined(function.type_of(read)),
+        "a read at an index may fall outside the array, so the first name admits undefined"
+    );
+    let sliced = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Slice { from, .. },
+                ..
+            } => Some((*target, *from)),
+            _ => None,
+        })
+        .expect("the rest should be sliced");
+    assert_eq!(sliced.1, 1, "the rest starts after the names before it");
+    assert_eq!(
+        function.type_of(sliced.0),
+        texts,
+        "the rest is a fresh array of the same element"
+    );
+}
+
+#[test]
+fn an_array_pattern_over_a_tuple_keeps_each_position_exact() {
+    let source = "function head(pair: [number, string]): number {\n  const [first, ...rest] = pair;\n  return first;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("head", returning(&mut table, number)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
+    let file = SourceFile::new("head.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let sliced = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Slice { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the rest should be sliced");
+    let kept = table.tuple(vec![text], false);
+    assert_eq!(
+        function.type_of(sliced),
+        kept,
+        "the rest of a tuple keeps the positions that are left"
+    );
+}
+
+#[test]
+fn an_array_pattern_with_a_hole_is_refused() {
+    let source = "function head(parts: string[]): string[] {\n  const [, ...rest] = parts;\n  return rest;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let texts = table.intern(TypeKind::Array(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("head", returning(&mut table, texts)),
+            ("parts", Answer::Known(texts)),
+        ],
+    );
+    let file = SourceFile::new("head.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn an_array_pattern_over_something_that_is_not_a_list_is_refused() {
+    let source = "function head(count: number): number {\n  const [first, ...rest] = count;\n  return first;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("head", returning(&mut table, number)),
+            ("count", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("head.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
 fn an_assignment_to_a_pattern_is_refused_rather_than_guessed() {
     let source = "function take(point: Point): void {\n  [point.x] = [1];\n}\n";
     let mut table = TypeTable::new();
