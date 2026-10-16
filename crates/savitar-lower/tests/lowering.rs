@@ -8016,3 +8016,59 @@ fn a_parameter_that_only_admits_undefined_through_its_default_is_narrowed_before
     assert_eq!(verify(function), vec![]);
     assert_eq!(function.type_of(returned_value(function)), number);
 }
+
+fn taking_one_optional(
+    table: &mut TypeTable,
+    takes: savitar_types::TypeId,
+    returns: savitar_types::TypeId,
+) -> Answer {
+    Answer::Known(table.function(
+        vec![savitar_types::Parameter {
+            type_id: takes,
+            rest: false,
+            optional: true,
+        }],
+        returns,
+    ))
+}
+
+#[test]
+fn a_call_that_omits_the_argument_a_default_fills_is_lowered() {
+    let source = "function callIt(): number {\n  return given();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = taking_one_optional(&mut table, number, number);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn passing_undefined_where_a_default_waits_is_refused_although_the_entry_admits_undefined() {
+    let source = "function callIt(): number {\n  return given(undefined);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = taking_one_optional(&mut table, number, number);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(
+        report.diagnostics[0].rule, "unsupported-argument",
+        "the signature carries the parameter type without undefined, and the call proof reads it"
+    );
+}
