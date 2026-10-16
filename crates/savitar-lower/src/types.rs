@@ -102,6 +102,36 @@ pub fn without_typeof(table: &mut TypeTable, id: TypeId, word: &str) -> Option<T
     })
 }
 
+#[must_use]
+pub fn with_only_discriminant(
+    table: &mut TypeTable,
+    id: TypeId,
+    field: &str,
+    literal: &TypeKind,
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        match decided_field_kinds(table, member, field) {
+            Some(kinds) => kinds.iter().any(|kind| kind == literal),
+            None => true,
+        }
+    })
+}
+
+#[must_use]
+pub fn without_discriminant(
+    table: &mut TypeTable,
+    id: TypeId,
+    field: &str,
+    literal: &TypeKind,
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        match decided_field_kinds(table, member, field) {
+            Some(kinds) => kinds.iter().any(|kind| kind != literal),
+            None => true,
+        }
+    })
+}
+
 fn keeping(
     table: &mut TypeTable,
     id: TypeId,
@@ -140,6 +170,28 @@ fn typeof_word(table: &TypeTable, id: TypeId) -> Option<&'static str> {
         }
         _ => None,
     }
+}
+
+fn decided_field_kinds(table: &TypeTable, member: TypeId, field: &str) -> Option<Vec<TypeKind>> {
+    let TypeKind::Object { fields, .. } = table.kind(member) else {
+        return None;
+    };
+    let found = fields.iter().find(|one| one.name == field)?;
+    if found.optional {
+        return None;
+    }
+    let held = match table.kind(found.type_id) {
+        TypeKind::Union(members) => members.clone(),
+        _ => vec![found.type_id],
+    };
+    held.into_iter()
+        .map(|one| match table.kind(one) {
+            kind @ (TypeKind::StringLiteral(_)
+            | TypeKind::NumberLiteral(_)
+            | TypeKind::BooleanLiteral(_)) => Some(kind.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_nullish(table: &TypeTable, id: TypeId) -> bool {

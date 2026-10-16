@@ -3869,6 +3869,16 @@ fn text_or_number(table: &mut TypeTable) -> (savitar_types::TypeId, savitar_type
     (number, either)
 }
 
+fn named_field(name: &str, type_id: savitar_types::TypeId, optional: bool) -> Field {
+    Field {
+        name: name.to_string(),
+        type_id,
+        optional,
+        method: false,
+        readonly: false,
+    }
+}
+
 fn taking(
     table: &mut TypeTable,
     takes: savitar_types::TypeId,
@@ -3881,6 +3891,43 @@ fn taking(
             optional: false,
         }],
         returns,
+    )
+}
+
+struct Frames {
+    union: savitar_types::TypeId,
+    tags: savitar_types::TypeId,
+    text: savitar_types::TypeId,
+    binary: savitar_types::TypeId,
+}
+
+fn frames(
+    table: &mut TypeTable,
+    tags: (savitar_types::TypeId, savitar_types::TypeId),
+    tag_optional: bool,
+) -> Frames {
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let text_frame = table.object(vec![
+        named_field("kind", tags.0, tag_optional),
+        named_field("text", text, false),
+    ]);
+    let binary_frame = table.object(vec![
+        named_field("kind", tags.1, tag_optional),
+        named_field("size", number, false),
+    ]);
+    Frames {
+        union: table.union(vec![text_frame, binary_frame]),
+        tags: table.union(vec![tags.0, tags.1]),
+        text: text_frame,
+        binary: binary_frame,
+    }
+}
+
+fn frame_tags(table: &mut TypeTable) -> (savitar_types::TypeId, savitar_types::TypeId) {
+    (
+        table.intern(TypeKind::StringLiteral("text".to_string())),
+        table.intern(TypeKind::StringLiteral("binary".to_string())),
     )
 }
 
@@ -4038,3 +4085,173 @@ fn a_typeof_test_on_something_that_is_not_a_name_narrows_nothing() {
     );
 }
 
+#[test]
+fn a_union_of_objects_is_filtered_to_the_member_the_discriminant_names() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.binary),
+        "the branch that tests the tag reads the member that carries it"
+    );
+}
+
+#[test]
+fn the_branch_where_the_discriminant_does_not_match_narrows_to_the_other_member() {
+    let source = "function use(frame: Frame): string {\n  if (frame.kind === \"binary\") {\n    return \"\";\n  }\n  return frame.text;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&shapes.text));
+}
+
+#[test]
+fn a_discriminant_test_with_strict_inequality_filters_the_other_way() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind !== \"text\") {\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&shapes.binary));
+}
+
+#[test]
+fn a_ternary_filters_the_union_by_discriminant_in_both_arms() {
+    let source = "function use(frame: Frame): string {\n  return frame.kind === \"text\" ? frame.text : label(frame);\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let labels = taking(&mut table, shapes.binary, text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("label", Answer::Known(labels)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let narrowings = narrowed(&report.functions[0]);
+    assert!(narrowings.contains(&shapes.text));
+    assert!(narrowings.contains(&shapes.binary));
+}
+
+#[test]
+fn a_discriminant_tested_against_a_number_literal_narrows_the_same_way() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === 2) {\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let first = table.number_literal(1.0);
+    let second = table.number_literal(2.0);
+    let shapes = frames(&mut table, (first, second), false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&shapes.binary));
+}
+
+#[test]
+fn a_discriminant_field_that_is_not_a_literal_type_narrows_nothing() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let shapes = frames(&mut table, (text, text), false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn an_optional_discriminant_field_narrows_nothing_because_it_may_be_absent() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}

@@ -1,5 +1,11 @@
 export type HeaderValue = string | number;
 
+export type TextFrame = { kind: "text"; text: string };
+
+export type BinaryFrame = { kind: "binary"; size: number };
+
+export type Frame = TextFrame | BinaryFrame;
+
 export function headerText(value: HeaderValue): string {
   if (typeof value === "number") {
     return `${value}`;
@@ -16,4 +22,30 @@ export function retryAfter(value: HeaderValue, fallback: number): number {
 
 export function headerWeight(value: HeaderValue): number {
   return typeof value === "string" ? value.length : value + 1;
+}
+
+export function textSize(frame: TextFrame): number {
+  return frame.text.length;
+}
+
+export function binarySize(frame: BinaryFrame): number {
+  return frame.size;
+}
+
+export function frameBytes(frame: Frame): number {
+  if (frame.kind === "binary") {
+    return binarySize(frame);
+  }
+  return textSize(frame);
+}
+
+export function frameLabel(frame: Frame): string {
+  if (frame.kind !== "text") {
+    return `binary ${binarySize(frame)}`;
+  }
+  return frame.text;
+}
+
+export function frameWeight(frame: Frame, extra: number): number {
+  return frame.kind === "text" ? textSize(frame) + extra : binarySize(frame);
 }

@@ -61,6 +61,7 @@ struct Tested {
 enum Fact {
     Nullish(TypeKind),
     Primitive(String),
+    Discriminant { field: String, literal: TypeKind },
 }
 
 enum Written<'target, 'source> {
@@ -1171,6 +1172,15 @@ impl Context<'_> {
                 equal,
             });
         }
+        if let (Some((name, field)), Some(literal)) =
+            (self.field_of_name_in_scope(subject), literal_kind(against))
+        {
+            return Some(Tested {
+                name,
+                fact: Fact::Discriminant { field, literal },
+                equal,
+            });
+        }
         None
     }
 
@@ -1191,6 +1201,14 @@ impl Context<'_> {
             return None;
         }
         self.name_in_scope(&unary.argument)
+    }
+
+    fn field_of_name_in_scope(&self, side: &Expression<'_>) -> Option<(String, String)> {
+        let Expression::StaticMemberExpression(member) = side else {
+            return None;
+        };
+        let name = self.name_in_scope(&member.object)?;
+        Some((name, member.property.name.to_string()))
     }
 
     fn narrow_by_test(
@@ -1222,6 +1240,13 @@ impl Context<'_> {
                     types::with_only_typeof(table, held, word)
                 } else {
                     types::without_typeof(table, held, word)
+                }
+            }
+            Fact::Discriminant { field, literal } => {
+                if asserted {
+                    types::with_only_discriminant(table, held, field, literal)
+                } else {
+                    types::without_discriminant(table, held, field, literal)
                 }
             }
         };
@@ -2328,6 +2353,19 @@ fn typeof_word(side: &Expression<'_>) -> Option<String> {
         return None;
     };
     types::narrowing_typeof_word(literal.value.as_str()).then(|| literal.value.to_string())
+}
+
+fn literal_kind(side: &Expression<'_>) -> Option<TypeKind> {
+    match side {
+        Expression::StringLiteral(literal) => {
+            Some(TypeKind::StringLiteral(literal.value.to_string()))
+        }
+        Expression::NumericLiteral(literal) => {
+            Some(TypeKind::NumberLiteral(literal.value.to_bits()))
+        }
+        Expression::BooleanLiteral(literal) => Some(TypeKind::BooleanLiteral(literal.value)),
+        _ => None,
+    }
 }
 
 fn literal_type(table: &mut TypeTable, expression: &Expression<'_>) -> Option<TypeId> {
