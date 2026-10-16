@@ -5606,3 +5606,117 @@ fn a_name_a_block_shadows_goes_back_to_the_outer_value_after_the_block() {
         "the block stepped its own `value`, and the outer one never moved"
     );
 }
+
+#[test]
+fn the_right_operand_of_and_sees_the_name_the_left_operand_narrowed() {
+    let source = "function use(frame: Frame, limit: number): number {\n  if (frame.kind === \"binary\" && frame.size < limit) {\n    return limit;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("limit", Answer::Known(number)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.binary),
+        "the right operand only runs when the left one held, so it reads the member the tag names"
+    );
+}
+
+#[test]
+fn the_right_operand_of_or_sees_the_name_the_left_operand_ruled_out() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\" || frame.text === \"ping\") {\n    return 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.text),
+        "the right operand only runs when the left one failed, so the tag it tested is gone"
+    );
+}
+
+#[test]
+fn the_branch_after_a_short_circuit_test_inherits_no_narrowing_from_it() {
+    let source = "function use(frame: Frame, limit: number): number {\n  if (frame.kind === \"binary\" && frame.size < limit) {\n    return limit;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("limit", Answer::Known(number)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]).len(),
+        1,
+        "the narrowing lives inside the short circuit and does not reach the branch it guards"
+    );
+}
+
+#[test]
+fn the_right_operand_of_nullish_coalescing_keeps_the_name_whole_because_it_runs_when_it_is_missing()
+{
+    let source = "function use(value: string | undefined, fallback: string): string {\n  return value ?? fallback;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let maybe = table.optional(text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("value", Answer::Known(maybe)),
+            ("fallback", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        narrowed(function),
+        vec![text],
+        "only the branch that keeps the left value narrows, and it drops the missing members"
+    );
+}

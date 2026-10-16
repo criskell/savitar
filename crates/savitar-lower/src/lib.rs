@@ -2554,6 +2554,8 @@ impl Context<'_> {
         expected: Option<TypeId>,
     ) -> Result<ValueId, Vec<Diagnostic>> {
         let left = self.lower_expression(table, function, &logical.left)?;
+        let short_circuit_fact = self.tested_fact(&logical.left);
+        let before = self.scope.clone();
         let coalescing = logical.operator == LogicalOperator::Coalesce;
         let condition = if coalescing {
             let boolean = table.intern(TypeKind::Boolean);
@@ -2592,6 +2594,15 @@ impl Context<'_> {
 
         self.current = right_entry;
         self.statements.clear();
+        if !coalescing {
+            self.narrow_by_test(
+                table,
+                function,
+                short_circuit_fact.as_ref(),
+                right_on_then,
+                logical.span,
+            );
+        }
         let right = self.lower_expression_expecting(table, function, &logical.right, expected)?;
         let right_exit = self.current;
         let right_statements = std::mem::take(&mut self.statements);
@@ -2642,6 +2653,7 @@ impl Context<'_> {
         function.block_mut(join).parameters = vec![parameter];
         self.current = join;
         self.statements.clear();
+        self.scope = before;
         Ok(parameter)
     }
 

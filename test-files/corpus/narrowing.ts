@@ -49,3 +49,24 @@ export function frameLabel(frame: Frame): string {
 export function frameWeight(frame: Frame, extra: number): number {
   return frame.kind === "text" ? textSize(frame) + extra : binarySize(frame);
 }
+
+export function binaryCount(frames: readonly Frame[], limit: number): number {
+  let seen = 0;
+  for (const frame of frames) {
+    if (frame.kind === "binary" && binarySize(frame) < limit) {
+      seen = seen + 1;
+    }
+  }
+  return seen;
+}
+
+export function textBudget(frames: readonly Frame[], budget: number): number {
+  let left = budget;
+  for (const frame of frames) {
+    if (frame.kind === "binary" || textSize(frame) > left) {
+      continue;
+    }
+    left = left - 1;
+  }
+  return left;
+}
