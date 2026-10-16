@@ -570,6 +570,10 @@ impl Context<'_> {
             };
         }
 
+        if let Expression::ParenthesizedExpression(inner) = expression {
+            return self.lower_effect(table, function, &inner.expression);
+        }
+
         let Expression::AssignmentExpression(assignment) = expression else {
             self.lower_expression(table, function, expression)?;
             return Ok(());
@@ -597,12 +601,183 @@ impl Context<'_> {
             AssignmentTarget::ComputedMemberExpression(member) => {
                 self.lower_element_write(table, function, member, written, assignment.span)
             }
+            AssignmentTarget::ArrayAssignmentTarget(_)
+            | AssignmentTarget::ObjectAssignmentTarget(_) => {
+                let Written::Value(expression) = written else {
+                    return Err(vec![refuse(
+                        "unsupported-statement",
+                        assignment.span,
+                        "a compound assignment to a pattern is not lowered yet",
+                    )]);
+                };
+                let source = self.lower_expression(table, function, expression)?;
+                self.write_pattern(table, function, &assignment.left, source)
+            }
             _ => Err(vec![refuse(
                 "unsupported-statement",
                 assignment.span,
-                "only assignment to a name, a field or an element is lowered yet",
+                "only assignment to a name, a field, an element or a pattern is lowered yet",
             )]),
         }
+    }
+
+    fn write_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        target: &AssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.store_name(table, function, id.name.as_str(), id.span, source, id.span)
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                self.write_array_pattern(table, function, array, source)
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                self.write_object_pattern(table, function, object, source)
+            }
+            other => Err(vec![refuse(
+                "unsupported-pattern",
+                other.span(),
+                "a pattern that writes anywhere but to a name is not lowered yet",
+            )]),
+        }
+    }
+
+    fn write_maybe_defaulted(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match target {
+            oxc_ast::ast::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(with) => {
+                let value = self.defaulted(table, function, source, &with.init, with.span)?;
+                self.write_pattern(table, function, &with.binding, value)
+            }
+            other => {
+                let Some(plain) = other.as_assignment_target() else {
+                    return Err(vec![refuse(
+                        "unsupported-pattern",
+                        other.span(),
+                        "this pattern target is not lowered yet",
+                    )]);
+                };
+                self.write_pattern(table, function, plain, source)
+            }
+        }
+    }
+
+    fn write_array_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ArrayAssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        for (position, element) in pattern.elements.iter().enumerate() {
+            let Some(element) = element.as_ref() else {
+                continue;
+            };
+            let at = element.span();
+            let index = self.index_constant(table, function, position, at);
+            let value = self.read_element_at(table, function, source, index, at)?;
+            self.write_maybe_defaulted(table, function, element, value)?;
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let from = u32::try_from(pattern.elements.len()).expect("a pattern is small");
+            let ty = types::rest_of(table, function.type_of(source), from)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Slice {
+                    array: source,
+                    from,
+                },
+                rest.span,
+            );
+            self.write_pattern(table, function, &rest.target, value)?;
+        }
+        Ok(())
+    }
+
+    fn write_object_pattern(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        pattern: &oxc_ast::ast::ObjectAssignmentTarget<'_>,
+        source: ValueId,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let mut taken = Vec::with_capacity(pattern.properties.len());
+        for property in &pattern.properties {
+            match property {
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(
+                    shorthand,
+                ) => {
+                    let name = shorthand.binding.name.to_string();
+                    let read =
+                        self.read_field_at(table, function, source, &name, shorthand.span)?;
+                    let value = match &shorthand.init {
+                        Some(fallback) => {
+                            self.defaulted(table, function, read, fallback, shorthand.span)?
+                        }
+                        None => read,
+                    };
+                    self.store_name(
+                        table,
+                        function,
+                        &name,
+                        shorthand.binding.span,
+                        value,
+                        shorthand.span,
+                    )?;
+                    taken.push(name);
+                }
+                oxc_ast::ast::AssignmentTargetProperty::AssignmentTargetPropertyProperty(
+                    renamed,
+                ) => {
+                    if renamed.computed {
+                        return Err(vec![refuse(
+                            "unsupported-pattern",
+                            renamed.span,
+                            "a computed key in an object pattern is not lowered yet",
+                        )]);
+                    }
+                    let Some(name) = renamed.name.static_name() else {
+                        return Err(vec![refuse(
+                            "unsupported-pattern",
+                            renamed.span,
+                            "a key in an object pattern that is not a plain name is not lowered yet",
+                        )]);
+                    };
+                    let name = name.to_string();
+                    let value = self.read_field_at(table, function, source, &name, renamed.span)?;
+                    taken.push(name);
+                    self.write_maybe_defaulted(table, function, &renamed.binding, value)?;
+                }
+            }
+        }
+
+        if let Some(rest) = &pattern.rest {
+            let ty = types::object_rest_of(table, function.type_of(source), &taken)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Rest {
+                    object: source,
+                    taken,
+                },
+                rest.span,
+            );
+            self.write_pattern(table, function, &rest.target, value)?;
+        }
+        Ok(())
     }
 
     fn lower_name_write(
@@ -627,16 +802,22 @@ impl Context<'_> {
                 self.combine(table, function, op, held.value, one, span)?
             }
         };
-        let stored = self.kept(
-            table,
-            function,
-            stored,
-            held.declared,
-            id.name.as_str(),
-            span,
-        )?;
+        self.store_name(table, function, id.name.as_str(), id.span, stored, span)
+    }
+
+    fn store_name(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        name: &str,
+        at: oxc_span::Span,
+        value: ValueId,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let held = self.bound(name, at)?;
+        let stored = self.kept(table, function, value, held.declared, name, span)?;
         self.scope.insert(
-            id.name.to_string(),
+            name.to_string(),
             Binding {
                 value: stored,
                 declared: held.declared,

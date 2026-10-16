@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use oxc_ast::ast::{
-    AssignmentTarget, Expression, ForStatementInit, SimpleAssignmentTarget, Statement,
+    AssignmentTarget, AssignmentTargetMaybeDefault, AssignmentTargetProperty, Expression,
+    ForStatementInit, SimpleAssignmentTarget, Statement,
 };
 
 #[must_use]
@@ -100,12 +101,59 @@ fn walk_statement(statement: &Statement<'_>, found: &mut BTreeSet<String>) {
     }
 }
 
+fn walk_target(target: &AssignmentTarget<'_>, found: &mut BTreeSet<String>) {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            found.insert(id.name.to_string());
+        }
+        AssignmentTarget::ArrayAssignmentTarget(array) => {
+            for element in array.elements.iter().flatten() {
+                walk_maybe_defaulted(element, found);
+            }
+            if let Some(rest) = &array.rest {
+                walk_target(&rest.target, found);
+            }
+        }
+        AssignmentTarget::ObjectAssignmentTarget(object) => {
+            for property in &object.properties {
+                match property {
+                    AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(shorthand) => {
+                        found.insert(shorthand.binding.name.to_string());
+                        if let Some(init) = &shorthand.init {
+                            walk_expression(init, found);
+                        }
+                    }
+                    AssignmentTargetProperty::AssignmentTargetPropertyProperty(renamed) => {
+                        walk_maybe_defaulted(&renamed.binding, found);
+                    }
+                }
+            }
+            if let Some(rest) = &object.rest {
+                walk_target(&rest.target, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_maybe_defaulted(target: &AssignmentTargetMaybeDefault<'_>, found: &mut BTreeSet<String>) {
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(with) => {
+            walk_target(&with.binding, found);
+            walk_expression(&with.init, found);
+        }
+        other => {
+            if let Some(plain) = other.as_assignment_target() {
+                walk_target(plain, found);
+            }
+        }
+    }
+}
+
 fn walk_expression(expression: &Expression<'_>, found: &mut BTreeSet<String>) {
     match expression {
         Expression::AssignmentExpression(assignment) => {
-            if let AssignmentTarget::AssignmentTargetIdentifier(id) = &assignment.left {
-                found.insert(id.name.to_string());
-            }
+            walk_target(&assignment.left, found);
             walk_expression(&assignment.right, found);
         }
         Expression::UpdateExpression(update) => {

@@ -111,3 +111,26 @@ export function firstRouteHandler(routes: Route[], fallback: Route): string {
   const [{ handler } = fallback] = routes;
   return handler;
 }
+
+export interface Sample {
+  label: string;
+  millis: number;
+}
+
+export function slowest(samples: readonly Sample[]): Sample {
+  let label = "";
+  let millis = 0;
+  for (const sample of samples) {
+    if (sample.millis > millis) {
+      ({ label, millis } = sample);
+    }
+  }
+  return { label: label, millis: millis };
+}
+
+export function swapped(pair: [number, number]): [number, number] {
+  let left = 0;
+  let right = 0;
+  [left, right] = pair;
+  return [right, left];
+}
