@@ -1,5 +1,5 @@
 use savitar_ir::{BinaryOp, UnaryOp};
-use savitar_types::{Field, TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, TypeId, TypeKind, TypeTable};
 
 #[must_use]
 pub fn is_numeric(table: &TypeTable, id: TypeId) -> bool {
@@ -420,18 +420,33 @@ pub fn field_result(table: &mut TypeTable, object: TypeId, name: &str) -> Result
         }
         return Ok(table.union(held));
     }
-    let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
+    let TypeKind::Object { fields, indexes } = table.kind(object).clone() else {
         return Err(format!(
             "`{name}` is read from something with no declared shape"
         ));
     };
     let Some(field) = fields.into_iter().find(|field| field.name == name) else {
-        return Err(format!("the shape declares no field `{name}`"));
+        return index_result(table, &indexes, name);
     };
     if field.optional {
         return Ok(table.optional(field.type_id));
     }
     Ok(field.type_id)
+}
+
+fn index_result(
+    table: &mut TypeTable,
+    indexes: &[IndexSignature],
+    name: &str,
+) -> Result<TypeId, String> {
+    let key = table.intern(TypeKind::StringLiteral(name.to_string()));
+    let matched = indexes
+        .iter()
+        .find(|signature| signature.key == key || key_accepts(table, signature.key, key));
+    match matched {
+        Some(signature) => Ok(table.optional(signature.value)),
+        None => Err(format!("the shape declares no field `{name}`")),
+    }
 }
 
 pub fn element_result(

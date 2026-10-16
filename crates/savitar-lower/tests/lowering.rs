@@ -7653,3 +7653,197 @@ fn a_patterned_parameter_after_one_that_branches_still_reads_from_its_own_value(
     assert_eq!(function.type_of(function.parameters()[1]), line);
     assert_eq!(function.type_of(returned_value(function)), number);
 }
+
+fn counted_by_text(table: &mut TypeTable, readonly: bool) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly,
+        }],
+    )
+}
+
+#[test]
+fn a_field_only_an_index_signature_declares_is_read_through_it_carrying_undefined() {
+    let source = "function lookup(counts: Record<string, number>): number | undefined {\n  return counts.total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let counts = counted_by_text(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, maybe)),
+            ("counts", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), maybe);
+}
+
+#[test]
+fn an_object_pattern_over_an_index_signature_binds_the_value_with_undefined() {
+    let source = "function lookup(counts: Record<string, number>): number | undefined {\n  const { total } = counts;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let counts = counted_by_text(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, maybe)),
+            ("counts", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let read = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::ReadField { name, .. },
+                ..
+            } if name == "total" => Some(*target),
+            _ => None,
+        })
+        .expect("the pattern should read the field through the index signature");
+    assert_eq!(function.type_of(read), maybe);
+}
+
+#[test]
+fn a_readonly_index_signature_answers_the_read_like_a_mutable_one() {
+    let source = "function lookup(counts: Record<string, number>): number | undefined {\n  const { total } = counts;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let counts = counted_by_text(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, maybe)),
+            ("counts", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(function.type_of(returned_value(function)), maybe);
+}
+
+#[test]
+fn a_named_field_wins_over_the_index_signature_that_also_keys_it() {
+    let source = "function lookup(counts: Totals): number {\n  const { total } = counts;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let counts = table.object_with_indexes(
+        vec![Field {
+            name: "total".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        }],
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: false,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, number)),
+            ("counts", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_pattern_key_that_is_a_name_never_reaches_a_numeric_index_signature() {
+    let source = "function lookup(labels: Record<number, string>): string | undefined {\n  const { total } = labels;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let maybe = table.optional(text);
+    let labels = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: number,
+            value: text,
+            readonly: false,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, maybe)),
+            ("labels", Answer::Known(labels)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn an_object_pattern_over_a_union_reads_the_index_signature_of_the_member_without_the_field() {
+    let source = "function lookup(bag: Bag): number | undefined {\n  const { total } = bag;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let named = table.object(vec![Field {
+        name: "total".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let counted = counted_by_text(&mut table, false);
+    let bag = table.union(vec![named, counted]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("lookup", returning(&mut table, maybe)),
+            ("bag", Answer::Known(bag)),
+        ],
+    );
+    let file = SourceFile::new("lookup.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), maybe);
+}

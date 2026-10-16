@@ -181,3 +181,16 @@ export function signalLabel(signal: Signal): string {
   }
   return `down ${at}`;
 }
+
+export function hostOf(env: Record<string, string>): string {
+  const { HOST } = env;
+  if (HOST === undefined) {
+    return "localhost";
+  }
+  return HOST;
+}
+
+export function retriesOf(settings: Record<string, number>): number {
+  const { retries = 3 } = settings;
+  return retries;
+}
