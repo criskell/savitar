@@ -6740,6 +6740,11 @@ fn a_rest_in_an_object_pattern_over_a_shape_with_an_index_signature_is_refused()
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("index signature"),
+        "the rest refuses, and the read of the named key no longer does: {}",
+        report.diagnostics[0].message
+    );
 }
 
 #[test]
