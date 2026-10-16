@@ -4970,6 +4970,186 @@ fn an_optional_discriminant_field_narrows_nothing_because_it_may_be_absent() {
 }
 
 #[test]
+fn a_switch_case_narrows_the_discriminant_to_the_member_its_label_names() {
+    let source = "function use(frame: Frame): number {\n  switch (frame.kind) {\n    case \"binary\":\n      return count(frame);\n    default:\n      return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let counts = taking(&mut table, shapes.binary, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("count", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.binary),
+        "the body of the case holds the member the label names"
+    );
+}
+
+#[test]
+fn the_default_of_a_switch_drops_every_member_a_label_decided() {
+    let source = "function use(frame: Frame): string {\n  switch (frame.kind) {\n    case \"binary\":\n      return \"\";\n    default:\n      return label(frame);\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let labels = taking(&mut table, shapes.text, text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, text)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("label", Answer::Known(labels)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&shapes.text),
+        "the default holds what no label named"
+    );
+}
+
+#[test]
+fn a_case_with_several_labels_narrows_the_name_to_the_union_of_them() {
+    let source = "function use(kind: Kind): number {\n  switch (kind) {\n    case \"a\":\n    case \"b\":\n      return early(kind);\n    default:\n      return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let first = table.intern(TypeKind::StringLiteral("a".to_string()));
+    let second = table.intern(TypeKind::StringLiteral("b".to_string()));
+    let third = table.intern(TypeKind::StringLiteral("c".to_string()));
+    let any_of_three = table.union(vec![first, second, third]);
+    let first_two = table.union(vec![first, second]);
+    let earlier = taking(&mut table, first_two, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("kind", Answer::Known(any_of_three)),
+            ("early", Answer::Known(earlier)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&first_two),
+        "the body both labels reach holds either of them"
+    );
+}
+
+#[test]
+fn the_default_of_a_switch_over_a_name_keeps_only_the_label_nobody_wrote() {
+    let source = "function use(kind: Kind): number {\n  switch (kind) {\n    case \"a\":\n      return 1;\n    case \"b\":\n      return 2;\n    default:\n      return late(kind);\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let first = table.intern(TypeKind::StringLiteral("a".to_string()));
+    let second = table.intern(TypeKind::StringLiteral("b".to_string()));
+    let third = table.intern(TypeKind::StringLiteral("c".to_string()));
+    let any_of_three = table.union(vec![first, second, third]);
+    let later = taking(&mut table, third, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("kind", Answer::Known(any_of_three)),
+            ("late", Answer::Known(later)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&third),
+        "the default holds the only label the switch left out"
+    );
+}
+
+#[test]
+fn a_case_whose_label_is_not_a_literal_narrows_nothing() {
+    let source = "function use(kind: Kind, other: string): number {\n  switch (kind) {\n    case other:\n      return 1;\n    default:\n      return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let first = table.intern(TypeKind::StringLiteral("a".to_string()));
+    let second = table.intern(TypeKind::StringLiteral("b".to_string()));
+    let either = table.union(vec![first, second]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("kind", Answer::Known(either)),
+            ("other", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        narrowed(&report.functions[0]),
+        Vec::new(),
+        "a label the compiler cannot read decides nothing, in its case or in the default"
+    );
+}
+
+#[test]
+fn a_case_fallen_into_from_the_default_narrows_nothing_because_the_two_paths_disagree() {
+    let source = "function use(kind: Kind): number {\n  switch (kind) {\n    default:\n    case \"a\":\n      return 1;\n    case \"b\":\n      return 2;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let first = table.intern(TypeKind::StringLiteral("a".to_string()));
+    let second = table.intern(TypeKind::StringLiteral("b".to_string()));
+    let third = table.intern(TypeKind::StringLiteral("c".to_string()));
+    let any_of_three = table.union(vec![first, second, third]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("kind", Answer::Known(any_of_three)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let narrowings = narrowed(&report.functions[0]);
+    assert!(
+        narrowings.contains(&third) && narrowings.contains(&second),
+        "the default and the case nobody runs into still narrow"
+    );
+    assert!(
+        !narrowings.contains(&first),
+        "the case the default runs into is reached by two disagreeing paths and stays wide"
+    );
+}
+
+#[test]
 fn a_name_assigned_inside_a_nested_for_of_is_carried_by_the_outer_loop() {
     let source = "function total(rows: number[], limit: number): number {\n  let sum = 0;\n  while (sum < limit) {\n    for (const row of rows) {\n      sum = sum + row;\n    }\n  }\n  return sum;\n}\n";
     let mut table = TypeTable::new();

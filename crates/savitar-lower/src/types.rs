@@ -107,11 +107,11 @@ pub fn with_only_discriminant(
     table: &mut TypeTable,
     id: TypeId,
     field: &str,
-    literal: &TypeKind,
+    literals: &[TypeKind],
 ) -> Option<TypeId> {
     keeping(table, id, |table, member| {
         match decided_field_kinds(table, member, field) {
-            Some(kinds) => kinds.iter().any(|kind| kind == literal),
+            Some(kinds) => kinds.iter().any(|kind| literals.contains(kind)),
             None => true,
         }
     })
@@ -122,14 +122,61 @@ pub fn without_discriminant(
     table: &mut TypeTable,
     id: TypeId,
     field: &str,
-    literal: &TypeKind,
+    literals: &[TypeKind],
 ) -> Option<TypeId> {
     keeping(table, id, |table, member| {
         match decided_field_kinds(table, member, field) {
-            Some(kinds) => kinds.iter().any(|kind| kind != literal),
+            Some(kinds) => kinds.iter().any(|kind| !literals.contains(kind)),
             None => true,
         }
     })
+}
+
+#[must_use]
+pub fn with_only_literals(
+    table: &mut TypeTable,
+    id: TypeId,
+    literals: &[TypeKind],
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        literals
+            .iter()
+            .any(|literal| may_hold_literal(table, member, literal))
+    })
+}
+
+#[must_use]
+pub fn without_literals(
+    table: &mut TypeTable,
+    id: TypeId,
+    literals: &[TypeKind],
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        !literals.contains(table.kind(member))
+    })
+}
+
+#[must_use]
+pub fn label_literal(table: &TypeTable, label: TypeId) -> Option<TypeKind> {
+    match table.kind(label) {
+        kind @ (TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_)
+        | TypeKind::Null
+        | TypeKind::Undefined) => Some(kind.clone()),
+        _ => None,
+    }
+}
+
+fn may_hold_literal(table: &TypeTable, member: TypeId, literal: &TypeKind) -> bool {
+    let held = table.kind(member);
+    held == literal
+        || matches!(
+            (held, literal),
+            (TypeKind::String, TypeKind::StringLiteral(_))
+                | (TypeKind::Number, TypeKind::NumberLiteral(_))
+                | (TypeKind::Boolean, TypeKind::BooleanLiteral(_))
+        )
 }
 
 fn keeping(

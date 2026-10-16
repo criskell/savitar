@@ -116,7 +116,68 @@ struct Tested {
 enum Fact {
     Nullish(TypeKind),
     Primitive(String),
-    Discriminant { field: String, literal: TypeKind },
+    Discriminant {
+        field: String,
+        literals: Vec<TypeKind>,
+    },
+    Among(Vec<TypeKind>),
+}
+
+struct Subject {
+    name: String,
+    field: Option<String>,
+}
+
+impl Subject {
+    fn fact_about(&self, literals: Vec<TypeKind>) -> Fact {
+        match &self.field {
+            Some(field) => Fact::Discriminant {
+                field: field.clone(),
+                literals,
+            },
+            None => Fact::Among(literals),
+        }
+    }
+}
+
+enum CaseEntry {
+    Matched(Vec<TypeKind>),
+    Unmatched,
+    Undecided,
+}
+
+impl CaseEntry {
+    fn fallen_into_from(self, earlier: &CaseEntry) -> CaseEntry {
+        match (self, earlier) {
+            (CaseEntry::Matched(mut held), CaseEntry::Matched(more)) => {
+                held.extend(more.iter().cloned());
+                CaseEntry::Matched(held)
+            }
+            _ => CaseEntry::Undecided,
+        }
+    }
+}
+
+fn case_entries(
+    statement: &oxc_ast::ast::SwitchStatement<'_>,
+    literals: &[Option<TypeKind>],
+) -> Vec<CaseEntry> {
+    let mut entries: Vec<CaseEntry> = Vec::with_capacity(literals.len());
+    for (position, case) in statement.cases.iter().enumerate() {
+        let reached = match (&case.test, &literals[position]) {
+            (None, _) => CaseEntry::Unmatched,
+            (Some(_), Some(literal)) => CaseEntry::Matched(vec![literal.clone()]),
+            (Some(_), None) => CaseEntry::Undecided,
+        };
+        let entry = match position.checked_sub(1) {
+            Some(earlier) if statement.cases[earlier].consequent.is_empty() => {
+                reached.fallen_into_from(&entries[earlier])
+            }
+            _ => reached,
+        };
+        entries.push(entry);
+    }
+    entries
 }
 
 enum Written<'target, 'source> {
@@ -1524,7 +1585,10 @@ impl Context<'_> {
         {
             return Some(Tested {
                 name,
-                fact: Fact::Discriminant { field, literal },
+                fact: Fact::Discriminant {
+                    field,
+                    literals: vec![literal],
+                },
                 equal,
             });
         }
@@ -1589,11 +1653,18 @@ impl Context<'_> {
                     types::without_typeof(table, held, word)
                 }
             }
-            Fact::Discriminant { field, literal } => {
+            Fact::Discriminant { field, literals } => {
                 if asserted {
-                    types::with_only_discriminant(table, held, field, literal)
+                    types::with_only_discriminant(table, held, field, literals)
                 } else {
-                    types::without_discriminant(table, held, field, literal)
+                    types::without_discriminant(table, held, field, literals)
+                }
+            }
+            Fact::Among(literals) => {
+                if asserted {
+                    types::with_only_literals(table, held, literals)
+                } else {
+                    types::without_literals(table, held, literals)
                 }
             }
         };
@@ -1605,6 +1676,45 @@ impl Context<'_> {
         }
         let value = self.assign(function, narrowed, Rvalue::Narrow(value), span);
         self.scope.insert(tested.name.clone(), value);
+    }
+
+    fn switch_subject(&self, discriminant: &Expression<'_>) -> Option<Subject> {
+        if let Some(name) = self.name_in_scope(discriminant) {
+            return Some(Subject { name, field: None });
+        }
+        let (name, field) = self.field_of_name_in_scope(discriminant)?;
+        Some(Subject {
+            name,
+            field: Some(field),
+        })
+    }
+
+    fn narrow_in_case(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        subject: Option<&Subject>,
+        entry: &CaseEntry,
+        decided: &[TypeKind],
+        span: oxc_span::Span,
+    ) {
+        let Some(subject) = subject else {
+            return;
+        };
+        let (literals, equal) = match entry {
+            CaseEntry::Matched(literals) => (literals.clone(), true),
+            CaseEntry::Unmatched => (decided.to_vec(), false),
+            CaseEntry::Undecided => return,
+        };
+        if literals.is_empty() {
+            return;
+        }
+        let tested = Tested {
+            name: subject.name.clone(),
+            fact: subject.fact_about(literals),
+            equal,
+        };
+        self.narrow_by_test(table, function, Some(&tested), true, span);
     }
 
     fn lower_if(
@@ -1835,12 +1945,14 @@ impl Context<'_> {
             .map(|position| bodies[position]);
 
         let mut labels = Vec::with_capacity(statement.cases.len());
+        let mut case_literals: Vec<Option<TypeKind>> = vec![None; statement.cases.len()];
         for (position, case) in statement.cases.iter().enumerate() {
             let Some(test) = &case.test else {
                 continue;
             };
             let label = self.lower_expression(table, function, test)?;
             labels.push(function.type_of(label));
+            case_literals[position] = types::label_literal(table, function.type_of(label));
             let matched = self.combine(
                 table,
                 function,
@@ -1883,6 +1995,10 @@ impl Context<'_> {
             }
         }
 
+        let subject = self.switch_subject(&statement.discriminant);
+        let entries = case_entries(statement, &case_literals);
+        let decided: Vec<TypeKind> = case_literals.iter().flatten().cloned().collect();
+
         let outer_breaks = std::mem::take(&mut self.breaks);
         self.enclosing.push(Breakable::Switch(join));
         let last = statement.cases.len().saturating_sub(1);
@@ -1890,6 +2006,14 @@ impl Context<'_> {
             self.current = bodies[position];
             self.statements.clear();
             self.scope = before.clone();
+            self.narrow_in_case(
+                table,
+                function,
+                subject.as_ref(),
+                &entries[position],
+                &decided,
+                case.span,
+            );
             let flow = self.lower_statements(table, function, &case.consequent)?;
             if !flow.continues() {
                 continue;

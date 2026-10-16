@@ -32,3 +32,54 @@ export function portOf(setting: number | Resolver): number {
   }
   return setting;
 }
+
+export type GetRequest = { method: "get"; query: string };
+
+export type PostRequest = { method: "post"; body: JsonBody };
+
+export type DeleteRequest = { method: "delete"; target: number };
+
+export type Request = GetRequest | PostRequest | DeleteRequest;
+
+export function getCost(request: GetRequest): number {
+  return request.query.length;
+}
+
+export function postCost(request: PostRequest): number {
+  return request.body.size;
+}
+
+export function deleteCost(request: DeleteRequest): number {
+  return request.target;
+}
+
+export function requestCost(request: Request): number {
+  switch (request.method) {
+    case "get":
+      return getCost(request);
+    case "post":
+      return postCost(request);
+    default:
+      return deleteCost(request);
+  }
+}
+
+export type Verb = "get" | "head" | "post";
+
+export function cachedCost(verb: "get" | "head", base: number): number {
+  return verb === "head" ? base : base + 1;
+}
+
+export function writtenCost(verb: "post", base: number): number {
+  return base + 2;
+}
+
+export function verbCost(verb: Verb, base: number): number {
+  switch (verb) {
+    case "get":
+    case "head":
+      return cachedCost(verb, base);
+    default:
+      return writtenCost(verb, base);
+  }
+}
