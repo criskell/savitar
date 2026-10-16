@@ -3181,24 +3181,50 @@ fn an_array_pattern_over_a_tuple_keeps_each_position_exact() {
 }
 
 #[test]
-fn an_array_pattern_with_a_hole_is_refused() {
-    let source = "function head(parts: string[]): string[] {\n  const [, ...rest] = parts;\n  return rest;\n}\n";
+fn an_array_pattern_with_a_hole_reads_nothing_at_that_position() {
+    let source = "function tail(parts: string[]): string[] {\n  const [, ...rest] = parts;\n  return rest;\n}\n";
     let mut table = TypeTable::new();
     let text = table.intern(TypeKind::String);
     let texts = table.intern(TypeKind::Array(text));
     let provider = ByName::new(
         source,
         vec![
-            ("head", returning(&mut table, texts)),
+            ("tail", returning(&mut table, texts)),
             ("parts", Answer::Known(texts)),
         ],
     );
-    let file = SourceFile::new("head.ts", source);
+    let file = SourceFile::new("tail.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        !only_block(function)
+            .statements
+            .iter()
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::ReadElement { .. },
+                    ..
+                }
+            )),
+        "a hole binds no name, so nothing is read for it"
+    );
+    let sliced = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                value: Rvalue::Slice { from, .. },
+                ..
+            } => Some(*from),
+            _ => None,
+        })
+        .expect("the rest should be sliced");
+    assert_eq!(sliced, 1, "the hole still takes up its position");
 }
 
 #[test]
@@ -6015,4 +6041,188 @@ fn a_default_in_a_pattern_that_assigns_to_a_name_is_refused() {
 
     assert!(report.functions.is_empty());
     assert!(!report.diagnostics.is_empty());
+}
+
+#[test]
+fn a_hole_in_the_middle_of_an_array_pattern_keeps_the_later_positions_exact() {
+    let source = "function second(pair: [number, string]): string {\n  const [, right] = pair;\n  return right;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let pair = table.tuple(vec![number, text], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("second", returning(&mut table, text)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
+    let file = SourceFile::new("second.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.type_of(returned_value(function)),
+        text,
+        "the name after the hole reads position one, not position zero"
+    );
+}
+
+#[test]
+fn a_rest_in_an_object_pattern_keeps_the_fields_no_name_took() {
+    let source = "function other(route: Route): string {\n  const { timeout, ...rest } = route;\n  return rest.handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("other", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("other.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let rest = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Rest { taken, .. },
+                ..
+            } => Some((*target, taken.clone())),
+            _ => None,
+        })
+        .expect("the rest should be taken from the object");
+    assert_eq!(rest.1, vec!["timeout".to_string()]);
+    let kept = table.object(vec![Field {
+        name: "handler".to_string(),
+        type_id: text,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    assert_eq!(
+        function.type_of(rest.0),
+        kept,
+        "the rest holds every field the pattern left behind, and nothing else"
+    );
+}
+
+#[test]
+fn a_rest_in_an_object_pattern_keeps_an_optional_field_optional() {
+    let source = "function other(route: Route): number | undefined {\n  const { handler, ...rest } = route;\n  return rest.timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let maybe = table.optional(number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("other", returning(&mut table, maybe)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("other.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let kept = table.object(vec![Field {
+        name: "timeout".to_string(),
+        type_id: number,
+        optional: true,
+        method: false,
+        readonly: false,
+    }]);
+    let rest = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Rest { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the rest should be taken from the object");
+    assert_eq!(function.type_of(rest), kept);
+}
+
+#[test]
+fn a_rest_in_an_object_pattern_over_a_shape_with_an_index_signature_is_refused() {
+    let source = "function other(counts: Record<string, number>): number {\n  const { total, ...rest } = counts;\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let counts = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: false,
+        }],
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("other", returning(&mut table, number)),
+            ("counts", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("other.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+#[test]
+fn a_rest_in_an_object_pattern_that_would_carry_a_method_is_refused() {
+    let source = "function other(clock: Clock): number {\n  const { now, ...rest } = clock;\n  return now;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let reader = table.function(Vec::new(), number);
+    let clock = table.object(vec![
+        Field {
+            name: "now".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "tick".to_string(),
+            type_id: reader,
+            optional: false,
+            method: true,
+            readonly: false,
+        },
+    ]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("other", returning(&mut table, number)),
+            ("clock", Answer::Known(clock)),
+        ],
+    );
+    let file = SourceFile::new("other.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
 }

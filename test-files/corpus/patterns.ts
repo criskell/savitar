@@ -55,3 +55,29 @@ export function attemptsOf(retry: Retry): number | null {
   const { attempts = 3 } = retry;
   return attempts;
 }
+
+export interface Header {
+  name: string;
+  value: string;
+}
+
+export function valueOfSecond(pair: [Header, Header]): string {
+  const [, second] = pair;
+  return second.value;
+}
+
+export interface Incoming {
+  path: string;
+  token: string;
+  bytes: number;
+}
+
+export interface Loggable {
+  path: string;
+  bytes: number;
+}
+
+export function withoutToken(incoming: Incoming): Loggable {
+  const { token, ...safe } = incoming;
+  return safe;
+}

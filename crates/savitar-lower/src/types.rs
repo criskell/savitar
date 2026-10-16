@@ -626,6 +626,32 @@ pub fn takes_type_arguments(table: &TypeTable, signature: TypeId) -> bool {
     )
 }
 
+pub fn object_rest_of(
+    table: &mut TypeTable,
+    source: TypeId,
+    taken: &[String],
+) -> Result<TypeId, String> {
+    let TypeKind::Object { fields, indexes } = table.kind(source).clone() else {
+        return Err("a rest in an object pattern needs a declared shape to take from".to_string());
+    };
+    if !indexes.is_empty() {
+        return Err(
+            "a rest over a shape with an index signature is not lowered yet, because the keys it carries are not named".to_string(),
+        );
+    }
+    let kept: Vec<Field> = fields
+        .into_iter()
+        .filter(|field| !taken.contains(&field.name))
+        .collect();
+    if let Some(method) = kept.iter().find(|field| field.method) {
+        return Err(format!(
+            "`{}` is a method, and a rest cannot show a method is copied",
+            method.name
+        ));
+    }
+    Ok(table.object(kept))
+}
+
 pub fn rest_of(table: &mut TypeTable, source: TypeId, from: u32) -> Result<TypeId, String> {
     match table.kind(source).clone() {
         TypeKind::Array(element) | TypeKind::ReadonlyArray(element) => {

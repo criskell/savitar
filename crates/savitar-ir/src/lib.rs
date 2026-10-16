@@ -96,6 +96,10 @@ pub enum Rvalue {
         array: ValueId,
         from: u32,
     },
+    Rest {
+        object: ValueId,
+        taken: Vec<String>,
+    },
     NewObject {
         fields: Vec<(String, ValueId)>,
     },

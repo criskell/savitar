@@ -2874,11 +2874,7 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         for (position, element) in pattern.elements.iter().enumerate() {
             let Some(element) = element.as_ref() else {
-                return Err(vec![refuse(
-                    "unsupported-pattern",
-                    pattern.span,
-                    "a hole in an array pattern is not lowered yet",
-                )]);
+                continue;
             };
             let at = element.span();
             let index = self.index_constant(table, function, position, at);
@@ -2924,18 +2920,40 @@ impl Context<'_> {
         pattern: &oxc_ast::ast::ObjectPattern<'_>,
         source: ValueId,
     ) -> Result<(), Vec<Diagnostic>> {
+        let mut taken = Vec::with_capacity(pattern.properties.len());
         for property in &pattern.properties {
             let name = self.pattern_key(property)?;
             let value = self.read_field_at(table, function, source, &name, property.span)?;
+            taken.push(name);
             self.bind_pattern(table, function, &property.value, value)?;
         }
 
         if let Some(rest) = &pattern.rest {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                rest.span,
-                "a rest in an object pattern is not lowered yet",
-            )]);
+            let BindingPattern::BindingIdentifier(id) = &rest.argument else {
+                return Err(vec![refuse(
+                    "unsupported-pattern",
+                    rest.span,
+                    "a rest in an object pattern that binds anything but a plain name is not lowered yet",
+                )]);
+            };
+            let ty = types::object_rest_of(table, function.type_of(source), &taken)
+                .map_err(|reason| vec![refuse("unsupported-pattern", rest.span, reason)])?;
+            let value = self.assign(
+                function,
+                ty,
+                Rvalue::Rest {
+                    object: source,
+                    taken,
+                },
+                id.span,
+            );
+            self.declare(
+                id.name.as_str(),
+                Binding {
+                    value,
+                    declared: ty,
+                },
+            );
         }
         Ok(())
     }
