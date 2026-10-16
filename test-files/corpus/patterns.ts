@@ -164,3 +164,20 @@ export function labelsOf(samples: readonly Sample[]): string {
   }
   return joined;
 }
+
+export type Signal =
+  | { kind: "started"; at: number }
+  | { kind: "stopped"; at: number };
+
+export function signalKind(signal: Signal): string {
+  const { kind } = signal;
+  return kind;
+}
+
+export function signalLabel(signal: Signal): string {
+  const { kind, at } = signal;
+  if (kind === "started") {
+    return `up ${at}`;
+  }
+  return `down ${at}`;
+}
