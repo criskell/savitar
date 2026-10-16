@@ -1,8 +1,10 @@
 mod assign;
+mod generic;
 
 use std::collections::HashMap;
 
 pub use assign::assignable;
+pub use generic::{Bindings, infer, mentions_a_type_parameter, substitute};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId(u32);
@@ -812,6 +814,70 @@ mod tests {
         assert!(assignable(&table, mutable, frozen));
         assert!(assignable(&table, frozen_zeroes, frozen));
         assert!(!assignable(&table, frozen_zeroes, mutable));
+    }
+
+    #[test]
+    fn substituting_a_recursive_shape_that_carries_a_type_parameter_is_refused() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let held = table.fresh_type_parameter();
+        let chain = table.reserve();
+        let node = table.object(vec![
+            Field {
+                name: "value".to_string(),
+                type_id: held,
+                optional: false,
+                method: false,
+                readonly: false,
+            },
+            Field {
+                name: "next".to_string(),
+                type_id: chain,
+                optional: false,
+                method: false,
+                readonly: false,
+            },
+        ]);
+        table.fill(chain, table.kind(node).clone());
+        let mut bindings = Bindings::new();
+        bindings.insert(held, number);
+
+        assert!(substitute(&mut table, chain, &bindings).is_err());
+        assert!(
+            substitute(&mut table, held, &bindings).is_ok(),
+            "the plain type parameter still stands for what it was bound to"
+        );
+    }
+
+    #[test]
+    fn inference_walks_into_an_array_and_a_shape() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let held = table.fresh_type_parameter();
+        let of_held = table.intern(TypeKind::ReadonlyArray(held));
+        let numbers = table.intern(TypeKind::Array(number));
+        let mut bindings = Bindings::new();
+
+        assert!(infer(&table, of_held, numbers, &mut bindings).is_ok());
+        assert_eq!(bindings.get(&held), Some(&number));
+
+        let boxed_held = table.object(vec![Field {
+            name: "value".to_string(),
+            type_id: held,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+        let boxed_number = table.object(vec![Field {
+            name: "value".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+        let mut bindings = Bindings::new();
+        assert!(infer(&table, boxed_held, boxed_number, &mut bindings).is_ok());
+        assert_eq!(bindings.get(&held), Some(&number));
     }
 
     #[test]

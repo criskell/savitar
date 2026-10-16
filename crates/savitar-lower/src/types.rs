@@ -345,6 +345,17 @@ pub fn contextual_elements(
     }
 }
 
+#[must_use]
+pub fn takes_type_arguments(table: &TypeTable, signature: TypeId) -> bool {
+    matches!(
+        table.kind(signature),
+        TypeKind::Function {
+            type_parameters,
+            ..
+        } if !type_parameters.is_empty()
+    )
+}
+
 pub fn argument_types(
     table: &TypeTable,
     callee: TypeId,

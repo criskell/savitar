@@ -797,6 +797,134 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
 }
 
 #[test]
+fn a_generic_call_takes_its_type_argument_from_the_argument_it_is_given() {
+    let source =
+        "function head(items: number[]): number | undefined {\n  return firstOf(items);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let numbers = table.intern(TypeKind::Array(number));
+    let maybe = table.optional(number);
+    let held = table.fresh_type_parameter();
+    let of_held = table.intern(TypeKind::ReadonlyArray(held));
+    let maybe_held = table.optional(held);
+    let first_of = table.generic_function(
+        vec![held],
+        vec![savitar_types::Parameter {
+            type_id: of_held,
+            rest: false,
+        }],
+        maybe_held,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("head", returning(&mut table, maybe)),
+            ("items", Answer::Known(numbers)),
+            ("firstOf", Answer::Known(first_of)),
+        ],
+    );
+    let file = SourceFile::new("head.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let called = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Call { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the call should be lowered");
+    assert_eq!(
+        function.type_of(called),
+        maybe,
+        "the type parameter stands for the element of the array it was given"
+    );
+}
+
+#[test]
+fn a_generic_call_with_nothing_to_bind_its_type_parameter_is_refused() {
+    let source = "function head(): number {\n  return makeOne();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let held = table.fresh_type_parameter();
+    let make_one = table.generic_function(vec![held], Vec::new(), held);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("head", returning(&mut table, number)),
+            ("makeOne", Answer::Known(make_one)),
+        ],
+    );
+    let file = SourceFile::new("head.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("nothing to stand for"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_generic_call_that_binds_one_type_parameter_twice_is_refused() {
+    let source =
+        "function join(left: number, right: string): number {\n  return pick(left, right);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let held = table.fresh_type_parameter();
+    let pick = table.generic_function(
+        vec![held],
+        vec![
+            savitar_types::Parameter {
+                type_id: held,
+                rest: false,
+            },
+            savitar_types::Parameter {
+                type_id: held,
+                rest: false,
+            },
+        ],
+        held,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("join", returning(&mut table, number)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(text)),
+            ("pick", Answer::Known(pick)),
+        ],
+    );
+    let file = SourceFile::new("join.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("two different types"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
 fn a_returned_value_the_declared_type_does_not_admit_is_refused() {
     let source = "function count(label: string): number {\n  return label;\n}\n";
     let mut table = TypeTable::new();

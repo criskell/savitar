@@ -628,6 +628,107 @@ impl Context<'_> {
         Ok(self.coerced(function, table, value, slot, span))
     }
 
+    fn lower_call(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        call: &oxc_ast::ast::CallExpression<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let callee = self.lower_expression(table, function, &call.callee)?;
+        let signature = function.type_of(callee);
+        let returns = types::call_result(table, signature)
+            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+        let wanted = types::argument_types(table, signature, call.arguments.len())
+            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+
+        let mut expressions = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            let Argument::SpreadElement(_) = argument else {
+                let Some(expression) = argument.as_expression() else {
+                    return Err(vec![refuse(
+                        "unsupported-expression",
+                        call.span,
+                        "an argument that is not an expression is not lowered yet",
+                    )]);
+                };
+                expressions.push(expression);
+                continue;
+            };
+            return Err(vec![refuse(
+                "unsupported-expression",
+                call.span,
+                "a spread argument is not lowered yet",
+            )]);
+        }
+
+        if types::takes_type_arguments(table, signature) {
+            return self.lower_generic_call(table, function, call, callee, &wanted, &expressions);
+        }
+
+        let mut arguments = Vec::with_capacity(expressions.len());
+        for (position, expression) in expressions.iter().enumerate() {
+            let slot = wanted[position];
+            let value = self.lower_expression_expecting(table, function, expression, Some(slot))?;
+            arguments.push(self.argued(table, function, value, slot, expression.span())?);
+        }
+        Ok(self.assign(
+            function,
+            returns,
+            Rvalue::Call { callee, arguments },
+            call.span,
+        ))
+    }
+
+    fn lower_generic_call(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        call: &oxc_ast::ast::CallExpression<'_>,
+        callee: ValueId,
+        wanted: &[TypeId],
+        expressions: &[&Expression<'_>],
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let mut values = Vec::with_capacity(expressions.len());
+        for expression in expressions {
+            values.push(self.lower_expression(table, function, expression)?);
+        }
+
+        let mut bindings = savitar_types::Bindings::new();
+        for (position, value) in values.iter().enumerate() {
+            savitar_types::infer(
+                table,
+                wanted[position],
+                function.type_of(*value),
+                &mut bindings,
+            )
+            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+        }
+
+        let mut arguments = Vec::with_capacity(values.len());
+        for (position, value) in values.iter().enumerate() {
+            let slot = savitar_types::substitute(table, wanted[position], &bindings)
+                .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+            arguments.push(self.argued(
+                table,
+                function,
+                *value,
+                slot,
+                expressions[position].span(),
+            )?);
+        }
+
+        let returns = types::call_result(table, function.type_of(callee))
+            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+        let returns = savitar_types::substitute(table, returns, &bindings)
+            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+        Ok(self.assign(
+            function,
+            returns,
+            Rvalue::Call { callee, arguments },
+            call.span,
+        ))
+    }
+
     fn argued(
         &mut self,
         table: &mut TypeTable,
@@ -1875,42 +1976,7 @@ impl Context<'_> {
                 let ty = table.intern(TypeKind::Array(element));
                 Ok(self.assign(function, ty, Rvalue::NewArray { elements }, array.span))
             }
-            Expression::CallExpression(call) => {
-                let callee = self.lower_expression(table, function, &call.callee)?;
-                let ty = types::call_result(table, function.type_of(callee))
-                    .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
-                let wanted =
-                    types::argument_types(table, function.type_of(callee), call.arguments.len())
-                        .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
-                let mut arguments = Vec::with_capacity(call.arguments.len());
-                for (position, argument) in call.arguments.iter().enumerate() {
-                    let Argument::SpreadElement(_) = argument else {
-                        let Some(expression) = argument.as_expression() else {
-                            return Err(vec![refuse(
-                                "unsupported-expression",
-                                call.span,
-                                "an argument that is not an expression is not lowered yet",
-                            )]);
-                        };
-                        let slot = wanted[position];
-                        let value = self.lower_expression_expecting(
-                            table,
-                            function,
-                            expression,
-                            Some(slot),
-                        )?;
-                        let value = self.argued(table, function, value, slot, expression.span())?;
-                        arguments.push(value);
-                        continue;
-                    };
-                    return Err(vec![refuse(
-                        "unsupported-expression",
-                        call.span,
-                        "a spread argument is not lowered yet",
-                    )]);
-                }
-                Ok(self.assign(function, ty, Rvalue::Call { callee, arguments }, call.span))
-            }
+            Expression::CallExpression(call) => self.lower_call(table, function, call),
             other => {
                 use oxc_span::GetSpan;
                 Err(vec![refuse(
