@@ -3839,6 +3839,80 @@ fn a_break_inside_a_switch_inside_a_loop_leaves_only_the_switch() {
 }
 
 #[test]
+fn a_break_in_an_inner_loop_leaves_only_the_inner_loop() {
+    let source = "function pairs(rows: readonly number[], limit: number): number {\n  let seen = 0;\n  for (const row of rows) {\n    let inner = 0;\n    while (inner < limit) {\n      inner = inner + 1;\n      if (inner === row) {\n        break;\n      }\n      continue;\n    }\n    seen = seen + inner;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let rows = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("rows", Answer::Known(rows)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pairs.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    let (outer_header, outer_parameters) = carrying[0];
+    assert_eq!(
+        outer_parameters, 2,
+        "the outer header carries the index and `seen`"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, outer_header),
+        vec![2, 2],
+        "the inner `break` and the inner `continue` never reach the outer header"
+    );
+}
+
+#[test]
+fn a_break_that_narrows_a_name_unions_it_with_the_normal_exit() {
+    let source = "function find(values: readonly string[], wanted: string): string | undefined {\n  let found: string | undefined = undefined;\n  for (const value of values) {\n    if (value === wanted) {\n      found = value;\n      break;\n    }\n  }\n  return found;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let undefined = table.intern(TypeKind::Undefined);
+    let optional = table.union(vec![text, undefined]);
+    let values = table.intern(TypeKind::ReadonlyArray(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("found", Answer::Known(optional)),
+            ("find", returning(&mut table, optional)),
+            ("values", Answer::Known(values)),
+            ("wanted", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("find.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    let (exit, exit_parameters) = carrying[carrying.len() - 1];
+    assert_eq!(exit_parameters, 1, "`found` leaves the loop as a parameter");
+    let parameter = function.block(exit).parameters[0];
+    assert_eq!(
+        function.type_of(parameter),
+        optional,
+        "the `break` carries the string, and the union with the normal exit keeps the undefined"
+    );
+    assert_eq!(
+        function.block(exit).terminator,
+        Terminator::Return(Some(parameter))
+    );
+}
+
+#[test]
 fn a_do_while_runs_its_body_before_the_test() {
     let source = "function backoff(limit: number): number {\n  let waited = 1;\n  do {\n    waited = waited * 2;\n  } while (waited < limit);\n  return waited;\n}\n";
     let mut table = TypeTable::new();
