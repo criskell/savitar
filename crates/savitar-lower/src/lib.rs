@@ -52,6 +52,17 @@ enum Breakable {
     Loop,
 }
 
+struct Tested {
+    name: String,
+    fact: Fact,
+    equal: bool,
+}
+
+enum Fact {
+    Nullish(TypeKind),
+    Primitive(String),
+}
+
 enum Written<'target, 'source> {
     Value(&'target Expression<'source>),
     Combined(BinaryOp, &'target Expression<'source>),
@@ -1127,7 +1138,7 @@ impl Context<'_> {
         Ok(Flow::Continues)
     }
 
-    fn tested_for_nullish(&self, test: &Expression<'_>) -> Option<(String, TypeKind, bool)> {
+    fn tested_fact(&self, test: &Expression<'_>) -> Option<Tested> {
         let Expression::BinaryExpression(binary) = test else {
             return None;
         };
@@ -1136,45 +1147,83 @@ impl Context<'_> {
             BinaryOperator::StrictInequality => false,
             _ => return None,
         };
-        let named = |side: &Expression<'_>| match side {
+        self.fact_between(&binary.left, &binary.right, equal)
+            .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+    }
+
+    fn fact_between(
+        &self,
+        subject: &Expression<'_>,
+        against: &Expression<'_>,
+        equal: bool,
+    ) -> Option<Tested> {
+        if let (Some(name), Some(kind)) = (self.name_in_scope(subject), nullish_kind(against)) {
+            return Some(Tested {
+                name,
+                fact: Fact::Nullish(kind),
+                equal,
+            });
+        }
+        if let (Some(name), Some(word)) = (self.name_behind_typeof(subject), typeof_word(against)) {
+            return Some(Tested {
+                name,
+                fact: Fact::Primitive(word),
+                equal,
+            });
+        }
+        None
+    }
+
+    fn name_in_scope(&self, side: &Expression<'_>) -> Option<String> {
+        match side {
             Expression::Identifier(id) if self.scope.contains_key(id.name.as_str()) => {
                 Some(id.name.to_string())
             }
             _ => None,
-        };
-        let nullish = |side: &Expression<'_>| match side {
-            Expression::Identifier(id) if id.name == "undefined" => Some(TypeKind::Undefined),
-            Expression::NullLiteral(_) => Some(TypeKind::Null),
-            _ => None,
-        };
-        if let (Some(name), Some(kind)) = (named(&binary.left), nullish(&binary.right)) {
-            return Some((name, kind, equal));
         }
-        if let (Some(name), Some(kind)) = (named(&binary.right), nullish(&binary.left)) {
-            return Some((name, kind, equal));
+    }
+
+    fn name_behind_typeof(&self, side: &Expression<'_>) -> Option<String> {
+        let Expression::UnaryExpression(unary) = side else {
+            return None;
+        };
+        if unary.operator != UnaryOperator::Typeof {
+            return None;
         }
-        None
+        self.name_in_scope(&unary.argument)
     }
 
     fn narrow_by_test(
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
-        tested: Option<&(String, TypeKind, bool)>,
+        tested: Option<&Tested>,
         holds: bool,
         span: oxc_span::Span,
     ) {
-        let Some((name, kind, equal)) = tested else {
+        let Some(tested) = tested else {
             return;
         };
-        let Some(&value) = self.scope.get(name) else {
+        let Some(&value) = self.scope.get(&tested.name) else {
             return;
         };
         let held = function.type_of(value);
-        let narrowed = if holds == *equal {
-            types::holds_member(table, held, kind).then(|| table.intern(kind.clone()))
-        } else {
-            types::without_member(table, held, kind)
+        let asserted = holds == tested.equal;
+        let narrowed = match &tested.fact {
+            Fact::Nullish(kind) => {
+                if asserted {
+                    types::holds_member(table, held, kind).then(|| table.intern(kind.clone()))
+                } else {
+                    types::without_member(table, held, kind)
+                }
+            }
+            Fact::Primitive(word) => {
+                if asserted {
+                    types::with_only_typeof(table, held, word)
+                } else {
+                    types::without_typeof(table, held, word)
+                }
+            }
         };
         let Some(narrowed) = narrowed else {
             return;
@@ -1183,7 +1232,7 @@ impl Context<'_> {
             return;
         }
         let value = self.assign(function, narrowed, Rvalue::Narrow(value), span);
-        self.scope.insert(name.clone(), value);
+        self.scope.insert(tested.name.clone(), value);
     }
 
     fn lower_if(
@@ -1193,7 +1242,7 @@ impl Context<'_> {
         statement: &oxc_ast::ast::IfStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let condition = self.lower_expression(table, function, &statement.test)?;
-        let tested = self.tested_for_nullish(&statement.test);
+        let tested = self.tested_fact(&statement.test);
         let before = self.scope.clone();
 
         let then_entry = function.add_block(empty_block());
@@ -1587,7 +1636,7 @@ impl Context<'_> {
         expected: Option<TypeId>,
     ) -> Result<ValueId, Vec<Diagnostic>> {
         let condition = self.lower_expression(table, function, &conditional.test)?;
-        let tested = self.tested_for_nullish(&conditional.test);
+        let tested = self.tested_fact(&conditional.test);
         let before = self.scope.clone();
         let then_entry = function.add_block(empty_block());
         let else_entry = function.add_block(empty_block());
@@ -2264,6 +2313,21 @@ impl Context<'_> {
             }
         }
     }
+}
+
+fn nullish_kind(side: &Expression<'_>) -> Option<TypeKind> {
+    match side {
+        Expression::Identifier(id) if id.name == "undefined" => Some(TypeKind::Undefined),
+        Expression::NullLiteral(_) => Some(TypeKind::Null),
+        _ => None,
+    }
+}
+
+fn typeof_word(side: &Expression<'_>) -> Option<String> {
+    let Expression::StringLiteral(literal) = side else {
+        return None;
+    };
+    types::narrowing_typeof_word(literal.value.as_str()).then(|| literal.value.to_string())
 }
 
 fn literal_type(table: &mut TypeTable, expression: &Expression<'_>) -> Option<TypeId> {

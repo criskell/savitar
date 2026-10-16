@@ -80,6 +80,68 @@ pub fn holds_member(table: &TypeTable, id: TypeId, wanted: &TypeKind) -> bool {
     }
 }
 
+#[must_use]
+pub fn narrowing_typeof_word(word: &str) -> bool {
+    matches!(
+        word,
+        "string" | "number" | "boolean" | "bigint" | "symbol" | "undefined"
+    )
+}
+
+#[must_use]
+pub fn with_only_typeof(table: &mut TypeTable, id: TypeId, word: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        typeof_word(table, member).is_none_or(|held| held == word)
+    })
+}
+
+#[must_use]
+pub fn without_typeof(table: &mut TypeTable, id: TypeId, word: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        typeof_word(table, member) != Some(word)
+    })
+}
+
+fn keeping(
+    table: &mut TypeTable,
+    id: TypeId,
+    keep: impl Fn(&TypeTable, TypeId) -> bool,
+) -> Option<TypeId> {
+    let members = match table.kind(id).clone() {
+        TypeKind::Union(members) => members,
+        _ => vec![id],
+    };
+    let kept: Vec<TypeId> = members
+        .into_iter()
+        .filter(|&member| keep(table, member))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    Some(table.union(kept))
+}
+
+fn typeof_word(table: &TypeTable, id: TypeId) -> Option<&'static str> {
+    match table.kind(id) {
+        TypeKind::String | TypeKind::StringLiteral(_) => Some("string"),
+        TypeKind::Number | TypeKind::NumberLiteral(_) => Some("number"),
+        TypeKind::Boolean | TypeKind::BooleanLiteral(_) => Some("boolean"),
+        TypeKind::BigInt => Some("bigint"),
+        TypeKind::Symbol => Some("symbol"),
+        TypeKind::Undefined => Some("undefined"),
+        TypeKind::Null
+        | TypeKind::Array(_)
+        | TypeKind::ReadonlyArray(_)
+        | TypeKind::Promise(_)
+        | TypeKind::Tuple { .. }
+        | TypeKind::Object { .. } => Some("object"),
+        TypeKind::Function { .. } | TypeKind::Overloaded(_) | TypeKind::Constructor(_) => {
+            Some("function")
+        }
+        _ => None,
+    }
+}
+
 fn is_nullish(table: &TypeTable, id: TypeId) -> bool {
     matches!(table.kind(id), TypeKind::Null | TypeKind::Undefined)
 }

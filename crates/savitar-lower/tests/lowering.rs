@@ -3846,3 +3846,195 @@ fn a_break_in_a_nested_switch_leaves_only_the_switch_around_it() {
         "the inner break feeds the inner join, not the outer one"
     );
 }
+
+fn narrowed(function: &savitar_ir::Function) -> Vec<savitar_types::TypeId> {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Narrow(_),
+                ..
+            } => Some(function.type_of(*target)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn text_or_number(table: &mut TypeTable) -> (savitar_types::TypeId, savitar_types::TypeId) {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![text, number]);
+    (number, either)
+}
+
+fn taking(
+    table: &mut TypeTable,
+    takes: savitar_types::TypeId,
+    returns: savitar_types::TypeId,
+) -> savitar_types::TypeId {
+    table.function(
+        vec![savitar_types::Parameter {
+            type_id: takes,
+            rest: false,
+            optional: false,
+        }],
+        returns,
+    )
+}
+
+#[test]
+fn a_name_tested_by_typeof_number_is_narrowed_to_number_in_that_branch() {
+    let source = "function use(value: string | number): number {\n  if (typeof value === \"number\") {\n    return value + 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&number),
+        "the branch where typeof answers number types the name as a number"
+    );
+}
+
+#[test]
+fn a_typeof_test_with_the_word_on_the_left_narrows_the_same_way() {
+    let source = "function use(value: string | number): number {\n  if (\"number\" === typeof value) {\n    return value + 1;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&number));
+}
+
+#[test]
+fn the_branch_where_typeof_fails_drops_only_that_primitive() {
+    let source = "function use(value: string | number | undefined): number {\n  if (typeof value === \"string\") {\n    return 0;\n  }\n  return count(value);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let nothing = table.intern(TypeKind::Undefined);
+    let any_of_three = table.union(vec![text, number, nothing]);
+    let number_or_nothing = table.union(vec![number, nothing]);
+    let counts = taking(&mut table, number_or_nothing, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(any_of_three)),
+            ("count", Answer::Known(counts)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        narrowed(&report.functions[0]).contains(&number_or_nothing),
+        "the other branch keeps every member whose typeof is not string"
+    );
+}
+
+#[test]
+fn a_ternary_narrows_both_arms_by_typeof() {
+    let source = "function use(value: string | number): number {\n  return typeof value === \"string\" ? width(value) : value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let text = table.intern(TypeKind::String);
+    let widths = taking(&mut table, text, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("width", Answer::Known(widths)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let narrowings = narrowed(&report.functions[0]);
+    assert!(narrowings.contains(&text), "the arm that holds takes string");
+    assert!(
+        narrowings.contains(&number),
+        "the arm that fails takes number"
+    );
+}
+
+#[test]
+fn typeof_object_is_left_wide_because_null_also_answers_object() {
+    let source = "function use(value: string | number): number {\n  if (typeof value === \"object\") {\n    return 0;\n  }\n  return value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0].message.contains("two numbers"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_typeof_test_on_something_that_is_not_a_name_narrows_nothing() {
+    let source = "function use(value: string | number): number {\n  if (typeof pick() === \"string\") {\n    return 0;\n  }\n  return value + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("pick", returning(&mut table, text)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-operator");
+    assert!(
+        report.diagnostics[0].message.contains("two numbers"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
