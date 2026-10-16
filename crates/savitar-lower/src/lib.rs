@@ -2746,12 +2746,123 @@ impl Context<'_> {
             BindingPattern::ObjectPattern(object) => {
                 self.bind_object_pattern(table, function, object, source)
             }
-            BindingPattern::AssignmentPattern(default) => Err(vec![refuse(
-                "unsupported-pattern",
-                default.span,
-                "a default value in a pattern is not lowered yet",
-            )]),
+            BindingPattern::AssignmentPattern(default) => {
+                let value =
+                    self.defaulted(table, function, source, &default.right, default.span)?;
+                self.bind_pattern(table, function, &default.left, value)
+            }
         }
+    }
+
+    fn defaulted(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        read: ValueId,
+        fallback: &Expression<'_>,
+        span: oxc_span::Span,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let held = function.type_of(read);
+        let Some(kept) = types::without_member(table, held, &TypeKind::Undefined) else {
+            let given = self.lower_expression(table, function, fallback)?;
+            return Ok(self.widened(table, function, given, span));
+        };
+        if kept == held {
+            return Ok(read);
+        }
+
+        let missing = self.tests_undefined(table, function, read, span);
+        let fallback_entry = function.add_block(empty_block());
+        let kept_entry = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition: missing,
+                then_block: fallback_entry,
+                then_arguments: Vec::new(),
+                else_block: kept_entry,
+                else_arguments: Vec::new(),
+            },
+        );
+        let join = function.add_block(empty_block());
+
+        let before = self.scope.clone();
+        self.current = fallback_entry;
+        self.statements.clear();
+        let given = self.lower_expression_expecting(table, function, fallback, Some(kept))?;
+        let given = self.settled(table, function, given, Some(kept), span);
+        let fallback_exit = self.current;
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: Vec::new(),
+            },
+        );
+        if self.scope != before {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                span,
+                "a default in a pattern that writes to a name is not lowered yet",
+            )]);
+        }
+
+        self.current = kept_entry;
+        self.statements.clear();
+        let narrowed = self.assign(function, kept, Rvalue::Narrow(read), span);
+        let kept_exit = self.current;
+        self.seal(
+            function,
+            Terminator::Jump {
+                target: join,
+                arguments: Vec::new(),
+            },
+        );
+
+        let wanted = table.union(vec![function.type_of(given), kept]);
+        let from_fallback = self.appended(function, fallback_exit, given, wanted, span);
+        let from_kept = self.appended(function, kept_exit, narrowed, wanted, span);
+        let bound = function.fresh_value(wanted);
+        function.block_mut(join).parameters = vec![bound];
+        function.block_mut(fallback_exit).terminator = Terminator::Jump {
+            target: join,
+            arguments: vec![from_fallback],
+        };
+        function.block_mut(kept_exit).terminator = Terminator::Jump {
+            target: join,
+            arguments: vec![from_kept],
+        };
+
+        self.current = join;
+        self.statements.clear();
+        Ok(bound)
+    }
+
+    fn tests_undefined(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        value: ValueId,
+        span: oxc_span::Span,
+    ) -> ValueId {
+        let nothing = table.intern(TypeKind::Undefined);
+        let nothing = self.assign(
+            function,
+            nothing,
+            Rvalue::Constant(Constant::Undefined),
+            span,
+        );
+        let boolean = table.intern(TypeKind::Boolean);
+        self.assign(
+            function,
+            boolean,
+            Rvalue::Binary {
+                op: BinaryOp::StrictEqual,
+                left: value,
+                right: nothing,
+            },
+            span,
+        )
     }
 
     fn bind_array_pattern(

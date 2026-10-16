@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use savitar_diagnostics::{SourceFile, Span};
-use savitar_ir::{BinaryOp, Rvalue, Statement, Terminator, verify};
+use savitar_ir::{BinaryOp, Constant, Rvalue, Statement, Terminator, verify};
 use savitar_lower::lower;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, IndexSignature, TypeKind, TypeTable};
@@ -5797,4 +5797,222 @@ fn an_object_pattern_with_a_computed_key_is_refused() {
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+}
+
+fn returned_value(function: &savitar_ir::Function) -> savitar_ir::ValueId {
+    function
+        .blocks()
+        .find_map(|(_, block)| match block.terminator {
+            Terminator::Return(Some(value)) => Some(value),
+            _ => None,
+        })
+        .expect("the function should return a value")
+}
+
+fn tests_undefined(function: &savitar_ir::Function) -> bool {
+    function.blocks().any(|(_, block)| {
+        block.statements.iter().any(|statement| {
+            matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Constant(Constant::Undefined),
+                    ..
+                }
+            )
+        }) && matches!(block.terminator, Terminator::Branch { .. })
+    })
+}
+
+#[test]
+fn a_default_in_an_object_pattern_takes_over_only_where_the_read_gives_undefined() {
+    let source = "function wait(route: Route): number {\n  const { timeout = 30 } = route;\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("wait", returning(&mut table, number)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        tests_undefined(function),
+        "the default is reached by testing the read against undefined"
+    );
+    assert_eq!(
+        function.type_of(returned_value(function)),
+        number,
+        "the bound name is the read without undefined, joined with the default"
+    );
+}
+
+#[test]
+fn a_default_in_an_array_pattern_covers_the_undefined_a_read_at_an_index_admits() {
+    let source = "function first(counts: number[]): number {\n  const [head = 0] = counts;\n  return head;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let numbers = table.intern(TypeKind::Array(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("first", returning(&mut table, number)),
+            ("counts", Answer::Known(numbers)),
+        ],
+    );
+    let file = SourceFile::new("first.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_default_never_takes_over_on_null_so_null_stays_in_the_bound_type() {
+    let source = "function pull(box: Box): number | null {\n  const { held = 7 } = box;\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let nothing = table.intern(TypeKind::Null);
+    let either = table.union(vec![number, nothing]);
+    let box_shape = table.object(vec![Field {
+        name: "held".to_string(),
+        type_id: either,
+        optional: true,
+        method: false,
+        readonly: false,
+    }]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pull", returning(&mut table, either)),
+            ("box", Answer::Known(box_shape)),
+        ],
+    );
+    let file = SourceFile::new("pull.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let bound = function.type_of(returned_value(function));
+    assert_eq!(
+        bound, either,
+        "only undefined is dropped by the default, so null is still held"
+    );
+    assert!(!table.admits_undefined(bound));
+}
+
+#[test]
+fn a_default_on_a_read_that_never_gives_undefined_binds_the_read_with_no_branch() {
+    let source = "function pick(route: Route): string {\n  const { handler = \"none\" } = route;\n  return handler;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.block_count(),
+        1,
+        "a field that is never undefined cannot reach the default"
+    );
+    assert_eq!(function.type_of(returned_value(function)), text);
+}
+
+#[test]
+fn a_default_that_branches_on_its_own_still_joins_into_one_bound_name() {
+    let source = "function wait(route: Route, slow: boolean): number {\n  const { timeout = slow ? 90 : 30 } = route;\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("wait", returning(&mut table, number)),
+            ("route", Answer::Known(route)),
+            ("slow", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_default_that_does_not_fit_the_field_is_held_as_a_union_rather_than_coerced() {
+    let source = "function wait(route: Route): number | string {\n  const { timeout = \"none\" } = route;\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("wait", returning(&mut table, either)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        function.type_of(returned_value(function)),
+        either,
+        "the bound name is the read without undefined, joined with the default"
+    );
+}
+
+#[test]
+fn a_default_in_a_pattern_that_assigns_to_a_name_is_refused() {
+    let source = "function wait(route: Route): number {\n  let fallback = 30;\n  const { timeout = (fallback = 60) } = route;\n  return timeout;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let route = route_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("wait", returning(&mut table, number)),
+            ("route", Answer::Known(route)),
+        ],
+    );
+    let file = SourceFile::new("wait.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(!report.diagnostics.is_empty());
 }

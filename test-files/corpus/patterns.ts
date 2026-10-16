@@ -26,3 +26,32 @@ export function timeoutOf(route: Route): number {
   }
   return timeout;
 }
+
+export interface Paging {
+  limit?: number;
+  offset?: number;
+}
+
+export interface Page {
+  limit: number;
+  offset: number;
+}
+
+export interface Retry {
+  attempts?: number | null;
+}
+
+export function pageOf(paging: Paging): Page {
+  const { limit = 50, offset = 0 } = paging;
+  return { limit: limit, offset: offset };
+}
+
+export function firstHeader(values: readonly string[]): string {
+  const [first = "none"] = values;
+  return first;
+}
+
+export function attemptsOf(retry: Retry): number | null {
+  const { attempts = 3 } = retry;
+  return attempts;
+}
