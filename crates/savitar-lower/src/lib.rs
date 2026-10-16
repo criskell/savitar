@@ -87,9 +87,52 @@ const fn jumped_out_as(then_flow: Flow, else_flow: Flow) -> Flow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Breakable {
+enum Target {
     Switch(BlockId),
     Loop { exit: BlockId, repeat: BlockId },
+    Labelled(BlockId),
+}
+
+impl Target {
+    const fn exit(self) -> BlockId {
+        match self {
+            Self::Switch(join) | Self::Labelled(join) => join,
+            Self::Loop { exit, .. } => exit,
+        }
+    }
+
+    const fn repeat(self) -> Option<BlockId> {
+        match self {
+            Self::Loop { repeat, .. } => Some(repeat),
+            Self::Switch(_) | Self::Labelled(_) => None,
+        }
+    }
+
+    const fn caught_by_a_bare_break(self) -> bool {
+        matches!(self, Self::Switch(_) | Self::Loop { .. })
+    }
+}
+
+struct Breakable {
+    labels: Vec<String>,
+    target: Target,
+    breaks: Vec<(BlockId, Scope)>,
+    continues: Vec<(BlockId, Scope)>,
+}
+
+impl Breakable {
+    fn around(labels: Vec<String>, target: Target) -> Self {
+        Self {
+            labels,
+            target,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+        }
+    }
+
+    fn answers_to(&self, label: &str) -> bool {
+        self.labels.iter().any(|held| held == label)
+    }
 }
 
 enum Repeating {
@@ -234,8 +277,6 @@ struct Context<'a> {
     statements: Vec<Statement>,
     current: BlockId,
     enclosing: Vec<Breakable>,
-    breaks: Vec<(BlockId, Scope)>,
-    continues: Vec<(BlockId, Scope)>,
     shadowed: Vec<(String, Option<Binding>)>,
 }
 
@@ -334,8 +375,6 @@ fn lower_function(
         statements: Vec::new(),
         current: entry,
         enclosing: Vec::new(),
-        breaks: Vec::new(),
-        continues: Vec::new(),
         shadowed: Vec::new(),
     };
 
@@ -548,16 +587,23 @@ impl Context<'_> {
                 Ok(flow)
             }
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
-            AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
-            AstStatement::ForStatement(statement) => self.lower_for(table, function, statement),
+            AstStatement::LabeledStatement(statement) => {
+                self.lower_labelled(table, function, statement)
+            }
+            AstStatement::WhileStatement(statement) => {
+                self.lower_while(table, function, statement, Vec::new())
+            }
+            AstStatement::ForStatement(statement) => {
+                self.lower_for(table, function, statement, Vec::new())
+            }
             AstStatement::DoWhileStatement(statement) => {
-                self.lower_do_while(table, function, statement)
+                self.lower_do_while(table, function, statement, Vec::new())
             }
             AstStatement::ForOfStatement(statement) => {
-                self.lower_for_of(table, function, statement)
+                self.lower_for_of(table, function, statement, Vec::new())
             }
             AstStatement::SwitchStatement(statement) => {
-                self.lower_switch(table, function, statement)
+                self.lower_switch(table, function, statement, Vec::new())
             }
             AstStatement::BreakStatement(statement) => {
                 self.lower_break(function, statement.label.as_ref(), statement.span)
@@ -1382,21 +1428,24 @@ impl Context<'_> {
         function: &mut Function,
         looping: &Looping,
         body: &AstStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Jumped, Vec<Diagnostic>> {
-        let outer_breaks = std::mem::take(&mut self.breaks);
-        let outer_continues = std::mem::take(&mut self.continues);
-        self.enclosing.push(Breakable::Loop {
-            exit: looping.exit,
-            repeat: looping.repeat,
-        });
+        self.enclosing.push(Breakable::around(
+            labels,
+            Target::Loop {
+                exit: looping.exit,
+                repeat: looping.repeat,
+            },
+        ));
         let flow = self.lower_statement(table, function, body)?;
-        self.enclosing.pop();
-        let breaks = std::mem::replace(&mut self.breaks, outer_breaks);
-        let continues = std::mem::replace(&mut self.continues, outer_continues);
+        let frame = self
+            .enclosing
+            .pop()
+            .expect("a loop pops the frame it pushed");
         Ok(Jumped {
             flow,
-            breaks,
-            continues,
+            breaks: frame.breaks,
+            continues: frame.continues,
         })
     }
 
@@ -1487,6 +1536,7 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::ForOfStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         if statement.r#await {
             return Err(vec![refuse(
@@ -1591,7 +1641,7 @@ impl Context<'_> {
         let standing = self.standing_declarations();
         self.bind_pattern(table, function, &declarator.id, current)?;
 
-        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body, labels)?;
         let repeats = jumped.repeats();
         self.repeat_edges(
             function,
@@ -1656,6 +1706,7 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::DoWhileStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let carried = self.carried_names(&statement.body, &[&statement.test], statement.span)?;
         let looping = self.open_loop(
@@ -1667,7 +1718,7 @@ impl Context<'_> {
             statement.span,
         );
 
-        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body, labels)?;
         let repeats = jumped.repeats();
         self.repeat_edges(
             function,
@@ -1750,6 +1801,7 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::ForStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let Some(test) = &statement.test else {
             return Err(vec![refuse(
@@ -1793,7 +1845,7 @@ impl Context<'_> {
 
         self.current = body;
         self.statements.clear();
-        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body, labels)?;
         let repeats = jumped.repeats();
         self.repeat_edges(
             function,
@@ -1845,6 +1897,7 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::WhileStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let carried = self.carried_names(&statement.body, &[], statement.span)?;
         let looping = self.open_loop(
@@ -1873,7 +1926,7 @@ impl Context<'_> {
 
         self.current = body;
         self.statements.clear();
-        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body, labels)?;
         self.repeat_edges(
             function,
             &looping,
@@ -2239,50 +2292,144 @@ impl Context<'_> {
         Ok(Flow::Continues)
     }
 
+    fn lower_labelled(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::LabeledStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let mut labels = vec![statement.label.name.to_string()];
+        let mut body = &statement.body;
+        while let AstStatement::LabeledStatement(inner) = body {
+            labels.push(inner.label.name.to_string());
+            body = &inner.body;
+        }
+        for (position, label) in labels.iter().enumerate() {
+            let already_standing = labels[..position].contains(label)
+                || self.enclosing.iter().any(|frame| frame.answers_to(label));
+            if already_standing {
+                return Err(vec![refuse(
+                    "unsupported-statement",
+                    statement.span,
+                    format!("`{label}` labels a statement already inside one with that label"),
+                )]);
+            }
+        }
+        match body {
+            AstStatement::WhileStatement(body) => self.lower_while(table, function, body, labels),
+            AstStatement::ForStatement(body) => self.lower_for(table, function, body, labels),
+            AstStatement::DoWhileStatement(body) => {
+                self.lower_do_while(table, function, body, labels)
+            }
+            AstStatement::ForOfStatement(body) => self.lower_for_of(table, function, body, labels),
+            AstStatement::SwitchStatement(body) => self.lower_switch(table, function, body, labels),
+            body => self.lower_labelled_block(table, function, labels, body),
+        }
+    }
+
+    fn lower_labelled_block(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        labels: Vec<String>,
+        body: &AstStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let span = statement_span(body);
+        let before = self.scope.clone();
+        let join = function.add_block(empty_block());
+        self.enclosing
+            .push(Breakable::around(labels, Target::Labelled(join)));
+        let flow = self.lower_statement(table, function, body)?;
+        let frame = self
+            .enclosing
+            .pop()
+            .expect("a labelled statement pops the frame it pushed");
+        let mut edges = frame.breaks;
+        if flow.continues() {
+            let exit = self.current;
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: join,
+                    arguments: Vec::new(),
+                },
+            );
+            edges.push((exit, std::mem::take(&mut self.scope)));
+        }
+        if edges.is_empty() {
+            self.scope = before;
+            return Ok(flow);
+        }
+        self.scope = self.joined(table, function, join, &before, &edges, span);
+        self.current = join;
+        self.statements.clear();
+        Ok(Flow::Continues)
+    }
+
+    fn jump_target(
+        &self,
+        label: Option<&oxc_ast::ast::LabelIdentifier<'_>>,
+        repeating: bool,
+        span: oxc_span::Span,
+    ) -> Result<usize, Vec<Diagnostic>> {
+        let word = if repeating { "continue" } else { "break" };
+        let Some(label) = label else {
+            let bare = self.enclosing.iter().rposition(|frame| {
+                if repeating {
+                    frame.target.repeat().is_some()
+                } else {
+                    frame.target.caught_by_a_bare_break()
+                }
+            });
+            return bare.ok_or_else(|| {
+                let around = if repeating {
+                    "a `continue` with no loop around it is not lowered"
+                } else {
+                    "a `break` with no loop or `switch` around it is not lowered"
+                };
+                vec![refuse("unsupported-statement", span, around)]
+            });
+        };
+        let name = label.name.as_str();
+        let found = self
+            .enclosing
+            .iter()
+            .rposition(|frame| frame.answers_to(name))
+            .ok_or_else(|| {
+                vec![refuse(
+                    "unsupported-statement",
+                    span,
+                    format!("`{word} {name}` names no label on a statement around it"),
+                )]
+            })?;
+        if repeating && self.enclosing[found].target.repeat().is_none() {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                span,
+                format!("`continue {name}` names a label that is not on a loop"),
+            )]);
+        }
+        Ok(found)
+    }
+
     fn lower_break(
         &mut self,
         function: &mut Function,
         label: Option<&oxc_ast::ast::LabelIdentifier<'_>>,
         span: oxc_span::Span,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        if label.is_some() {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                span,
-                "a labelled `break` is not lowered yet",
-            )]);
-        }
-        match self.enclosing.last() {
-            Some(Breakable::Switch(join)) => {
-                let target = *join;
-                self.seal(
-                    function,
-                    Terminator::Jump {
-                        target,
-                        arguments: Vec::new(),
-                    },
-                );
-                self.breaks.push((self.current, self.scope.clone()));
-                Ok(Flow::Broke)
-            }
-            Some(Breakable::Loop { exit, .. }) => {
-                let target = *exit;
-                self.seal(
-                    function,
-                    Terminator::Jump {
-                        target,
-                        arguments: Vec::new(),
-                    },
-                );
-                self.breaks.push((self.current, self.scope.clone()));
-                Ok(Flow::Broke)
-            }
-            None => Err(vec![refuse(
-                "unsupported-statement",
-                span,
-                "a `break` with no loop or `switch` around it is not lowered",
-            )]),
-        }
+        let found = self.jump_target(label, false, span)?;
+        let target = self.enclosing[found].target.exit();
+        self.seal(
+            function,
+            Terminator::Jump {
+                target,
+                arguments: Vec::new(),
+            },
+        );
+        let site = (self.current, self.scope.clone());
+        self.enclosing[found].breaks.push(site);
+        Ok(Flow::Broke)
     }
 
     fn lower_continue(
@@ -2291,28 +2438,11 @@ impl Context<'_> {
         label: Option<&oxc_ast::ast::LabelIdentifier<'_>>,
         span: oxc_span::Span,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        if label.is_some() {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                span,
-                "a labelled `continue` is not lowered yet",
-            )]);
-        }
-        let innermost = self
-            .enclosing
-            .iter()
-            .rev()
-            .find_map(|breakable| match breakable {
-                Breakable::Loop { repeat, .. } => Some(*repeat),
-                Breakable::Switch(_) => None,
-            });
-        let Some(target) = innermost else {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                span,
-                "a `continue` with no loop around it is not lowered",
-            )]);
-        };
+        let found = self.jump_target(label, true, span)?;
+        let target = self.enclosing[found]
+            .target
+            .repeat()
+            .expect("a `continue` only lands on a loop");
         self.seal(
             function,
             Terminator::Jump {
@@ -2320,7 +2450,8 @@ impl Context<'_> {
                 arguments: Vec::new(),
             },
         );
-        self.continues.push((self.current, self.scope.clone()));
+        let site = (self.current, self.scope.clone());
+        self.enclosing[found].continues.push(site);
         Ok(Flow::Continued)
     }
 
@@ -2329,6 +2460,7 @@ impl Context<'_> {
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::SwitchStatement<'_>,
+        labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
         let discriminant = self.lower_expression(table, function, &statement.discriminant)?;
         let before = self.scope.clone();
@@ -2345,14 +2477,14 @@ impl Context<'_> {
             .position(|case| case.test.is_none())
             .map(|position| bodies[position]);
 
-        let mut labels = Vec::with_capacity(statement.cases.len());
+        let mut label_types = Vec::with_capacity(statement.cases.len());
         let mut case_literals: Vec<Option<TypeKind>> = vec![None; statement.cases.len()];
         for (position, case) in statement.cases.iter().enumerate() {
             let Some(test) = &case.test else {
                 continue;
             };
             let label = self.lower_expression(table, function, test)?;
-            labels.push(function.type_of(label));
+            label_types.push(function.type_of(label));
             case_literals[position] = types::label_literal(table, function.type_of(label));
             let matched = self.combine(
                 table,
@@ -2379,8 +2511,8 @@ impl Context<'_> {
 
         let mut edges: Vec<(BlockId, Scope)> = Vec::new();
         let unmatched = self.current;
-        let exhaustive =
-            fallback.is_none() && types::exhausted(table, function.type_of(discriminant), &labels);
+        let exhaustive = fallback.is_none()
+            && types::exhausted(table, function.type_of(discriminant), &label_types);
         if exhaustive {
             self.seal(function, Terminator::Unreachable);
         } else {
@@ -2400,8 +2532,8 @@ impl Context<'_> {
         let entries = case_entries(statement, &case_literals);
         let decided: Vec<TypeKind> = case_literals.iter().flatten().cloned().collect();
 
-        let outer_breaks = std::mem::take(&mut self.breaks);
-        self.enclosing.push(Breakable::Switch(join));
+        self.enclosing
+            .push(Breakable::around(labels, Target::Switch(join)));
         let last = statement.cases.len().saturating_sub(1);
         for (position, case) in statement.cases.iter().enumerate() {
             self.current = bodies[position];
@@ -2448,8 +2580,11 @@ impl Context<'_> {
                 },
             );
         }
-        self.enclosing.pop();
-        edges.extend(std::mem::replace(&mut self.breaks, outer_breaks));
+        let frame = self
+            .enclosing
+            .pop()
+            .expect("a `switch` pops the frame it pushed");
+        edges.extend(frame.breaks);
 
         if edges.is_empty() {
             self.scope = before;

@@ -4221,7 +4221,7 @@ fn a_continue_with_no_loop_around_it_is_refused() {
 }
 
 #[test]
-fn a_labelled_continue_is_refused_rather_than_guessed_at() {
+fn a_continue_naming_a_label_nobody_wrote_is_refused() {
     let source = "function scan(limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    seen = seen + 1;\n    continue outer;\n  }\n  return seen;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -4232,17 +4232,16 @@ fn a_labelled_continue_is_refused_rather_than_guessed_at() {
 
     assert!(report.functions.is_empty());
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("labelled `continue`")),
+        report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("`continue outer` names no label")),
         "{:?}",
         report.diagnostics
     );
 }
 
 #[test]
-fn a_labelled_break_is_refused_rather_than_guessed_at() {
+fn a_break_naming_a_label_nobody_wrote_is_refused() {
     let source = "function scan(limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    break outer;\n  }\n  return seen;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -4256,7 +4255,204 @@ fn a_labelled_break_is_refused_rather_than_guessed_at() {
         report
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.message.contains("labelled `break`")),
+            .any(|diagnostic| diagnostic.message.contains("`break outer` names no label")),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_labelled_break_inside_the_inner_loop_leaves_the_outer_one() {
+    let source = "function pairs(rows: readonly number[], limit: number): number {\n  let seen = 0;\n  outer: for (const row of rows) {\n    let inner = 0;\n    while (inner < limit) {\n      inner = inner + 1;\n      if (inner === row) {\n        seen = inner;\n        break outer;\n      }\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let rows = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("rows", Answer::Known(rows)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pairs.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let (outer_exit, parameters) = function
+        .blocks()
+        .find(|(_, block)| matches!(block.terminator, Terminator::Return(_)))
+        .map(|(id, block)| (id, block.parameters.len()))
+        .expect("the function returns from the outer loop exit");
+    assert_eq!(
+        parameters, 1,
+        "`seen` leaves the outer loop as a parameter, because the two ways out disagree"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, outer_exit),
+        vec![1, 1],
+        "the outer test falling false and the labelled `break` both carry `seen`"
+    );
+}
+
+#[test]
+fn a_labelled_continue_inside_the_inner_loop_repeats_the_outer_one() {
+    let source = "function pairs(rows: readonly number[], limit: number): number {\n  let seen = 0;\n  outer: for (const row of rows) {\n    let inner = 0;\n    while (inner < limit) {\n      inner = inner + 1;\n      if (inner === row) {\n        seen = seen + 1;\n        continue outer;\n      }\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let rows = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("rows", Answer::Known(rows)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pairs.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let latch = parameterised(function)
+        .into_iter()
+        .find(|(_, count)| *count == 2)
+        .map(|(id, _)| id)
+        .expect("the outer latch carries the index and `seen`");
+    assert_eq!(
+        blocks_jumping_to(function, latch).len(),
+        2,
+        "the inner loop falling through and the labelled `continue` both reach the outer latch"
+    );
+}
+
+#[test]
+fn a_labelled_break_inside_a_switch_leaves_the_loop_the_label_names() {
+    let source = "function classify(kind: string, limit: number): number {\n  let seen = 0;\n  outer: while (seen < limit) {\n    switch (kind) {\n      case \"stop\":\n        break outer;\n      default:\n        seen = seen + 1;\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("classify.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
+    assert_eq!(
+        blocks_jumping_to(function, header).len(),
+        2,
+        "the entry and the back edge reach the header, and the labelled `break` does not"
+    );
+}
+
+#[test]
+fn a_break_naming_the_label_on_a_plain_block_leaves_that_block() {
+    let source = "function pick(flag: boolean, left: number, right: number): number {\n  let chosen = left;\n  found: {\n    if (flag) {\n      chosen = right;\n      break found;\n    }\n    chosen = left + right;\n  }\n  return chosen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("flag", Answer::Known(boolean)),
+            ("left", Answer::Known(number)),
+            ("right", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let joins = parameterised(function);
+    assert_eq!(
+        joins.len(),
+        1,
+        "only the end of the labelled block joins, and it carries `chosen`"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, joins[0].0),
+        vec![1, 1],
+        "the labelled `break` and the fall through both carry `chosen`"
+    );
+}
+
+#[test]
+fn a_bare_break_inside_a_labelled_block_still_leaves_the_loop_around_it() {
+    let source = "function scan(limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    step: {\n      seen = seen + 1;\n      break;\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("scan.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1],
+        "the body always breaks out of the loop, so no back edge reaches the header"
+    );
+}
+
+#[test]
+fn a_continue_naming_a_label_on_a_plain_block_is_refused() {
+    let source = "function pick(flag: boolean): number {\n  found: {\n    continue found;\n  }\n  return 1;\n}\n";
+    let mut table = TypeTable::new();
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(source, vec![("flag", Answer::Known(boolean))]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("is not on a loop")),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_label_written_again_inside_itself_is_refused() {
+    let source = "function scan(limit: number): number {\n  let seen = 0;\n  outer: while (seen < limit) {\n    outer: while (seen < limit) {\n      break outer;\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("scan.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("already inside one with that label")),
         "{:?}",
         report.diagnostics
     );
