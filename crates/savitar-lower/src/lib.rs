@@ -1977,6 +1977,23 @@ impl Context<'_> {
                 Ok(self.assign(function, ty, Rvalue::NewArray { elements }, array.span))
             }
             Expression::CallExpression(call) => self.lower_call(table, function, call),
+            Expression::AwaitExpression(await_expression) => {
+                let promised =
+                    self.lower_expression(table, function, &await_expression.argument)?;
+                let held = types::awaited(table, function.type_of(promised)).map_err(|_| {
+                    vec![refuse(
+                        "unsupported-expression",
+                        await_expression.span,
+                        "`await` of something that is not a promise is not lowered yet",
+                    )]
+                })?;
+                Ok(self.assign(
+                    function,
+                    held,
+                    Rvalue::Await(promised),
+                    await_expression.span,
+                ))
+            }
             other => {
                 use oxc_span::GetSpan;
                 Err(vec![refuse(

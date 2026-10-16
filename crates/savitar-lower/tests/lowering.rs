@@ -797,6 +797,75 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
 }
 
 #[test]
+fn an_await_takes_what_the_promise_holds() {
+    let source = "async function body(route: string): Promise<string> {\n  const held = await fetchOne(route);\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let promised = table.intern(TypeKind::Promise(text));
+    let fetch_one = table.function(
+        vec![savitar_types::Parameter {
+            type_id: text,
+            rest: false,
+        }],
+        promised,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, promised)),
+            ("route", Answer::Known(text)),
+            ("fetchOne", Answer::Known(fetch_one)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let awaited = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Await(_),
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the await should be lowered");
+    assert_eq!(function.type_of(awaited), text);
+}
+
+#[test]
+fn an_await_of_something_that_is_not_a_promise_is_refused() {
+    let source = "async function body(route: string): Promise<string> {\n  const held = await route;\n  return held;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let promised = table.intern(TypeKind::Promise(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("body", returning(&mut table, promised)),
+            ("route", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("body.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-expression");
+    assert!(
+        report.diagnostics[0].message.contains("not a promise"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
 fn a_generic_call_takes_its_type_argument_from_the_argument_it_is_given() {
     let source =
         "function head(items: number[]): number | undefined {\n  return firstOf(items);\n}\n";

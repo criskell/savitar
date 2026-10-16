@@ -72,6 +72,7 @@ pub enum Rvalue {
     Constant(Constant),
     Widen(ValueId),
     Narrow(ValueId),
+    Await(ValueId),
     Concat(Vec<ValueId>),
     Unary {
         op: UnaryOp,
