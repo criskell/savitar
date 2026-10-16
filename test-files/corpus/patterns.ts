@@ -81,3 +81,33 @@ export function withoutToken(incoming: Incoming): Loggable {
   const { token, ...safe } = incoming;
   return safe;
 }
+
+export interface Envelope {
+  line: RequestLine;
+  route: Route;
+}
+
+export function targetOf(envelope: Envelope): string {
+  const {
+    line: { path },
+    route: { handler },
+  } = envelope;
+  return path + " -> " + handler;
+}
+
+export function budgetOf(envelope: Envelope): number {
+  const {
+    route: { timeout = 30 },
+  } = envelope;
+  return timeout;
+}
+
+export function firstHeaderName(pair: [Header, Header]): string {
+  const [{ name }] = pair;
+  return name;
+}
+
+export function firstRouteHandler(routes: Route[], fallback: Route): string {
+  const [{ handler } = fallback] = routes;
+  return handler;
+}
