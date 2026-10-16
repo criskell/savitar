@@ -384,6 +384,7 @@ pub fn rest_of(table: &mut TypeTable, source: TypeId, from: u32) -> Result<TypeI
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fitted {
     pub slots: Vec<TypeId>,
     pub returns: TypeId,
@@ -397,10 +398,60 @@ pub fn callable_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<TypeId
     }
 }
 
-pub fn fits_call(table: &mut TypeTable, form: TypeId, held: &[TypeId]) -> Result<Fitted, String> {
+#[must_use]
+pub fn fittings_agree(table: &TypeTable, held: &Fitted, other: &Fitted) -> bool {
+    held.slots.len() == other.slots.len()
+        && alike(table, held.returns, other.returns)
+        && held
+            .slots
+            .iter()
+            .zip(other.slots.iter())
+            .all(|(&left, &right)| alike(table, left, right))
+}
+
+fn alike(table: &TypeTable, left: TypeId, right: TypeId) -> bool {
+    savitar_types::assignable(table, left, right) && savitar_types::assignable(table, right, left)
+}
+
+pub fn constructible_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<TypeId>, String> {
+    match table.kind(signature) {
+        TypeKind::Constructor(forms) => Ok(forms.clone()),
+        _ => Err("this value declares no way to construct it".to_string()),
+    }
+}
+
+pub fn fits_call_with(
+    table: &mut TypeTable,
+    form: TypeId,
+    held: &[TypeId],
+    written: &[TypeId],
+) -> Result<Fitted, String> {
     let wanted = argument_types(table, form, held.len())?;
     let returns = call_result(table, form)?;
-    let (slots, returns) = if takes_type_arguments(table, form) {
+    let declared = match table.kind(form) {
+        TypeKind::Function {
+            type_parameters, ..
+        } => type_parameters.clone(),
+        _ => Vec::new(),
+    };
+    let (slots, returns) = if !written.is_empty() {
+        if declared.len() != written.len() {
+            return Err(
+                "this form declares a different number of type parameters than the call writes"
+                    .to_string(),
+            );
+        }
+        let bindings: savitar_types::Bindings = declared
+            .iter()
+            .copied()
+            .zip(written.iter().copied())
+            .collect();
+        let mut slots = Vec::with_capacity(wanted.len());
+        for &slot in &wanted {
+            slots.push(savitar_types::substitute(table, slot, &bindings)?);
+        }
+        (slots, savitar_types::substitute(table, returns, &bindings)?)
+    } else if takes_type_arguments(table, form) {
         let mut bindings = savitar_types::Bindings::new();
         for (position, &given) in held.iter().enumerate() {
             savitar_types::infer(table, wanted[position], given, &mut bindings)?;

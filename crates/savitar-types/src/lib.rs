@@ -72,6 +72,7 @@ pub enum TypeKind {
         returns: TypeId,
     },
     Overloaded(Vec<TypeId>),
+    Constructor(Vec<TypeId>),
     Union(Vec<TypeId>),
     Nominal(NominalId),
     TypeParameter(u32),
@@ -91,6 +92,16 @@ pub enum TypeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NominalId(u32);
+
+fn without_repeats(forms: Vec<TypeId>) -> Vec<TypeId> {
+    let mut kept: Vec<TypeId> = Vec::with_capacity(forms.len());
+    for form in forms {
+        if !kept.contains(&form) {
+            kept.push(form);
+        }
+    }
+    kept
+}
 
 #[derive(Debug, Default)]
 pub struct TypeTable {
@@ -234,10 +245,15 @@ impl TypeTable {
     }
 
     pub fn overloaded(&mut self, forms: Vec<TypeId>) -> TypeId {
+        let forms = without_repeats(forms);
         if let [only] = forms.as_slice() {
             return *only;
         }
         self.intern(TypeKind::Overloaded(forms))
+    }
+
+    pub fn constructor(&mut self, forms: Vec<TypeId>) -> TypeId {
+        self.intern(TypeKind::Constructor(without_repeats(forms)))
     }
 
     pub fn fresh_type_parameter(&mut self) -> TypeId {
@@ -859,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn substituting_a_recursive_shape_that_carries_a_type_parameter_is_refused() {
+    fn substituting_a_recursive_shape_keeps_the_knot_and_replaces_the_parameter() {
         let mut table = TypeTable::new();
         let number = table.intern(TypeKind::Number);
         let held = table.fresh_type_parameter();
@@ -884,10 +900,30 @@ mod tests {
         let mut bindings = Bindings::new();
         bindings.insert(held, number);
 
-        assert!(substitute(&mut table, chain, &bindings).is_err());
+        let built = substitute(&mut table, chain, &bindings)
+            .expect("a recursive shape is tied back to itself instead of unrolled forever");
+        let TypeKind::Object { fields, .. } = table.kind(built).clone() else {
+            panic!("expected an object, got {:?}", table.kind(built));
+        };
+        let value = fields
+            .iter()
+            .find(|field| field.name == "value")
+            .expect("the shape keeps its value field");
+        assert_eq!(
+            value.type_id, number,
+            "the parameter stands for `number` now"
+        );
+        let next = fields
+            .iter()
+            .find(|field| field.name == "next")
+            .expect("the shape keeps its next field");
         assert!(
-            substitute(&mut table, held, &bindings).is_ok(),
-            "the plain type parameter still stands for what it was bound to"
+            assignable(&table, next.type_id, built) && assignable(&table, built, next.type_id),
+            "the knot points back at the substituted shape"
+        );
+        assert!(
+            !assignable(&table, built, chain),
+            "the shape before substitution held a type parameter, so it is not the same type"
         );
     }
 

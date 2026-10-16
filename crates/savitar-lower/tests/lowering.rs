@@ -888,6 +888,189 @@ fn overloaded(
 }
 
 #[test]
+fn a_new_expression_takes_the_form_that_fits_and_the_type_it_builds() {
+    let source = "function make(start: number): Counter {\n  return new Counter(start);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let counter = table.object(vec![Field {
+        name: "value".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let form = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: false,
+        }],
+        counter,
+    );
+    let constructor = table.constructor(vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("make", returning(&mut table, counter)),
+            ("start", Answer::Known(number)),
+            ("Counter", Answer::Known(constructor)),
+        ],
+    );
+    let file = SourceFile::new("make.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let built = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::New { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the construction should be lowered");
+    assert_eq!(function.type_of(built), counter);
+}
+
+#[test]
+fn constructing_something_that_declares_no_way_to_build_it_is_refused() {
+    let source = "function make(start: number): number {\n  return new Counter(start);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("make", returning(&mut table, number)),
+            ("start", Answer::Known(number)),
+            ("Counter", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("make.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("no way to construct"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_written_type_argument_stands_for_the_type_parameter_the_form_declares() {
+    let source = "function make(): Box {\n  return new Holder<number>();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let held = table.fresh_type_parameter();
+    let boxed_held = table.object(vec![Field {
+        name: "held".to_string(),
+        type_id: held,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let form = table.generic_function(vec![held], Vec::new(), boxed_held);
+    let constructor = table.constructor(vec![form]);
+    let boxed_number = table.object(vec![Field {
+        name: "held".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("make", returning(&mut table, boxed_number)),
+            ("Holder", Answer::Known(constructor)),
+            ("number", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("make.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let built = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::New { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the construction should be lowered");
+    assert_eq!(
+        function.type_of(built),
+        boxed_number,
+        "the type argument written at the call site binds the type parameter"
+    );
+}
+
+#[test]
+fn two_forms_that_agree_on_the_types_are_not_a_refusal() {
+    let source = "function call(label: string): string {\n  return either(label);\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let first = table.function(
+        vec![savitar_types::Parameter {
+            type_id: text,
+            rest: false,
+            optional: false,
+        }],
+        text,
+    );
+    let second = table.function(
+        vec![
+            savitar_types::Parameter {
+                type_id: text,
+                rest: false,
+                optional: false,
+            },
+            savitar_types::Parameter {
+                type_id: number,
+                rest: false,
+                optional: true,
+            },
+        ],
+        text,
+    );
+    let either = table.overloaded(vec![first, second]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("call", returning(&mut table, text)),
+            ("label", Answer::Known(text)),
+            ("either", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(
+        report.diagnostics.is_empty(),
+        "both forms type this call the same way, so there is nothing to choose: {:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
 fn an_overloaded_call_takes_the_only_form_that_fits() {
     let source = "function call(label: string): string {\n  return either(label);\n}\n";
     let mut table = TypeTable::new();

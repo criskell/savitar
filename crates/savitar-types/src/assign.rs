@@ -52,13 +52,18 @@ fn decide(
         (TypeKind::StringLiteral(_), TypeKind::String)
         | (TypeKind::NumberLiteral(_), TypeKind::Number)
         | (TypeKind::BooleanLiteral(_), TypeKind::Boolean) => true,
-        (TypeKind::Array(element), TypeKind::Array(wanted)) => element == wanted,
+        (TypeKind::Array(element), TypeKind::Array(wanted)) => {
+            alike(table, *element, *wanted, seen)
+        }
         (
             TypeKind::Array(element) | TypeKind::ReadonlyArray(element),
             TypeKind::ReadonlyArray(wanted),
         ) => relate(table, *element, *wanted, seen),
         (TypeKind::Tuple { elements, readonly }, TypeKind::Array(wanted)) => {
-            !readonly && elements.iter().all(|element| element == wanted)
+            !readonly
+                && elements
+                    .iter()
+                    .all(|&element| alike(table, element, *wanted, seen))
         }
         (TypeKind::Tuple { elements, .. }, TypeKind::ReadonlyArray(wanted)) => elements
             .iter()
@@ -83,7 +88,7 @@ fn decide(
                     if *target_readonly {
                         relate(table, element, wanted, seen)
                     } else {
-                        element == wanted
+                        alike(table, element, wanted, seen)
                     }
                 })
         }
@@ -181,7 +186,16 @@ fn fits_in_slot(
     if want.readonly {
         return relate(table, held, want.type_id, seen);
     }
-    !held_readonly && held == want.type_id
+    !held_readonly && alike(table, held, want.type_id, seen)
+}
+
+fn alike(
+    table: &TypeTable,
+    left: TypeId,
+    right: TypeId,
+    seen: &mut HashSet<(TypeId, TypeId)>,
+) -> bool {
+    relate(table, left, right, seen) && relate(table, right, left, seen)
 }
 
 fn value_fits_in_index(
@@ -194,7 +208,7 @@ fn value_fits_in_index(
     if want.readonly {
         return relate(table, held, want.value, seen);
     }
-    !held_readonly && held == want.value
+    !held_readonly && alike(table, held, want.value, seen)
 }
 
 fn key_covers(table: &TypeTable, key: TypeId, name: &str) -> bool {

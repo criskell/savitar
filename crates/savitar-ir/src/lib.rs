@@ -105,6 +105,10 @@ pub enum Rvalue {
         callee: ValueId,
         arguments: Vec<ValueId>,
     },
+    New {
+        callee: ValueId,
+        arguments: Vec<ValueId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

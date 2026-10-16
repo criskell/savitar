@@ -596,12 +596,28 @@ impl TsApi {
         }
     }
 
-    fn call_signatures(&self, type_id: u32) -> Result<Vec<Value>, TsApiError> {
-        let signatures = self.checker_call("getSignaturesOfType", "type", type_id)?;
+    fn signatures_of(&self, type_id: u32, kind: u32) -> Result<Vec<Value>, TsApiError> {
+        let signatures = self.request(
+            "getSignaturesOfType",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "type": type_id,
+                "kind": kind,
+            }),
+        )?;
         signatures
             .as_array()
             .cloned()
             .ok_or_else(|| TsApiError::Protocol("getSignaturesOfType returned no array".into()))
+    }
+
+    fn call_signatures(&self, type_id: u32) -> Result<Vec<Value>, TsApiError> {
+        self.signatures_of(type_id, 0)
+    }
+
+    fn construct_signatures(&self, type_id: u32) -> Result<Vec<Value>, TsApiError> {
+        self.signatures_of(type_id, 1)
     }
 
     fn intern_fields(&self, table: &mut TypeTable, type_id: u32, depth: u32) -> Answer {
@@ -614,6 +630,26 @@ impl TsApi {
             Ok(signatures) => signatures,
             Err(error) => return Answer::Unsupported(error.to_string()),
         };
+
+        let constructs = match self.construct_signatures(type_id) {
+            Ok(constructs) => constructs,
+            Err(error) => return Answer::Unsupported(error.to_string()),
+        };
+        if !constructs.is_empty() {
+            if !signatures.is_empty() {
+                return Answer::Unsupported(
+                    "a type that is both callable and constructible is not modelled yet".into(),
+                );
+            }
+            let mut forms = Vec::with_capacity(constructs.len());
+            for construct in &constructs {
+                match self.intern_signature(table, construct, depth) {
+                    Answer::Known(form) => forms.push(form),
+                    other => return other,
+                }
+            }
+            return Answer::Known(table.constructor(forms));
+        }
 
         let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
             Ok(properties) => properties,

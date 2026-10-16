@@ -95,15 +95,20 @@ pub fn substitute(
     id: TypeId,
     bindings: &Bindings,
 ) -> Result<TypeId, String> {
-    let mut entered = HashSet::new();
-    replace(table, id, bindings, &mut entered)
+    let mut standing = HashMap::new();
+    replace(table, id, bindings, &mut standing)
+}
+
+struct Standing {
+    slot: TypeId,
+    reached: bool,
 }
 
 fn replace(
     table: &mut TypeTable,
     id: TypeId,
     bindings: &Bindings,
-    entered: &mut HashSet<TypeId>,
+    standing: &mut HashMap<TypeId, Standing>,
 ) -> Result<TypeId, String> {
     if !mentions_a_type_parameter(table, id) {
         return Ok(id);
@@ -111,33 +116,55 @@ fn replace(
     if let Some(&bound) = bindings.get(&id) {
         return Ok(bound);
     }
-    if !entered.insert(id) {
-        return Err(
-            "a recursive type carrying a type parameter is not substituted yet".to_string(),
-        );
+    if let Some(held) = standing.get_mut(&id) {
+        held.reached = true;
+        return Ok(held.slot);
     }
+    let slot = table.reserve();
+    standing.insert(
+        id,
+        Standing {
+            slot,
+            reached: false,
+        },
+    );
+    let outcome = rebuild(table, id, bindings, standing);
+    let held = standing.remove(&id).expect("the slot was just recorded");
+    let built = outcome?;
+    if held.reached {
+        let kind = table.kind(built).clone();
+        table.fill(held.slot, kind);
+        return Ok(held.slot);
+    }
+    Ok(built)
+}
+
+fn rebuild(
+    table: &mut TypeTable,
+    id: TypeId,
+    bindings: &Bindings,
+    standing: &mut HashMap<TypeId, Standing>,
+) -> Result<TypeId, String> {
     let kind = table.kind(id).clone();
     let built = match kind {
         TypeKind::TypeParameter(_) => {
-            entered.remove(&id);
             return Err("this call leaves a type parameter with nothing to stand for".to_string());
         }
         TypeKind::Deferred(named) => {
-            entered.remove(&id);
             return Err(format!(
                 "this call reaches {}, which Savitar stopped unrolling",
                 table.nominal_name(named)
             ));
         }
-        TypeKind::Array(element) => TypeKind::Array(replace(table, element, bindings, entered)?),
+        TypeKind::Array(element) => TypeKind::Array(replace(table, element, bindings, standing)?),
         TypeKind::ReadonlyArray(element) => {
-            TypeKind::ReadonlyArray(replace(table, element, bindings, entered)?)
+            TypeKind::ReadonlyArray(replace(table, element, bindings, standing)?)
         }
-        TypeKind::Promise(held) => TypeKind::Promise(replace(table, held, bindings, entered)?),
+        TypeKind::Promise(held) => TypeKind::Promise(replace(table, held, bindings, standing)?),
         TypeKind::Tuple { elements, readonly } => {
             let mut built = Vec::with_capacity(elements.len());
             for element in elements {
-                built.push(replace(table, element, bindings, entered)?);
+                built.push(replace(table, element, bindings, standing)?);
             }
             TypeKind::Tuple {
                 elements: built,
@@ -148,15 +175,15 @@ fn replace(
             let mut built = Vec::with_capacity(fields.len());
             for field in fields {
                 built.push(Field {
-                    type_id: replace(table, field.type_id, bindings, entered)?,
+                    type_id: replace(table, field.type_id, bindings, standing)?,
                     ..field
                 });
             }
             let mut signatures = Vec::with_capacity(indexes.len());
             for index in indexes {
                 signatures.push(IndexSignature {
-                    key: replace(table, index.key, bindings, entered)?,
-                    value: replace(table, index.value, bindings, entered)?,
+                    key: replace(table, index.key, bindings, standing)?,
+                    value: replace(table, index.value, bindings, standing)?,
                     readonly: index.readonly,
                 });
             }
@@ -177,14 +204,14 @@ fn replace(
             let mut built = Vec::with_capacity(parameters.len());
             for parameter in parameters {
                 built.push(Parameter {
-                    type_id: replace(table, parameter.type_id, bindings, entered)?,
+                    type_id: replace(table, parameter.type_id, bindings, standing)?,
                     ..parameter
                 });
             }
             TypeKind::Function {
                 type_parameters: kept,
                 parameters: built,
-                returns: replace(table, returns, bindings, entered)?,
+                returns: replace(table, returns, bindings, standing)?,
             }
         }
         TypeKind::Conditional {
@@ -193,11 +220,10 @@ fn replace(
             when_true,
             when_false,
         } => {
-            let check = replace(table, check, bindings, entered)?;
-            let bound = replace(table, bound, bindings, entered)?;
-            let when_true = replace(table, when_true, bindings, entered)?;
-            let when_false = replace(table, when_false, bindings, entered)?;
-            entered.remove(&id);
+            let check = replace(table, check, bindings, standing)?;
+            let bound = replace(table, bound, bindings, standing)?;
+            let when_true = replace(table, when_true, bindings, standing)?;
+            let when_false = replace(table, when_false, bindings, standing)?;
             if mentions_a_type_parameter(table, check) || mentions_a_type_parameter(table, bound) {
                 return Ok(table.conditional(check, bound, when_true, when_false));
             }
@@ -208,9 +234,8 @@ fn replace(
             });
         }
         TypeKind::IndexedAccess { object, index } => {
-            let object = replace(table, object, bindings, entered)?;
-            let index = replace(table, index, bindings, entered)?;
-            entered.remove(&id);
+            let object = replace(table, object, bindings, standing)?;
+            let index = replace(table, index, bindings, standing)?;
             if mentions_a_type_parameter(table, object) || mentions_a_type_parameter(table, index) {
                 return Ok(table.indexed_access(object, index));
             }
@@ -219,21 +244,19 @@ fn replace(
         TypeKind::Overloaded(forms) => {
             let mut built = Vec::with_capacity(forms.len());
             for form in forms {
-                built.push(replace(table, form, bindings, entered)?);
+                built.push(replace(table, form, bindings, standing)?);
             }
             TypeKind::Overloaded(built)
         }
         TypeKind::Union(members) => {
             let mut built = Vec::with_capacity(members.len());
             for member in members {
-                built.push(replace(table, member, bindings, entered)?);
+                built.push(replace(table, member, bindings, standing)?);
             }
-            entered.remove(&id);
             return Ok(table.union(built));
         }
         other => other,
     };
-    entered.remove(&id);
     Ok(table.intern(built))
 }
 

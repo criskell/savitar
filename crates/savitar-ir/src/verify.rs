@@ -196,7 +196,7 @@ fn rvalue_uses(value: &Rvalue) -> Vec<ValueId> {
         Rvalue::Slice { array, .. } => vec![*array],
         Rvalue::NewObject { fields } => fields.iter().map(|(_, id)| *id).collect(),
         Rvalue::NewArray { elements } => elements.clone(),
-        Rvalue::Call { callee, arguments } => {
+        Rvalue::Call { callee, arguments } | Rvalue::New { callee, arguments } => {
             let mut used = vec![*callee];
             used.extend(arguments.iter().copied());
             used

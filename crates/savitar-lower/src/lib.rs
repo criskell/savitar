@@ -628,6 +628,112 @@ impl Context<'_> {
         Ok(self.coerced(function, table, value, slot, span))
     }
 
+    fn written_type_arguments(
+        &mut self,
+        table: &mut TypeTable,
+        written: Option<&oxc_ast::ast::TSTypeParameterInstantiation<'_>>,
+    ) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
+        let Some(written) = written else {
+            return Ok(Vec::new());
+        };
+        let mut resolved = Vec::with_capacity(written.params.len());
+        for argument in &written.params {
+            resolved.push(self.type_at(table, argument.span())?);
+        }
+        Ok(resolved)
+    }
+
+    fn chosen_form(
+        &mut self,
+        table: &mut TypeTable,
+        forms: &[TypeId],
+        held: &[TypeId],
+        written: &[TypeId],
+        span: oxc_span::Span,
+    ) -> Result<types::Fitted, Vec<Diagnostic>> {
+        let mut fitting: Vec<types::Fitted> = Vec::new();
+        let mut refusals = Vec::new();
+        for form in forms {
+            match types::fits_call_with(table, *form, held, written) {
+                Ok(fitted) => {
+                    if !fitting
+                        .iter()
+                        .any(|held| types::fittings_agree(table, held, &fitted))
+                    {
+                        fitting.push(fitted);
+                    }
+                }
+                Err(reason) => refusals.push(reason),
+            }
+        }
+        if fitting.len() > 1 {
+            return Err(vec![refuse(
+                "unsupported-call",
+                span,
+                "this call fits more than one of the declared forms, and they disagree on the types, so Savitar does not choose between them",
+            )]);
+        }
+        fitting.pop().ok_or_else(|| {
+            vec![refuse(
+                "unsupported-call",
+                span,
+                format!(
+                    "no declared form of this call fits: {}",
+                    refusals.join("; ")
+                ),
+            )]
+        })
+    }
+
+    fn lower_new(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        new_expression: &oxc_ast::ast::NewExpression<'_>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let callee = self.lower_expression(table, function, &new_expression.callee)?;
+        let forms = types::constructible_forms(table, function.type_of(callee))
+            .map_err(|reason| vec![refuse("unsupported-call", new_expression.span, reason)])?;
+        let written =
+            self.written_type_arguments(table, new_expression.type_arguments.as_deref())?;
+
+        let mut values = Vec::with_capacity(new_expression.arguments.len());
+        let mut spans = Vec::with_capacity(new_expression.arguments.len());
+        for argument in &new_expression.arguments {
+            let Some(expression) = argument.as_expression() else {
+                return Err(vec![refuse(
+                    "unsupported-expression",
+                    new_expression.span,
+                    "an argument that is not an expression is not lowered yet",
+                )]);
+            };
+            spans.push(expression.span());
+            values.push(self.lower_expression(table, function, expression)?);
+        }
+        let held: Vec<TypeId> = values
+            .iter()
+            .map(|value| function.type_of(*value))
+            .collect();
+
+        let fitted = self.chosen_form(table, &forms, &held, &written, new_expression.span)?;
+        let mut arguments = Vec::with_capacity(values.len());
+        for (position, value) in values.iter().enumerate() {
+            arguments.push(self.coerced(
+                function,
+                table,
+                *value,
+                fitted.slots[position],
+                spans[position],
+            ));
+        }
+        Ok(self.assign(
+            function,
+            fitted.returns,
+            Rvalue::New { callee, arguments },
+            new_expression.span,
+        ))
+    }
+
     fn lower_call(
         &mut self,
         table: &mut TypeTable,
@@ -659,8 +765,11 @@ impl Context<'_> {
             )]);
         }
 
+        let written = self.written_type_arguments(table, call.type_arguments.as_deref())?;
+
         if let [only] = forms.as_slice()
             && !types::takes_type_arguments(table, *only)
+            && written.is_empty()
         {
             let wanted = types::argument_types(table, *only, expressions.len())
                 .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
@@ -690,31 +799,7 @@ impl Context<'_> {
             .map(|value| function.type_of(*value))
             .collect();
 
-        let mut fitting = Vec::new();
-        let mut refusals = Vec::new();
-        for form in &forms {
-            match types::fits_call(table, *form, &held) {
-                Ok(fitted) => fitting.push(fitted),
-                Err(reason) => refusals.push(reason),
-            }
-        }
-        if fitting.len() > 1 {
-            return Err(vec![refuse(
-                "unsupported-call",
-                call.span,
-                "this call fits more than one of the declared forms, and Savitar does not choose between them",
-            )]);
-        }
-        let Some(fitted) = fitting.pop() else {
-            return Err(vec![refuse(
-                "unsupported-call",
-                call.span,
-                format!(
-                    "no declared form of this call fits: {}",
-                    refusals.join("; ")
-                ),
-            )]);
-        };
+        let fitted = self.chosen_form(table, &forms, &held, &written, call.span)?;
 
         let mut arguments = Vec::with_capacity(values.len());
         for (position, value) in values.iter().enumerate() {
@@ -2081,6 +2166,9 @@ impl Context<'_> {
                 Ok(self.assign(function, ty, Rvalue::NewArray { elements }, array.span))
             }
             Expression::CallExpression(call) => self.lower_call(table, function, call),
+            Expression::NewExpression(new_expression) => {
+                self.lower_new(table, function, new_expression)
+            }
             Expression::AwaitExpression(await_expression) => {
                 let promised =
                     self.lower_expression(table, function, &await_expression.argument)?;
