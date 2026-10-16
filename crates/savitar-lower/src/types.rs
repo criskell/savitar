@@ -356,6 +356,46 @@ pub fn takes_type_arguments(table: &TypeTable, signature: TypeId) -> bool {
     )
 }
 
+pub struct Fitted {
+    pub slots: Vec<TypeId>,
+    pub returns: TypeId,
+}
+
+pub fn callable_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<TypeId>, String> {
+    match table.kind(signature) {
+        TypeKind::Function { .. } => Ok(vec![signature]),
+        TypeKind::Overloaded(forms) => Ok(forms.clone()),
+        _ => Err("this value is not callable".to_string()),
+    }
+}
+
+pub fn fits_call(table: &mut TypeTable, form: TypeId, held: &[TypeId]) -> Result<Fitted, String> {
+    let wanted = argument_types(table, form, held.len())?;
+    let returns = call_result(table, form)?;
+    let (slots, returns) = if takes_type_arguments(table, form) {
+        let mut bindings = savitar_types::Bindings::new();
+        for (position, &given) in held.iter().enumerate() {
+            savitar_types::infer(table, wanted[position], given, &mut bindings)?;
+        }
+        let mut slots = Vec::with_capacity(wanted.len());
+        for &slot in &wanted {
+            slots.push(savitar_types::substitute(table, slot, &bindings)?);
+        }
+        (slots, savitar_types::substitute(table, returns, &bindings)?)
+    } else {
+        (wanted, returns)
+    };
+    for (position, &given) in held.iter().enumerate() {
+        if !savitar_types::assignable(table, given, slots[position]) {
+            return Err(format!(
+                "argument {} does not fit the parameter it is passed to",
+                position + 1
+            ));
+        }
+    }
+    Ok(Fitted { slots, returns })
+}
+
 pub fn argument_types(
     table: &TypeTable,
     callee: TypeId,

@@ -867,6 +867,125 @@ fn an_await_of_something_that_is_not_a_promise_is_refused() {
     );
 }
 
+fn overloaded(
+    table: &mut TypeTable,
+    forms: Vec<(savitar_types::TypeId, savitar_types::TypeId)>,
+) -> savitar_types::TypeId {
+    let built: Vec<savitar_types::TypeId> = forms
+        .into_iter()
+        .map(|(takes, returns)| {
+            table.function(
+                vec![savitar_types::Parameter {
+                    type_id: takes,
+                    rest: false,
+                    optional: false,
+                }],
+                returns,
+            )
+        })
+        .collect();
+    table.overloaded(built)
+}
+
+#[test]
+fn an_overloaded_call_takes_the_only_form_that_fits() {
+    let source = "function call(label: string): string {\n  return either(label);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = overloaded(&mut table, vec![(number, number), (text, text)]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("call", returning(&mut table, text)),
+            ("label", Answer::Known(text)),
+            ("either", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let called = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Call { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the call should be lowered");
+    assert_eq!(
+        function.type_of(called),
+        text,
+        "the form whose parameter takes the argument decides the result"
+    );
+}
+
+#[test]
+fn an_overloaded_call_that_fits_no_form_is_refused() {
+    let source = "function call(flag: boolean): string {\n  return either(flag);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let boolean = table.intern(TypeKind::Boolean);
+    let either = overloaded(&mut table, vec![(number, number), (text, text)]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("call", returning(&mut table, text)),
+            ("flag", Answer::Known(boolean)),
+            ("either", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("no declared form"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_overloaded_call_that_fits_two_forms_is_refused_rather_than_picked() {
+    let source = "function call(count: number): string {\n  return either(count);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either_type = table.union(vec![number, text]);
+    let either = overloaded(&mut table, vec![(number, number), (either_type, text)]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("call", returning(&mut table, text)),
+            ("count", Answer::Known(number)),
+            ("either", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("more than one"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
 #[test]
 fn a_generic_call_takes_its_type_argument_from_the_argument_it_is_given() {
     let source =

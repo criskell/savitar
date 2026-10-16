@@ -636,9 +636,7 @@ impl Context<'_> {
     ) -> Result<ValueId, Vec<Diagnostic>> {
         let callee = self.lower_expression(table, function, &call.callee)?;
         let signature = function.type_of(callee);
-        let returns = types::call_result(table, signature)
-            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
-        let wanted = types::argument_types(table, signature, call.arguments.len())
+        let forms = types::callable_forms(table, signature)
             .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
 
         let mut expressions = Vec::with_capacity(call.arguments.len());
@@ -661,69 +659,76 @@ impl Context<'_> {
             )]);
         }
 
-        if types::takes_type_arguments(table, signature) {
-            return self.lower_generic_call(table, function, call, callee, &wanted, &expressions);
+        if let [only] = forms.as_slice()
+            && !types::takes_type_arguments(table, *only)
+        {
+            let wanted = types::argument_types(table, *only, expressions.len())
+                .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+            let returns = types::call_result(table, *only)
+                .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+            let mut arguments = Vec::with_capacity(expressions.len());
+            for (position, expression) in expressions.iter().enumerate() {
+                let slot = wanted[position];
+                let value =
+                    self.lower_expression_expecting(table, function, expression, Some(slot))?;
+                arguments.push(self.argued(table, function, value, slot, expression.span())?);
+            }
+            return Ok(self.assign(
+                function,
+                returns,
+                Rvalue::Call { callee, arguments },
+                call.span,
+            ));
         }
 
-        let mut arguments = Vec::with_capacity(expressions.len());
-        for (position, expression) in expressions.iter().enumerate() {
-            let slot = wanted[position];
-            let value = self.lower_expression_expecting(table, function, expression, Some(slot))?;
-            arguments.push(self.argued(table, function, value, slot, expression.span())?);
-        }
-        Ok(self.assign(
-            function,
-            returns,
-            Rvalue::Call { callee, arguments },
-            call.span,
-        ))
-    }
-
-    fn lower_generic_call(
-        &mut self,
-        table: &mut TypeTable,
-        function: &mut Function,
-        call: &oxc_ast::ast::CallExpression<'_>,
-        callee: ValueId,
-        wanted: &[TypeId],
-        expressions: &[&Expression<'_>],
-    ) -> Result<ValueId, Vec<Diagnostic>> {
         let mut values = Vec::with_capacity(expressions.len());
-        for expression in expressions {
+        for expression in &expressions {
             values.push(self.lower_expression(table, function, expression)?);
         }
+        let held: Vec<TypeId> = values
+            .iter()
+            .map(|value| function.type_of(*value))
+            .collect();
 
-        let mut bindings = savitar_types::Bindings::new();
-        for (position, value) in values.iter().enumerate() {
-            savitar_types::infer(
-                table,
-                wanted[position],
-                function.type_of(*value),
-                &mut bindings,
-            )
-            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
+        let mut fitting = Vec::new();
+        let mut refusals = Vec::new();
+        for form in &forms {
+            match types::fits_call(table, *form, &held) {
+                Ok(fitted) => fitting.push(fitted),
+                Err(reason) => refusals.push(reason),
+            }
         }
+        if fitting.len() > 1 {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                "this call fits more than one of the declared forms, and Savitar does not choose between them",
+            )]);
+        }
+        let Some(fitted) = fitting.pop() else {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                format!(
+                    "no declared form of this call fits: {}",
+                    refusals.join("; ")
+                ),
+            )]);
+        };
 
         let mut arguments = Vec::with_capacity(values.len());
         for (position, value) in values.iter().enumerate() {
-            let slot = savitar_types::substitute(table, wanted[position], &bindings)
-                .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
-            arguments.push(self.argued(
-                table,
+            arguments.push(self.coerced(
                 function,
+                table,
                 *value,
-                slot,
+                fitted.slots[position],
                 expressions[position].span(),
-            )?);
+            ));
         }
-
-        let returns = types::call_result(table, function.type_of(callee))
-            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
-        let returns = savitar_types::substitute(table, returns, &bindings)
-            .map_err(|reason| vec![refuse("unsupported-call", call.span, reason)])?;
         Ok(self.assign(
             function,
-            returns,
+            fitted.returns,
             Rvalue::Call { callee, arguments },
             call.span,
         ))
