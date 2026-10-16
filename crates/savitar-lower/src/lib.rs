@@ -122,7 +122,70 @@ struct Tested {
 enum Fact {
     Nullish(TypeKind),
     Primitive(String),
-    Discriminant { field: String, literal: TypeKind },
+    Truth,
+    Declares(String),
+    Discriminant {
+        field: String,
+        literals: Vec<TypeKind>,
+    },
+    Among(Vec<TypeKind>),
+}
+
+struct Subject {
+    name: String,
+    field: Option<String>,
+}
+
+impl Subject {
+    fn fact_about(&self, literals: Vec<TypeKind>) -> Fact {
+        match &self.field {
+            Some(field) => Fact::Discriminant {
+                field: field.clone(),
+                literals,
+            },
+            None => Fact::Among(literals),
+        }
+    }
+}
+
+enum CaseEntry {
+    Matched(Vec<TypeKind>),
+    Unmatched,
+    Undecided,
+}
+
+impl CaseEntry {
+    fn fallen_into_from(self, earlier: &CaseEntry) -> CaseEntry {
+        match (self, earlier) {
+            (CaseEntry::Matched(mut held), CaseEntry::Matched(more)) => {
+                held.extend(more.iter().cloned());
+                CaseEntry::Matched(held)
+            }
+            _ => CaseEntry::Undecided,
+        }
+    }
+}
+
+fn case_entries(
+    statement: &oxc_ast::ast::SwitchStatement<'_>,
+    literals: &[Option<TypeKind>],
+) -> Vec<CaseEntry> {
+    let mut entries: Vec<CaseEntry> = Vec::with_capacity(literals.len());
+    for (position, case) in statement.cases.iter().enumerate() {
+        let reached = match (&case.test, &literals[position]) {
+            (None, _) => CaseEntry::Unmatched,
+            (Some(_), Some(literal)) => CaseEntry::Matched(vec![literal.clone()]),
+            (Some(_), None) => CaseEntry::Undecided,
+        };
+        let entry = match position.checked_sub(1) {
+            Some(earlier) if statement.cases[earlier].consequent.is_empty() => {
+                reached.fallen_into_from(&entries[earlier])
+            }
+            _ => reached,
+        };
+        entries.push(entry);
+    }
+    entries
 }
 
 enum Written<'target, 'source> {
@@ -1617,16 +1680,31 @@ impl Context<'_> {
     }
 
     fn tested_fact(&self, test: &Expression<'_>) -> Option<Tested> {
-        let Expression::BinaryExpression(binary) = test else {
-            return None;
-        };
-        let equal = match binary.operator {
-            BinaryOperator::StrictEquality => true,
-            BinaryOperator::StrictInequality => false,
-            _ => return None,
-        };
-        self.fact_between(&binary.left, &binary.right, equal)
-            .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+        match test {
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                let inner = self.tested_fact(&unary.argument)?;
+                Some(Tested {
+                    equal: !inner.equal,
+                    ..inner
+                })
+            }
+            Expression::ParenthesizedExpression(inner) => self.tested_fact(&inner.expression),
+            Expression::Identifier(_) => Some(Tested {
+                name: self.name_in_scope(test)?,
+                fact: Fact::Truth,
+                equal: true,
+            }),
+            Expression::BinaryExpression(binary) => match binary.operator {
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
+                    let equal = binary.operator == BinaryOperator::StrictEquality;
+                    self.fact_between(&binary.left, &binary.right, equal)
+                        .or_else(|| self.fact_between(&binary.right, &binary.left, equal))
+                }
+                BinaryOperator::In => self.fact_about_a_field(&binary.left, &binary.right),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn fact_between(
@@ -1654,11 +1732,29 @@ impl Context<'_> {
         {
             return Some(Tested {
                 name,
-                fact: Fact::Discriminant { field, literal },
+                fact: Fact::Discriminant {
+                    field,
+                    literals: vec![literal],
+                },
                 equal,
             });
         }
         None
+    }
+
+    fn fact_about_a_field(
+        &self,
+        named: &Expression<'_>,
+        holder: &Expression<'_>,
+    ) -> Option<Tested> {
+        let Expression::StringLiteral(field) = named else {
+            return None;
+        };
+        Some(Tested {
+            name: self.name_in_scope(holder)?,
+            fact: Fact::Declares(field.value.to_string()),
+            equal: true,
+        })
     }
 
     fn name_in_scope(&self, side: &Expression<'_>) -> Option<String> {
@@ -1719,11 +1815,28 @@ impl Context<'_> {
                     types::without_typeof(table, held, word)
                 }
             }
-            Fact::Discriminant { field, literal } => {
+            Fact::Discriminant { field, literals } => {
                 if asserted {
-                    types::with_only_discriminant(table, held, field, literal)
+                    types::with_only_discriminant(table, held, field, literals)
                 } else {
-                    types::without_discriminant(table, held, field, literal)
+                    types::without_discriminant(table, held, field, literals)
+                }
+            }
+            Fact::Among(literals) => {
+                if asserted {
+                    types::with_only_literals(table, held, literals)
+                } else {
+                    types::without_literals(table, held, literals)
+                }
+            }
+            Fact::Truth => asserted
+                .then(|| types::without_always_false(table, held))
+                .flatten(),
+            Fact::Declares(field) => {
+                if asserted {
+                    types::with_only_declaring(table, held, field)
+                } else {
+                    types::without_declaring(table, held, field)
                 }
             }
         };
@@ -1741,6 +1854,45 @@ impl Context<'_> {
                 declared: binding.declared,
             },
         );
+    }
+
+    fn switch_subject(&self, discriminant: &Expression<'_>) -> Option<Subject> {
+        if let Some(name) = self.name_in_scope(discriminant) {
+            return Some(Subject { name, field: None });
+        }
+        let (name, field) = self.field_of_name_in_scope(discriminant)?;
+        Some(Subject {
+            name,
+            field: Some(field),
+        })
+    }
+
+    fn narrow_in_case(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        subject: Option<&Subject>,
+        entry: &CaseEntry,
+        decided: &[TypeKind],
+        span: oxc_span::Span,
+    ) {
+        let Some(subject) = subject else {
+            return;
+        };
+        let (literals, equal) = match entry {
+            CaseEntry::Matched(literals) => (literals.clone(), true),
+            CaseEntry::Unmatched => (decided.to_vec(), false),
+            CaseEntry::Undecided => return,
+        };
+        if literals.is_empty() {
+            return;
+        }
+        let tested = Tested {
+            name: subject.name.clone(),
+            fact: subject.fact_about(literals),
+            equal,
+        };
+        self.narrow_by_test(table, function, Some(&tested), true, span);
     }
 
     fn lower_if(
@@ -1984,12 +2136,14 @@ impl Context<'_> {
             .map(|position| bodies[position]);
 
         let mut labels = Vec::with_capacity(statement.cases.len());
+        let mut case_literals: Vec<Option<TypeKind>> = vec![None; statement.cases.len()];
         for (position, case) in statement.cases.iter().enumerate() {
             let Some(test) = &case.test else {
                 continue;
             };
             let label = self.lower_expression(table, function, test)?;
             labels.push(function.type_of(label));
+            case_literals[position] = types::label_literal(table, function.type_of(label));
             let matched = self.combine(
                 table,
                 function,
@@ -2032,6 +2186,10 @@ impl Context<'_> {
             }
         }
 
+        let subject = self.switch_subject(&statement.discriminant);
+        let entries = case_entries(statement, &case_literals);
+        let decided: Vec<TypeKind> = case_literals.iter().flatten().cloned().collect();
+
         let outer_breaks = std::mem::take(&mut self.breaks);
         self.enclosing.push(Breakable::Switch(join));
         let last = statement.cases.len().saturating_sub(1);
@@ -2040,6 +2198,14 @@ impl Context<'_> {
             self.statements.clear();
             self.scope = before.clone();
             let standing = self.standing_declarations();
+            self.narrow_in_case(
+                table,
+                function,
+                subject.as_ref(),
+                &entries[position],
+                &decided,
+                case.span,
+            );
             let flow = self.lower_statements(table, function, &case.consequent)?;
             self.leave_declarations(standing);
             if !flow.continues() {
@@ -2996,6 +3162,7 @@ fn binary_op(operator: BinaryOperator) -> Option<BinaryOp> {
         BinaryOperator::GreaterEqualThan => BinaryOp::GreaterOrEqual,
         BinaryOperator::StrictEquality => BinaryOp::StrictEqual,
         BinaryOperator::StrictInequality => BinaryOp::StrictNotEqual,
+        BinaryOperator::In => BinaryOp::In,
         _ => return None,
     })
 }

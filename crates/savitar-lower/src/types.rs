@@ -84,7 +84,7 @@ pub fn holds_member(table: &TypeTable, id: TypeId, wanted: &TypeKind) -> bool {
 pub fn narrowing_typeof_word(word: &str) -> bool {
     matches!(
         word,
-        "string" | "number" | "boolean" | "bigint" | "symbol" | "undefined"
+        "string" | "number" | "boolean" | "bigint" | "symbol" | "undefined" | "object" | "function"
     )
 }
 
@@ -107,11 +107,11 @@ pub fn with_only_discriminant(
     table: &mut TypeTable,
     id: TypeId,
     field: &str,
-    literal: &TypeKind,
+    literals: &[TypeKind],
 ) -> Option<TypeId> {
     keeping(table, id, |table, member| {
         match decided_field_kinds(table, member, field) {
-            Some(kinds) => kinds.iter().any(|kind| kind == literal),
+            Some(kinds) => kinds.iter().any(|kind| literals.contains(kind)),
             None => true,
         }
     })
@@ -122,14 +122,104 @@ pub fn without_discriminant(
     table: &mut TypeTable,
     id: TypeId,
     field: &str,
-    literal: &TypeKind,
+    literals: &[TypeKind],
 ) -> Option<TypeId> {
     keeping(table, id, |table, member| {
         match decided_field_kinds(table, member, field) {
-            Some(kinds) => kinds.iter().any(|kind| kind != literal),
+            Some(kinds) => kinds.iter().any(|kind| !literals.contains(kind)),
             None => true,
         }
     })
+}
+
+#[must_use]
+pub fn with_only_literals(
+    table: &mut TypeTable,
+    id: TypeId,
+    literals: &[TypeKind],
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        literals
+            .iter()
+            .any(|literal| may_hold_literal(table, member, literal))
+    })
+}
+
+#[must_use]
+pub fn without_literals(
+    table: &mut TypeTable,
+    id: TypeId,
+    literals: &[TypeKind],
+) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        !literals.contains(table.kind(member))
+    })
+}
+
+#[must_use]
+pub fn with_only_declaring(table: &mut TypeTable, id: TypeId, field: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        declares_field(table, member, field) != Some(false)
+    })
+}
+
+#[must_use]
+pub fn without_declaring(table: &mut TypeTable, id: TypeId, field: &str) -> Option<TypeId> {
+    keeping(table, id, |table, member| {
+        declares_field(table, member, field) != Some(true)
+    })
+}
+
+fn declares_field(table: &TypeTable, member: TypeId, field: &str) -> Option<bool> {
+    let TypeKind::Object { fields, indexes } = table.kind(member) else {
+        return None;
+    };
+    if !indexes.is_empty() {
+        return None;
+    }
+    match fields.iter().find(|one| one.name == field) {
+        Some(found) if found.optional => None,
+        Some(_) => Some(true),
+        None => Some(false),
+    }
+}
+
+#[must_use]
+pub fn without_always_false(table: &mut TypeTable, id: TypeId) -> Option<TypeId> {
+    keeping(table, id, |table, member| !is_always_false(table, member))
+}
+
+fn is_always_false(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Undefined | TypeKind::Null => true,
+        TypeKind::BooleanLiteral(held) => !held,
+        TypeKind::NumberLiteral(bits) => f64::from_bits(*bits) == 0.0,
+        TypeKind::StringLiteral(held) => held.is_empty(),
+        _ => false,
+    }
+}
+
+#[must_use]
+pub fn label_literal(table: &TypeTable, label: TypeId) -> Option<TypeKind> {
+    match table.kind(label) {
+        kind @ (TypeKind::StringLiteral(_)
+        | TypeKind::NumberLiteral(_)
+        | TypeKind::BooleanLiteral(_)
+        | TypeKind::Null
+        | TypeKind::Undefined) => Some(kind.clone()),
+        _ => None,
+    }
+}
+
+fn may_hold_literal(table: &TypeTable, member: TypeId, literal: &TypeKind) -> bool {
+    let held = table.kind(member);
+    held == literal
+        || matches!(
+            (held, literal),
+            (TypeKind::String, TypeKind::StringLiteral(_))
+                | (TypeKind::Number, TypeKind::NumberLiteral(_))
+                | (TypeKind::Boolean, TypeKind::BooleanLiteral(_))
+        )
 }
 
 fn keeping(
@@ -234,6 +324,31 @@ pub fn binary_result(
             })
         }
         BinaryOp::StrictEqual | BinaryOp::StrictNotEqual => Ok(table.intern(TypeKind::Boolean)),
+        BinaryOp::In => {
+            if !is_textual(table, left) {
+                return Err("`in` takes the name of a field on the left".to_string());
+            }
+            if !holds_fields(table, right) {
+                return Err("`in` needs a value with fields on the right".to_string());
+            }
+            Ok(table.intern(TypeKind::Boolean))
+        }
+    }
+}
+
+fn holds_fields(table: &TypeTable, id: TypeId) -> bool {
+    match table.kind(id) {
+        TypeKind::Object { .. }
+        | TypeKind::NonPrimitive
+        | TypeKind::Array(_)
+        | TypeKind::ReadonlyArray(_)
+        | TypeKind::Tuple { .. }
+        | TypeKind::Promise(_)
+        | TypeKind::Function { .. }
+        | TypeKind::Overloaded(_)
+        | TypeKind::Constructor(_) => true,
+        TypeKind::Union(members) => members.iter().all(|&member| holds_fields(table, member)),
+        _ => false,
     }
 }
 
