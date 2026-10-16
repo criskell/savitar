@@ -652,15 +652,14 @@ fn a_for_of_over_an_array_yields_the_element_not_an_optional() {
         "the loop bound keeps the element present, and the sparse-array rules keep it dense"
     );
 
-    let headers: Vec<_> = function
-        .blocks()
-        .filter(|(_, block)| !block.parameters.is_empty())
+    let carried: Vec<usize> = parameterised(function)
+        .iter()
+        .map(|(_, count)| *count)
         .collect();
-    assert_eq!(headers.len(), 1);
     assert_eq!(
-        headers[0].1.parameters.len(),
-        2,
-        "the index and the running total are both carried"
+        carried,
+        vec![2, 2],
+        "the header and the latch that steps the index both carry the index and the running total"
     );
 }
 
@@ -3821,6 +3820,149 @@ fn a_break_inside_a_switch_inside_a_loop_leaves_only_the_switch() {
         blocks_jumping_to(function, header),
         vec![1, 1],
         "the `break` ends the `switch`, so the loop still comes back"
+    );
+}
+
+#[test]
+fn a_continue_in_a_while_goes_straight_back_to_the_header() {
+    let source = "function odds(limit: number, flag: boolean): number {\n  let seen = 0;\n  let kept = 0;\n  while (seen < limit) {\n    seen = seen + 1;\n    if (flag) {\n      continue;\n    }\n    kept = kept + 1;\n  }\n  return kept;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+        ],
+    );
+    let file = SourceFile::new("odds.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(
+        carrying.len(),
+        1,
+        "a `while` steps nothing, so the `continue` needs no latch of its own"
+    );
+    let (header, _) = carrying[0];
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![2, 2, 2],
+        "the entry, the `continue` and the end of the body all carry both names"
+    );
+}
+
+#[test]
+fn a_continue_in_a_for_of_steps_the_index_through_the_latch() {
+    let source = "function kept(values: readonly number[], floor: number): number {\n  let seen = 0;\n  for (const value of values) {\n    if (value < floor) {\n      continue;\n    }\n    seen = seen + 1;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let values = table.intern(TypeKind::ReadonlyArray(number));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("values", Answer::Known(values)),
+            ("floor", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("kept.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    let (header, _) = carrying[0];
+    let (latch, latch_parameters) = carrying[1];
+    assert_eq!(latch_parameters, 2, "the latch carries the index and `seen`");
+    assert_eq!(
+        blocks_jumping_to(function, latch),
+        vec![2, 2],
+        "the `continue` and the end of the body both reach the latch"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![2, 2],
+        "only the entry and the latch reach the header, so the index is stepped once"
+    );
+}
+
+#[test]
+fn a_continue_inside_a_switch_inside_a_loop_leaves_the_switch_as_well() {
+    let source = "function tally(kind: string, limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    switch (kind) {\n      case \"skip\":\n        seen = seen + 1;\n        continue;\n      default:\n        seen = seen + 2;\n    }\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("kind", Answer::Known(text)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("tally.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let (header, _) = parameterised(function)[0];
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1, 1, 1],
+        "the entry, the `continue` that skipped the `switch`, and the end of the body"
+    );
+}
+
+#[test]
+fn a_continue_with_no_loop_around_it_is_refused() {
+    let source = "function pick(kind: string): number {\n  switch (kind) {\n    case \"a\":\n      continue;\n    default:\n      return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("kind", Answer::Known(text))]);
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("no loop around it")),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_labelled_continue_is_refused_rather_than_guessed_at() {
+    let source = "function scan(limit: number): number {\n  let seen = 0;\n  while (seen < limit) {\n    seen = seen + 1;\n    continue outer;\n  }\n  return seen;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("scan.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("labelled `continue`")),
+        "{:?}",
+        report.diagnostics
     );
 }
 
