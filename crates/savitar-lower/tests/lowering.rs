@@ -3824,6 +3824,117 @@ fn a_break_inside_a_switch_inside_a_loop_leaves_only_the_switch() {
 }
 
 #[test]
+fn a_classic_for_carries_its_counter_through_the_header() {
+    let source = "function upto(limit: number): number {\n  let sum = 0;\n  for (let index = 0; index < limit; index += 1) {\n    sum = sum + index;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("upto.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    let (header, header_parameters) = carrying[0];
+    assert_eq!(
+        header_parameters, 2,
+        "the counter and the running total are both carried"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![2, 2],
+        "the entry and the latch that runs the update"
+    );
+}
+
+#[test]
+fn a_continue_in_a_classic_for_runs_the_update_before_the_test() {
+    let source = "function evens(limit: number): number {\n  let sum = 0;\n  for (let index = 0; index < limit; index += 1) {\n    if (index === 0) {\n      continue;\n    }\n    sum = sum + index;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("evens.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    let (header, _) = carrying[0];
+    let (latch, _) = carrying[1];
+    assert_eq!(
+        blocks_jumping_to(function, latch),
+        vec![2, 2],
+        "the `continue` and the end of the body both land on the latch"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![2, 2],
+        "nothing but the entry and the latch reaches the test, so the update always runs first"
+    );
+}
+
+#[test]
+fn a_name_the_for_initialiser_declares_does_not_outlive_the_loop() {
+    let source = "function after(limit: number): number {\n  let sum = 0;\n  for (let index = 0; index < limit; index += 1) {\n    sum = sum + 1;\n  }\n  return index;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("limit", Answer::Known(number)),
+            ("index", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("after.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        function
+            .blocks()
+            .flat_map(|(_, block)| block.statements.iter())
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Global(name),
+                    ..
+                } if name == "index"
+            )),
+        "the `index` after the loop is a global read, not the loop counter"
+    );
+}
+
+#[test]
+fn a_for_with_no_test_is_refused_rather_than_given_a_condition() {
+    let source = "function spin(limit: number): number {\n  let sum = 0;\n  for (;;) {\n    sum = sum + limit;\n    break;\n  }\n  return sum;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("spin.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("`for` with no test")),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
 fn a_continue_in_a_while_goes_straight_back_to_the_header() {
     let source = "function odds(limit: number, flag: boolean): number {\n  let seen = 0;\n  let kept = 0;\n  while (seen < limit) {\n    seen = seen + 1;\n    if (flag) {\n      continue;\n    }\n    kept = kept + 1;\n  }\n  return kept;\n}\n";
     let mut table = TypeTable::new();

@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Declaration, Expression, ForStatementLeft,
-    FunctionBody, ObjectPropertyKind, SimpleAssignmentTarget, Statement as AstStatement,
-    VariableDeclarator,
+    Argument, AssignmentTarget, BindingPattern, Declaration, Expression, ForStatementInit,
+    ForStatementLeft, FunctionBody, ObjectPropertyKind, SimpleAssignmentTarget,
+    Statement as AstStatement, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -418,6 +418,7 @@ impl Context<'_> {
             }
             AstStatement::IfStatement(statement) => self.lower_if(table, function, statement),
             AstStatement::WhileStatement(statement) => self.lower_while(table, function, statement),
+            AstStatement::ForStatement(statement) => self.lower_for(table, function, statement),
             AstStatement::ForOfStatement(statement) => {
                 self.lower_for_of(table, function, statement)
             }
@@ -912,8 +913,12 @@ impl Context<'_> {
         )
     }
 
-    fn carried_names(&self, body: &AstStatement<'_>) -> Vec<String> {
-        assigned::assigned_names(std::slice::from_ref(body))
+    fn carried_names(&self, body: &AstStatement<'_>, stepping: &[&Expression<'_>]) -> Vec<String> {
+        let mut found = assigned::assigned_names(std::slice::from_ref(body));
+        for expression in stepping {
+            found.extend(assigned::assigned_names_in(expression));
+        }
+        found
             .into_iter()
             .filter(|name| self.scope.contains_key(name))
             .collect()
@@ -1143,7 +1148,7 @@ impl Context<'_> {
         );
         let start = self.assign(function, number, Rvalue::Widen(zero), statement.span);
 
-        let carried = self.carried_names(&statement.body);
+        let carried = self.carried_names(&statement.body, &[]);
         let looping = self.open_loop(function, carried, &[start], Repeating::ThroughLatch);
         let index = looping.leading[0];
 
@@ -1247,13 +1252,122 @@ impl Context<'_> {
         Ok(Flow::Continues)
     }
 
+    fn lower_for_init(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::ForStatement<'_>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        match &statement.init {
+            Some(ForStatementInit::VariableDeclaration(declaration)) => {
+                let widening = declaration.kind != VariableDeclarationKind::Const;
+                for declarator in &declaration.declarations {
+                    self.lower_declarator(table, function, declarator, widening)?;
+                }
+                Ok(())
+            }
+            Some(init) => {
+                let Some(expression) = init.as_expression() else {
+                    return Err(vec![refuse(
+                        "unsupported-statement",
+                        statement.span,
+                        "this `for` initialiser is not lowered yet",
+                    )]);
+                };
+                self.lower_effect(table, function, expression)
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn lower_for(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        statement: &oxc_ast::ast::ForStatement<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let Some(test) = &statement.test else {
+            return Err(vec![refuse(
+                "unsupported-statement",
+                statement.span,
+                "a `for` with no test is not lowered yet, because its only way out is a `break`",
+            )]);
+        };
+
+        let around: Vec<String> = self.scope.keys().cloned().collect();
+        self.lower_for_init(table, function, statement)?;
+
+        let mut stepping = vec![test];
+        if let Some(update) = &statement.update {
+            stepping.push(update);
+        }
+        let carried = self.carried_names(&statement.body, &stepping);
+        let looping = self.open_loop(function, carried, &[], Repeating::ThroughLatch);
+
+        let condition = self.lower_expression(table, function, test)?;
+        let body = function.add_block(empty_block());
+        let leaving = function.add_block(empty_block());
+        self.seal(
+            function,
+            Terminator::Branch {
+                condition,
+                then_block: body,
+                then_arguments: Vec::new(),
+                else_block: leaving,
+                else_arguments: Vec::new(),
+            },
+        );
+        let leaving = self.leaving_edge(function, &looping, leaving);
+
+        self.current = body;
+        self.statements.clear();
+        let jumped = self.lower_loop_body(table, function, &looping, &statement.body)?;
+        let repeats = jumped.repeats();
+        self.repeat_edges(
+            function,
+            &looping,
+            jumped.flow,
+            jumped.continues,
+            statement.span,
+        )?;
+        if repeats {
+            self.stand_at_latch(&looping);
+            if let Some(update) = &statement.update {
+                self.lower_effect(table, function, update)?;
+            }
+            every_change_is_carried(&looping, &self.scope, statement.span)?;
+            let mut back = Vec::with_capacity(looping.carried.len());
+            for name in &looping.carried {
+                back.push(self.scope[name]);
+            }
+            self.seal(
+                function,
+                Terminator::Jump {
+                    target: looping.header,
+                    arguments: back,
+                },
+            );
+        }
+
+        self.close_loop(
+            table,
+            function,
+            &looping,
+            leaving,
+            jumped.breaks,
+            statement.span,
+        );
+        self.scope.retain(|name, _| around.contains(name));
+        Ok(Flow::Continues)
+    }
+
     fn lower_while(
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
         statement: &oxc_ast::ast::WhileStatement<'_>,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        let carried = self.carried_names(&statement.body);
+        let carried = self.carried_names(&statement.body, &[]);
         let looping = self.open_loop(function, carried, &[], Repeating::AtHeader);
 
         let condition = self.lower_expression(table, function, &statement.test)?;
