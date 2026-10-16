@@ -141,3 +141,31 @@ export function retryDelay(attempts: readonly number[], ceiling: number): number
   }
   return delay;
 }
+
+export function drainUntil(queue: readonly string[], stop: string): number {
+  let index = 0;
+  for (;;) {
+    const next = queue[index];
+    if (next === undefined) {
+      break;
+    }
+    index += 1;
+    if (next === stop) {
+      break;
+    }
+  }
+  return index;
+}
+
+export function nextSlot(used: readonly boolean[], from: number): number {
+  let at = from;
+  for (;;) {
+    if (at >= used.length) {
+      return -1;
+    }
+    if (used[at] === false) {
+      return at;
+    }
+    at += 1;
+  }
+}

@@ -1903,18 +1903,13 @@ impl Context<'_> {
         statement: &oxc_ast::ast::ForStatement<'_>,
         labels: Vec<String>,
     ) -> Result<Flow, Vec<Diagnostic>> {
-        let Some(test) = &statement.test else {
-            return Err(vec![refuse(
-                "unsupported-statement",
-                statement.span,
-                "a `for` with no test is not lowered yet, because its only way out is a `break`",
-            )]);
-        };
-
         let standing = self.standing_declarations();
         self.lower_for_init(table, function, statement)?;
 
-        let mut stepping = vec![test];
+        let mut stepping = Vec::new();
+        if let Some(test) = &statement.test {
+            stepping.push(test);
+        }
         if let Some(update) = &statement.update {
             stepping.push(update);
         }
@@ -1928,23 +1923,29 @@ impl Context<'_> {
             statement.span,
         );
 
-        let condition = self.lower_expression(table, function, test)?;
-        let body = function.add_block(empty_block());
-        let leaving = function.add_block(empty_block());
-        self.seal(
-            function,
-            Terminator::Branch {
-                condition,
-                then_block: body,
-                then_arguments: Vec::new(),
-                else_block: leaving,
-                else_arguments: Vec::new(),
-            },
-        );
-        let leaving = self.leaving_edge(function, &looping, leaving);
+        let leaving = match &statement.test {
+            Some(test) => {
+                let condition = self.lower_expression(table, function, test)?;
+                let body = function.add_block(empty_block());
+                let leaving = function.add_block(empty_block());
+                self.seal(
+                    function,
+                    Terminator::Branch {
+                        condition,
+                        then_block: body,
+                        then_arguments: Vec::new(),
+                        else_block: leaving,
+                        else_arguments: Vec::new(),
+                    },
+                );
+                let leaving = self.leaving_edge(function, &looping, leaving);
+                self.current = body;
+                self.statements.clear();
+                Some(leaving)
+            }
+            None => None,
+        };
 
-        self.current = body;
-        self.statements.clear();
         let jumped = self.lower_loop_body(table, function, &looping, &statement.body, labels)?;
         let repeats = jumped.repeats();
         self.repeat_edges(
@@ -1984,7 +1985,7 @@ impl Context<'_> {
             table,
             function,
             &looping,
-            Some(leaving),
+            leaving,
             jumped.breaks,
             statement.span,
         );

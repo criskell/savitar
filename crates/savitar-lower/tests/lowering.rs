@@ -4075,23 +4075,34 @@ fn a_name_the_for_initialiser_declares_does_not_outlive_the_loop() {
 }
 
 #[test]
-fn a_for_with_no_test_is_refused_rather_than_given_a_condition() {
+fn a_for_with_no_test_runs_its_body_straight_from_the_header() {
     let source = "function spin(limit: number): number {\n  let sum = 0;\n  for (;;) {\n    sum = sum + limit;\n    break;\n  }\n  return sum;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
-    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("spin", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
     let file = SourceFile::new("spin.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let header = parameterised(function)[0].0;
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.message.contains("`for` with no test")),
-        "{:?}",
-        report.diagnostics
+        operators_in(function, header).contains(&BinaryOp::Add),
+        "with no test to lower, the body starts in the header itself"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, header),
+        vec![1],
+        "the body always breaks, so nothing comes back to the header"
     );
 }
 
@@ -7928,5 +7939,116 @@ fn a_continue_from_a_block_that_shadows_a_name_carries_the_outer_value_back() {
         back[1],
         vec![carried],
         "the `continue` carries the outer `value` back untouched, not the one the block declared"
+    );
+}
+
+#[test]
+fn a_for_with_no_test_leaves_only_through_its_breaks() {
+    let source = "function drainUntil(queue: readonly string[], stop: string): number {\n  let index = 0;\n  for (;;) {\n    const next = queue[index];\n    if (next === undefined) {\n      break;\n    }\n    index = index + 1;\n    if (next === stop) {\n      break;\n    }\n  }\n  return index;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let queue = table.intern(TypeKind::ReadonlyArray(text));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("drainUntil", returning(&mut table, number)),
+            ("queue", Answer::Known(queue)),
+            ("stop", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("drain.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let (exit, parameters) = function
+        .blocks()
+        .find(|(_, block)| matches!(block.terminator, Terminator::Return(_)))
+        .map(|(id, block)| (id, block.parameters.len()))
+        .expect("the function returns from the loop exit");
+    assert_eq!(
+        parameters, 1,
+        "the two `break`s disagree on `index`, so it leaves as a parameter"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, exit),
+        vec![1, 1],
+        "only the two `break`s reach the exit, because there is no test to fall false"
+    );
+}
+
+#[test]
+fn a_for_with_no_test_and_no_break_leaves_its_exit_unreachable() {
+    let source = "function nextSlot(used: readonly boolean[], from: number): number {\n  let at = from;\n  for (;;) {\n    if (at >= used.length) {\n      return 0;\n    }\n    if (used[at] === false) {\n      return at;\n    }\n    at = at + 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let used = table.intern(TypeKind::ReadonlyArray(boolean));
+    let provider = ByName::new(
+        source,
+        vec![
+            ("nextSlot", returning(&mut table, number)),
+            ("used", Answer::Known(used)),
+            ("from", Answer::Known(number)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("slot.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let dominance = savitar_ir::Dominance::of(function);
+    let stranded: Vec<savitar_ir::BlockId> = function
+        .blocks()
+        .map(|(id, _)| id)
+        .filter(|&id| !dominance.reachable(id))
+        .collect();
+    assert_eq!(
+        stranded.len(),
+        1,
+        "the loop never ends, so the exit alone is stranded and the verifier stays clean"
+    );
+    assert!(
+        function.block(stranded[0]).parameters.is_empty(),
+        "the stranded exit takes no parameter, because no edge would carry one"
+    );
+}
+
+#[test]
+fn a_for_with_no_test_still_runs_its_update_through_the_latch() {
+    let source = "function seek(limit: number): number {\n  let at = 0;\n  for (;; at = at + 1) {\n    if (at >= limit) {\n      break;\n    }\n  }\n  return at;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("seek", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("seek.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let latch = parameterised(function)
+        .into_iter()
+        .find(|&(id, _)| operators_in(function, id).contains(&BinaryOp::Add))
+        .map(|(id, _)| id)
+        .expect("the update runs in the latch");
+    assert!(
+        matches!(function.block(latch).terminator, Terminator::Jump { .. }),
+        "the latch jumps straight back to the header, because there is no test to branch on"
     );
 }
