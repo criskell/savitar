@@ -367,10 +367,14 @@ pub fn argument_types(
     let rest = parameters.last().filter(|parameter| parameter.rest);
     let fixed = parameters.len() - usize::from(rest.is_some());
     if given < fixed {
-        return Err(
-            "a call that leaves out an argument is not lowered yet, because the declaration does not say which parameters may be left out"
-                .to_string(),
-        );
+        let left_out = parameters[given..fixed]
+            .iter()
+            .find(|parameter| !parameter.optional);
+        if left_out.is_some() {
+            return Err(
+                "this call leaves out an argument the signature does not mark optional".to_string(),
+            );
+        }
     }
     let Some(rest) = rest else {
         if given > parameters.len() {

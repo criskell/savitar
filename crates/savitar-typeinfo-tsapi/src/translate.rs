@@ -106,9 +106,159 @@ pub fn classify(flags: TypeFlags) -> Classified {
     Classified::Unsupported("the checker answered a type Savitar does not recognise")
 }
 
+const CALL_SIGNATURE_KIND: u32 = 181;
+
+#[must_use]
+pub fn call_signature_kind() -> u32 {
+    CALL_SIGNATURE_KIND
+}
+
+#[must_use]
+pub fn optional_parameters(printed: &str) -> Vec<bool> {
+    let Some(list) = parameter_list(printed) else {
+        return Vec::new();
+    };
+    split_at_top_level(list)
+        .into_iter()
+        .map(|parameter| {
+            let parameter = parameter.trim();
+            if parameter.starts_with("...") {
+                return false;
+            }
+            let name = match first_top_level_colon(parameter) {
+                Some(at) => &parameter[..at],
+                None => parameter,
+            };
+            name.trim_end().ends_with('?')
+        })
+        .collect()
+}
+
+fn parameter_list(printed: &str) -> Option<&str> {
+    let mut angle = 0i32;
+    let mut opened = None;
+    let mut depth = 0i32;
+    for (at, letter) in printed.char_indices() {
+        match letter {
+            '<' if opened.is_none() => angle += 1,
+            '>' if opened.is_none() => angle -= 1,
+            '(' if angle == 0 => {
+                if opened.is_none() {
+                    opened = Some(at + 1);
+                }
+                depth += 1;
+            }
+            ')' if opened.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&printed[opened?..at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_at_top_level(list: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (at, letter) in nesting(list) {
+        match letter {
+            Nesting::Opens => depth += 1,
+            Nesting::Closes => depth -= 1,
+            Nesting::Colon => {}
+            Nesting::Comma if depth <= 0 => {
+                pieces.push(&list[start..at]);
+                start = at + 1;
+            }
+            Nesting::Comma => {}
+        }
+    }
+    if !list[start..].trim().is_empty() {
+        pieces.push(&list[start..]);
+    }
+    pieces
+}
+
+fn first_top_level_colon(parameter: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (at, letter) in nesting(parameter) {
+        match letter {
+            Nesting::Opens => depth += 1,
+            Nesting::Closes => depth -= 1,
+            Nesting::Colon if depth <= 0 => return Some(at),
+            _ => {}
+        }
+    }
+    None
+}
+
+enum Nesting {
+    Opens,
+    Closes,
+    Comma,
+    Colon,
+}
+
+fn nesting(text: &str) -> Vec<(usize, Nesting)> {
+    let mut marks = Vec::new();
+    let mut letters = text.char_indices().peekable();
+    while let Some((at, letter)) = letters.next() {
+        match letter {
+            '=' if letters.peek().map(|(_, next)| *next) == Some('>') => {
+                letters.next();
+            }
+            '(' | '[' | '{' | '<' => marks.push((at, Nesting::Opens)),
+            ')' | ']' | '}' | '>' => marks.push((at, Nesting::Closes)),
+            ',' => marks.push((at, Nesting::Comma)),
+            ':' => marks.push((at, Nesting::Colon)),
+            _ => {}
+        }
+    }
+    marks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_printed_signature_marks_which_parameters_may_be_left_out() {
+        assert_eq!(
+            optional_parameters("(a: number, b?: string | undefined): void;"),
+            vec![false, true]
+        );
+        assert_eq!(
+            optional_parameters("(a: number, b: string | undefined): void;"),
+            vec![false, false],
+            "a parameter whose type admits undefined is not the same as an optional one"
+        );
+        assert_eq!(
+            optional_parameters("(a: number, ...rest: string[]): void;"),
+            vec![false, false]
+        );
+        assert_eq!(optional_parameters("(): void;"), Vec::<bool>::new());
+    }
+
+    #[test]
+    fn a_printed_signature_with_awkward_types_still_splits_by_parameter() {
+        assert_eq!(
+            optional_parameters("<T>(callback: (x: T, y?: T) => void, limit?: number): T;"),
+            vec![false, true],
+            "a `?` inside a parameter type belongs to that type, not to the parameter"
+        );
+        assert_eq!(
+            optional_parameters("(pair: [number, string], shape?: { a?: number }): void;"),
+            vec![false, true]
+        );
+        assert_eq!(
+            optional_parameters("(picked: A extends B ? C : D): void;"),
+            vec![false],
+            "a conditional type in a parameter does not make the parameter optional"
+        );
+    }
 
     #[test]
     fn any_from_a_declaration_becomes_unknown_so_it_must_be_narrowed() {

@@ -326,10 +326,12 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
             Parameter {
                 type_id: number,
                 rest: false,
+                optional: false,
             },
             Parameter {
                 type_id: text_kind,
                 rest: false,
+                optional: false,
             },
         ],
         boolean,
@@ -344,9 +346,29 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
     let Answer::Known(explicit) = explicit else {
         panic!("expected a known type for `explicitUndef`, got {explicit:?}");
     };
-    assert_eq!(
+    assert_ne!(
         loose, explicit,
-        "the API exposes no minimum arity, so `a?: T` and `a: T | undefined` collapse"
+        "the printed declaration marks `a?: T`, so it no longer collapses with `a: T | undefined`"
+    );
+    let TypeKind::Function {
+        parameters: loose_parameters,
+        ..
+    } = table.kind(loose).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(loose));
+    };
+    let TypeKind::Function {
+        parameters: explicit_parameters,
+        ..
+    } = table.kind(explicit).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(explicit));
+    };
+    assert!(loose_parameters[0].optional);
+    assert!(!explicit_parameters[0].optional);
+    assert_eq!(
+        loose_parameters[0].type_id, explicit_parameters[0].type_id,
+        "both still carry `T | undefined` as the type; only the mark differs"
     );
 
     let with_method = api.type_at(&mut table, path, Span::new(position_of("obj"), 0));
@@ -374,6 +396,7 @@ fn reads_literals_unions_and_arrays_from_the_provider() {
         vec![Parameter {
             type_id: boolean,
             rest: false,
+            optional: false,
         }],
         void,
     );
@@ -1088,11 +1111,13 @@ fn a_rest_parameter_is_marked_as_one() {
         vec![
             Parameter {
                 type_id: text,
-                rest: false
+                rest: false,
+                optional: false
             },
             Parameter {
                 type_id: texts,
-                rest: true
+                rest: true,
+                optional: false
             },
         ],
         "the rest parameter keeps the array type it declares and says it is a rest"

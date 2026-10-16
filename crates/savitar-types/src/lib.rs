@@ -29,6 +29,7 @@ pub struct Field {
 pub struct Parameter {
     pub type_id: TypeId,
     pub rest: bool,
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -84,6 +85,7 @@ pub enum TypeKind {
         object: TypeId,
         index: TypeId,
     },
+    Deferred(NominalId),
     Unresolved,
 }
 
@@ -276,6 +278,11 @@ impl TypeTable {
         })
     }
 
+    pub fn deferred(&mut self, name: impl Into<String>) -> TypeId {
+        let named = self.declare_nominal(name);
+        self.intern(TypeKind::Deferred(named))
+    }
+
     pub fn indexed_access(&mut self, object: TypeId, index: TypeId) -> TypeId {
         self.intern(TypeKind::IndexedAccess { object, index })
     }
@@ -452,6 +459,7 @@ mod tests {
             vec![Parameter {
                 type_id: number,
                 rest: false,
+                optional: false,
             }],
             number,
         );
@@ -459,6 +467,7 @@ mod tests {
             vec![Parameter {
                 type_id: text,
                 rest: false,
+                optional: false,
             }],
             number,
         );
@@ -488,6 +497,7 @@ mod tests {
             vec![Parameter {
                 type_id: parameter,
                 rest: false,
+                optional: false,
             }],
             parameter,
         );
@@ -496,6 +506,7 @@ mod tests {
             vec![Parameter {
                 type_id: parameter,
                 rest: false,
+                optional: false,
             }],
             parameter,
         );
@@ -511,10 +522,12 @@ mod tests {
         let left = Parameter {
             type_id: number,
             rest: false,
+            optional: false,
         };
         let right = Parameter {
             type_id: text,
             rest: false,
+            optional: false,
         };
         assert_ne!(
             table.function(vec![left.clone(), right.clone()], void),
@@ -937,6 +950,7 @@ mod tests {
             parameters: vec![Parameter {
                 type_id: maybe,
                 rest: false,
+                optional: false,
             }],
             returns: zero,
         });
@@ -945,6 +959,7 @@ mod tests {
             parameters: vec![Parameter {
                 type_id: number,
                 rest: false,
+                optional: false,
             }],
             returns: number,
         });

@@ -764,6 +764,7 @@ fn a_name_the_function_does_not_bind_is_read_as_a_global() {
         vec![savitar_types::Parameter {
             type_id: number,
             rest: false,
+            optional: false,
         }],
         number,
     );
@@ -806,6 +807,7 @@ fn an_await_takes_what_the_promise_holds() {
         vec![savitar_types::Parameter {
             type_id: text,
             rest: false,
+            optional: false,
         }],
         promised,
     );
@@ -881,6 +883,7 @@ fn a_generic_call_takes_its_type_argument_from_the_argument_it_is_given() {
         vec![savitar_types::Parameter {
             type_id: of_held,
             rest: false,
+            optional: false,
         }],
         maybe_held,
     );
@@ -939,10 +942,12 @@ fn a_deferred_indexed_access_is_resolved_once_the_call_binds_both_sides() {
             savitar_types::Parameter {
                 type_id: shape,
                 rest: false,
+                optional: false,
             },
             savitar_types::Parameter {
                 type_id: key,
                 rest: false,
+                optional: false,
             },
         ],
         reached,
@@ -1002,10 +1007,12 @@ fn a_deferred_indexed_access_that_reaches_no_field_is_refused() {
             savitar_types::Parameter {
                 type_id: shape,
                 rest: false,
+                optional: false,
             },
             savitar_types::Parameter {
                 type_id: key,
                 rest: false,
+                optional: false,
             },
         ],
         reached,
@@ -1044,6 +1051,7 @@ fn a_deferred_conditional_is_decided_once_the_call_binds_its_check() {
         vec![savitar_types::Parameter {
             type_id: held,
             rest: false,
+            optional: false,
         }],
         decided,
     );
@@ -1123,10 +1131,12 @@ fn a_generic_call_that_binds_one_type_parameter_twice_is_refused() {
             savitar_types::Parameter {
                 type_id: held,
                 rest: false,
+                optional: false,
             },
             savitar_types::Parameter {
                 type_id: held,
                 rest: false,
+                optional: false,
             },
         ],
         held,
@@ -1457,6 +1467,7 @@ fn one_parameter(table: &mut TypeTable, takes: savitar_types::TypeId) -> savitar
         vec![savitar_types::Parameter {
             type_id: takes,
             rest: false,
+            optional: false,
         }],
         number,
     )
@@ -1573,10 +1584,12 @@ fn a_rest_parameter_takes_every_argument_past_the_fixed_ones() {
             savitar_types::Parameter {
                 type_id: text,
                 rest: false,
+                optional: false,
             },
             savitar_types::Parameter {
                 type_id: texts,
                 rest: true,
+                optional: false,
             },
         ],
         number,
@@ -1625,10 +1638,12 @@ fn a_rest_argument_the_element_type_does_not_admit_is_refused() {
             savitar_types::Parameter {
                 type_id: text,
                 rest: false,
+                optional: false,
             },
             savitar_types::Parameter {
                 type_id: texts,
                 rest: true,
+                optional: false,
             },
         ],
         number,

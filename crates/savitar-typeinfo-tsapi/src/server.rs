@@ -11,9 +11,10 @@ use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTabl
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SignatureFlags, SymbolFlags, TypeFlags};
-use crate::translate::{Classified, classify};
+use crate::translate::{Classified, call_signature_kind, classify, optional_parameters};
 
 const MAX_TYPE_DEPTH: u32 = 32;
+const MAX_DEFERRED_UNROLLING: u32 = 2;
 
 #[derive(Debug)]
 pub enum TsApiError {
@@ -43,6 +44,7 @@ struct Connection {
 pub struct TsApi {
     connection: RefCell<Connection>,
     next_id: Cell<u64>,
+    unrolled: Cell<u32>,
     snapshot: RefCell<Value>,
     project: RefCell<Value>,
     cache: RefCell<HashMap<u32, TypeId>>,
@@ -102,6 +104,7 @@ impl TsApi {
                 stdout,
             }),
             next_id: Cell::new(0),
+            unrolled: Cell::new(0),
             snapshot: RefCell::new(Value::Null),
             project: RefCell::new(Value::Null),
             cache: RefCell::new(HashMap::new()),
@@ -400,7 +403,35 @@ impl TsApi {
         }
     }
 
+    fn named_type(&self, id: u32) -> String {
+        match self.request(
+            "typeToString",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "type": id,
+            }),
+        ) {
+            Ok(Value::String(printed)) => printed,
+            _ => "a deferred type the checker would not print".to_string(),
+        }
+    }
+
+    fn stopped_unrolling(&self, table: &mut TypeTable, id: u32) -> Answer {
+        Answer::Known(table.deferred(self.named_type(id)))
+    }
+
     fn intern_indexed_access(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        if self.unrolled.get() >= MAX_DEFERRED_UNROLLING {
+            return self.stopped_unrolling(table, id);
+        }
+        self.unrolled.set(self.unrolled.get() + 1);
+        let answer = self.unroll_indexed_access(table, id, depth);
+        self.unrolled.set(self.unrolled.get() - 1);
+        answer
+    }
+
+    fn unroll_indexed_access(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
         let object = match self.operand_of(table, "getObjectTypeOfType", id, depth) {
             Answer::Known(object) => object,
             other => return refusal_reached_through_member("the shape `T[K]` indexes", other),
@@ -413,6 +444,16 @@ impl TsApi {
     }
 
     fn intern_conditional(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        if self.unrolled.get() >= MAX_DEFERRED_UNROLLING {
+            return self.stopped_unrolling(table, id);
+        }
+        self.unrolled.set(self.unrolled.get() + 1);
+        let answer = self.unroll_conditional(table, id, depth);
+        self.unrolled.set(self.unrolled.get() - 1);
+        answer
+    }
+
+    fn unroll_conditional(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
         let mut operands = Vec::with_capacity(4);
         for method in [
             "getCheckTypeOfType",
@@ -490,6 +531,8 @@ impl TsApi {
             return Answer::Unsupported("getParametersOfSignature returned no array".into());
         };
 
+        let printed = self.printed_signature(signature_id);
+        let marked = optional_parameters(&printed);
         let signature_flags = signature
             .get("flags")
             .and_then(Value::as_u64)
@@ -507,8 +550,13 @@ impl TsApi {
                 Err(error) => return Answer::Unsupported(error.to_string()),
             };
             let rest = position == last && signature_flags.has(SignatureFlags::HAS_REST_PARAMETER);
+            let optional = marked.get(position).copied().unwrap_or(false);
             match self.intern_response(table, &parameter_type, depth + 1) {
-                Answer::Known(type_id) => interned.push(Parameter { type_id, rest }),
+                Answer::Known(type_id) => interned.push(Parameter {
+                    type_id,
+                    rest,
+                    optional,
+                }),
                 other => return other,
             }
         }
@@ -523,6 +571,28 @@ impl TsApi {
                 Answer::Known(table.generic_function(type_parameters, interned, returns))
             }
             other => other,
+        }
+    }
+
+    fn printed_signature(&self, signature_id: u32) -> String {
+        let declaration = self.request(
+            "signatureToSignatureDeclaration",
+            json!({
+                "snapshot": *self.snapshot.borrow(),
+                "project": *self.project.borrow(),
+                "signature": signature_id,
+                "kind": call_signature_kind(),
+            }),
+        );
+        let Ok(declaration) = declaration else {
+            return String::new();
+        };
+        let Some(data) = declaration.get("data").cloned() else {
+            return String::new();
+        };
+        match self.request("printNode", json!({ "data": data })) {
+            Ok(Value::String(printed)) => printed,
+            _ => String::new(),
         }
     }
 

@@ -122,6 +122,13 @@ fn replace(
             entered.remove(&id);
             return Err("this call leaves a type parameter with nothing to stand for".to_string());
         }
+        TypeKind::Deferred(named) => {
+            entered.remove(&id);
+            return Err(format!(
+                "this call reaches {}, which Savitar stopped unrolling",
+                table.nominal_name(named)
+            ));
+        }
         TypeKind::Array(element) => TypeKind::Array(replace(table, element, bindings, entered)?),
         TypeKind::ReadonlyArray(element) => {
             TypeKind::ReadonlyArray(replace(table, element, bindings, entered)?)
@@ -277,7 +284,7 @@ fn mentioned(table: &TypeTable, id: TypeId, seen: &mut HashSet<TypeId>) -> bool 
         return false;
     }
     match table.kind(id) {
-        TypeKind::TypeParameter(_) => true,
+        TypeKind::TypeParameter(_) | TypeKind::Deferred(_) => true,
         TypeKind::Array(inner) | TypeKind::ReadonlyArray(inner) | TypeKind::Promise(inner) => {
             mentioned(table, *inner, seen)
         }
