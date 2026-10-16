@@ -181,3 +181,9 @@ export function signalLabel(signal: Signal): string {
   }
   return `down ${at}`;
 }
+
+export function routeTimeout(
+  { timeout = 30 }: Route = { handler: "none" },
+): number {
+  return timeout;
+}

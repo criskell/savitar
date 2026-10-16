@@ -349,29 +349,35 @@ fn lower_function(
         declared
     };
 
-    let mut patterned = Vec::new();
+    let mut entering = Vec::new();
     for (position, parameter) in declaration.params.items.iter().enumerate() {
-        if let BindingPattern::BindingIdentifier(id) = &parameter.pattern {
-            let ty = context.type_at(table, id.span)?;
-            let value = function.declare_parameter(ty);
-            context
-                .scope
-                .insert(id.name.to_string(), Binding::written(value, ty));
+        let default = parameter.initializer.as_deref();
+        let declared = match &parameter.pattern {
+            BindingPattern::BindingIdentifier(id) => context.type_at(table, id.span)?,
+            _ => types::declared_parameter(table, signature, position, default.is_some())
+                .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?,
+        };
+        let Some(fallback) = default else {
+            let value = function.declare_parameter(declared);
+            match &parameter.pattern {
+                BindingPattern::BindingIdentifier(id) => {
+                    context
+                        .scope
+                        .insert(id.name.to_string(), Binding::written(value, declared));
+                }
+                pattern => entering.push((pattern, None, value, parameter.span)),
+            }
             continue;
-        }
-        if parameter.initializer.is_some() {
-            return Err(vec![refuse(
-                "unsupported-pattern",
-                parameter.span,
-                "a default on a parameter bound by a pattern is not lowered yet",
-            )]);
-        }
-        let ty = types::declared_parameter(table, signature, position)
-            .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?;
-        let value = function.declare_parameter(ty);
-        patterned.push((&parameter.pattern, value));
+        };
+        let omitted = table.optional(declared);
+        let value = function.declare_parameter(omitted);
+        entering.push((&parameter.pattern, Some(fallback), value, parameter.span));
     }
-    for (pattern, value) in patterned {
+    for (pattern, fallback, value, span) in entering {
+        let value = match fallback {
+            Some(fallback) => context.defaulted(table, &mut function, value, fallback, span)?,
+            None => value,
+        };
         context.bind_pattern(table, &mut function, pattern, value)?;
     }
 

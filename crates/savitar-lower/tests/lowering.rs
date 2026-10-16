@@ -7321,19 +7321,25 @@ fn a_patterned_parameter_beside_a_named_one_keeps_both_in_the_order_declared() {
 }
 
 #[test]
-fn a_parameter_bound_by_a_pattern_with_a_default_on_the_parameter_itself_is_refused() {
+fn a_parameter_bound_by_a_pattern_with_a_default_reads_the_pattern_from_the_joined_value() {
     let source = "function pick({ handler }: Route = { handler: \"none\" }): string {\n  return handler;\n}\n";
     let mut table = TypeTable::new();
     let text = table.intern(TypeKind::String);
     let route = route_shape(&mut table);
+    let omitted = table.optional(route);
     let signature = signature_taking(&mut table, vec![route], text);
     let provider = ByName::new(source, vec![("pick", signature)]);
     let file = SourceFile::new("pick.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert_eq!(function.type_of(function.parameters()[0]), omitted);
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), text);
 }
 
 #[test]
@@ -7904,4 +7910,109 @@ fn a_compound_write_to_a_field_of_a_union_proves_the_joined_value_against_every_
         "{:?}",
         report.diagnostics
     );
+}
+
+#[test]
+fn a_parameter_with_a_default_admits_undefined_at_the_edge_and_not_in_the_body() {
+    let source = "function page(limit: number = 20): number {\n  return limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let omitted = table.optional(number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 1);
+    assert_eq!(
+        function.type_of(function.parameters()[0]),
+        omitted,
+        "the call may omit the argument, so the parameter admits undefined"
+    );
+    assert!(tests_undefined(function));
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_parameter_default_that_does_not_fit_the_annotation_is_held_as_a_union_rather_than_coerced() {
+    let source = "function page(limit: number = \"ten\"): number | string {\n  return limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, either)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), either);
+}
+
+#[test]
+fn a_parameter_after_one_with_a_default_still_reads_from_its_own_value() {
+    let source = "function page(limit: number = 20, offset: number): number {\n  return limit + offset;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+            ("offset", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.parameters().len(), 2);
+    assert_eq!(function.type_of(function.parameters()[1]), number);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn a_parameter_that_only_admits_undefined_through_its_default_is_narrowed_before_it_is_read() {
+    let source = "function page(limit: number = 20): number {\n  return limit + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("page", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("page.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(
+        report.diagnostics.is_empty(),
+        "adding to the parameter proves it is no longer optional: {:?}",
+        report.diagnostics
+    );
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
 }

@@ -26,3 +26,14 @@ export function paths(requests: readonly Request[]): string[] {
   }
   return out;
 }
+
+export function windowSize(total: number, limit: number = 50): number {
+  if (total < limit) {
+    return total;
+  }
+  return limit;
+}
+
+export function backoff(attempt: number, base: number = 100): number {
+  return base * attempt;
+}
