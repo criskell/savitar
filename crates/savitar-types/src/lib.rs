@@ -74,6 +74,16 @@ pub enum TypeKind {
     Union(Vec<TypeId>),
     Nominal(NominalId),
     TypeParameter(u32),
+    Conditional {
+        check: TypeId,
+        bound: TypeId,
+        when_true: TypeId,
+        when_false: TypeId,
+    },
+    IndexedAccess {
+        object: TypeId,
+        index: TypeId,
+    },
     Unresolved,
 }
 
@@ -249,6 +259,25 @@ impl TypeTable {
             parameters,
             returns,
         })
+    }
+
+    pub fn conditional(
+        &mut self,
+        check: TypeId,
+        bound: TypeId,
+        when_true: TypeId,
+        when_false: TypeId,
+    ) -> TypeId {
+        self.intern(TypeKind::Conditional {
+            check,
+            bound,
+            when_true,
+            when_false,
+        })
+    }
+
+    pub fn indexed_access(&mut self, object: TypeId, index: TypeId) -> TypeId {
+        self.intern(TypeKind::IndexedAccess { object, index })
     }
 
     pub fn optional(&mut self, inner: TypeId) -> TypeId {

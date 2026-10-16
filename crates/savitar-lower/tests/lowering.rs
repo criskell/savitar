@@ -919,6 +919,168 @@ fn a_generic_call_takes_its_type_argument_from_the_argument_it_is_given() {
 }
 
 #[test]
+fn a_deferred_indexed_access_is_resolved_once_the_call_binds_both_sides() {
+    let source = "function at(route: Route): string {\n  return indexAt(route, \"path\");\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = table.object(vec![Field {
+        name: "path".to_string(),
+        type_id: text,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let shape = table.fresh_type_parameter();
+    let key = table.fresh_type_parameter();
+    let reached = table.indexed_access(shape, key);
+    let index_at = table.generic_function(
+        vec![shape, key],
+        vec![
+            savitar_types::Parameter {
+                type_id: shape,
+                rest: false,
+            },
+            savitar_types::Parameter {
+                type_id: key,
+                rest: false,
+            },
+        ],
+        reached,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("at", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+            ("indexAt", Answer::Known(index_at)),
+        ],
+    );
+    let file = SourceFile::new("at.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let called = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Call { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the call should be lowered");
+    assert_eq!(
+        function.type_of(called),
+        text,
+        "`T[K]` reaches the field the key names once both sides are bound"
+    );
+}
+
+#[test]
+fn a_deferred_indexed_access_that_reaches_no_field_is_refused() {
+    let source = "function at(route: Route): string {\n  return indexAt(route, \"missing\");\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let route = table.object(vec![Field {
+        name: "path".to_string(),
+        type_id: text,
+        optional: false,
+        method: false,
+        readonly: false,
+    }]);
+    let shape = table.fresh_type_parameter();
+    let key = table.fresh_type_parameter();
+    let reached = table.indexed_access(shape, key);
+    let index_at = table.generic_function(
+        vec![shape, key],
+        vec![
+            savitar_types::Parameter {
+                type_id: shape,
+                rest: false,
+            },
+            savitar_types::Parameter {
+                type_id: key,
+                rest: false,
+            },
+        ],
+        reached,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("at", returning(&mut table, text)),
+            ("route", Answer::Known(route)),
+            ("indexAt", Answer::Known(index_at)),
+        ],
+    );
+    let file = SourceFile::new("at.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("no field named"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_deferred_conditional_is_decided_once_the_call_binds_its_check() {
+    let source = "function name(value: string): string {\n  return nameOf(value);\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let held = table.fresh_type_parameter();
+    let decided = table.conditional(held, text, text, number);
+    let name_of = table.generic_function(
+        vec![held],
+        vec![savitar_types::Parameter {
+            type_id: held,
+            rest: false,
+        }],
+        decided,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("name", returning(&mut table, text)),
+            ("value", Answer::Known(text)),
+            ("nameOf", Answer::Known(name_of)),
+        ],
+    );
+    let file = SourceFile::new("name.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    let called = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                target,
+                value: Rvalue::Call { .. },
+                ..
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("the call should be lowered");
+    assert_eq!(
+        function.type_of(called),
+        text,
+        "the bound check type fits the bound, so the true branch decides"
+    );
+}
+
+#[test]
 fn a_generic_call_with_nothing_to_bind_its_type_parameter_is_refused() {
     let source = "function head(): number {\n  return makeOne();\n}\n";
     let mut table = TypeTable::new();

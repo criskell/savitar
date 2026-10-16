@@ -50,6 +50,7 @@ const SOURCE: &str = concat!(
     "declare const keyedPath: Keyed[\"path\"];\n",
     "declare const keyedByAnyKey: Keyed[keyof Keyed];\n",
     "declare function indexAt<T, K extends keyof T>(t: T, k: K): T[K];\n",
+    "declare function nameOf<T>(t: T): T extends string ? \"text\" : \"other\";\n",
     "declare const pattern: RegExp;\n",
     "declare const execArray: RegExpExecArray;\n",
     "interface Labelled extends Array<number> { label: string }\n",
@@ -741,7 +742,7 @@ fn a_concrete_indexed_access_arrives_already_resolved_by_the_checker() {
 }
 
 #[test]
-fn an_indexed_access_over_type_parameters_is_refused_naming_both_operands() {
+fn an_indexed_access_over_type_parameters_arrives_deferred_with_both_operands() {
     let Some(binary) = provider_binary() else {
         eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
         return;
@@ -755,39 +756,36 @@ fn an_indexed_access_over_type_parameters_is_refused_naming_both_operands() {
     let mut table = TypeTable::new();
 
     let answer = api.type_at(&mut table, path, Span::new(position_of("indexAt"), 0));
-    let Answer::Unsupported(reason) = answer else {
-        panic!("a deferred `T[K]` must not be guessed, got {answer:?}");
+    let Answer::Known(signature) = answer else {
+        panic!("expected a known signature for `indexAt`, got {answer:?}");
     };
-    assert_eq!(
-        reason, "`T[K]` stays deferred: a type parameter indexed by a type parameter",
-        "the refusal should name what the checker left abstract"
+    let TypeKind::Function {
+        parameters,
+        returns,
+        ..
+    } = table.kind(signature).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(signature));
+    };
+    let TypeKind::IndexedAccess { object, index } = table.kind(returns).clone() else {
+        panic!(
+            "`T[K]` should arrive as a deferred indexed access, got {:?}",
+            table.kind(returns)
+        );
+    };
+    assert!(
+        matches!(table.kind(object), TypeKind::TypeParameter(_)),
+        "the object side is the type parameter the signature declares, got {:?}",
+        table.kind(object)
     );
-
-    std::fs::remove_dir_all(&project).ok();
-}
-
-#[test]
-fn the_refusal_behind_regexp_names_the_member_path_to_its_conditional_index() {
-    let Some(binary) = provider_binary() else {
-        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
-        return;
-    };
-
-    let project = scratch_project_with("\"strict\": true, \"target\": \"es2022\"");
-    let file = project.join("a.ts");
-    let api = TsApi::start(&binary, &project, &[file.as_path()])
-        .expect("the provider should start and create a snapshot");
-    let path = file.to_str().expect("utf-8 path");
-    let mut table = TypeTable::new();
-
-    let answer = api.type_at(&mut table, path, Span::new(position_of("pattern"), 0));
-    let Answer::Unsupported(reason) = answer else {
-        panic!("`RegExp` carries `FlatArray<A, D>`, which must not be guessed, got {answer:?}");
-    };
+    assert!(
+        matches!(table.kind(index), TypeKind::TypeParameter(_)),
+        "the index side stays a type parameter, got {:?}",
+        table.kind(index)
+    );
     assert_eq!(
-        reason,
-        "`exec`: `indices`: `flat`: `T[K]` stays deferred: an object shape indexed by a conditional type",
-        "the blocker sits under `exec`, so the refusal must name the member path to it"
+        parameters[0].type_id, object,
+        "the deferred access points at the same type parameter the first parameter has"
     );
 
     std::fs::remove_dir_all(&project).ok();
@@ -1110,6 +1108,92 @@ fn a_rest_parameter_is_marked_as_one() {
     assert!(
         parameters.iter().all(|parameter| !parameter.rest),
         "a signature with no rest parameter marks none"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn a_conditional_type_arrives_deferred_with_its_four_operands() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("nameOf"), 0));
+    let Answer::Known(signature) = answer else {
+        panic!("expected a known signature for `nameOf`, got {answer:?}");
+    };
+    let TypeKind::Function {
+        parameters,
+        returns,
+        ..
+    } = table.kind(signature).clone()
+    else {
+        panic!("expected a function, got {:?}", table.kind(signature));
+    };
+    let TypeKind::Conditional {
+        check,
+        bound,
+        when_true,
+        when_false,
+    } = table.kind(returns).clone()
+    else {
+        panic!(
+            "a conditional type should arrive deferred, got {:?}",
+            table.kind(returns)
+        );
+    };
+    assert!(
+        matches!(table.kind(check), TypeKind::TypeParameter(_)),
+        "the check side is a type parameter, got {:?}",
+        table.kind(check)
+    );
+    assert_ne!(
+        check, parameters[0].type_id,
+        "measured: the checker hands the conditional a type parameter of its own, not the one the signature declares, so a call site cannot bind it"
+    );
+    assert_eq!(table.kind(bound), &TypeKind::String);
+    assert_eq!(
+        table.kind(when_true),
+        &TypeKind::StringLiteral("text".to_string())
+    );
+    assert_eq!(
+        table.kind(when_false),
+        &TypeKind::StringLiteral("other".to_string())
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn the_refusal_behind_regexp_names_the_recursion_it_cannot_unroll() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project();
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(&mut table, path, Span::new(position_of("pattern"), 0));
+    let Answer::Unsupported(reason) = answer else {
+        panic!("`RegExp` should still be refused, got {answer:?}");
+    };
+    assert!(
+        reason.starts_with("`exec`: `indices`:") && reason.contains("nests deeper"),
+        "the refusal should name the member path and say the walk ran out of depth, got {reason}"
     );
 
     std::fs::remove_dir_all(&project).ok();

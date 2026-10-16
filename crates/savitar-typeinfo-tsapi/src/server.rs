@@ -11,7 +11,7 @@ use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTabl
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SignatureFlags, SymbolFlags, TypeFlags};
-use crate::translate::{Classified, classify, describe};
+use crate::translate::{Classified, classify};
 
 const MAX_TYPE_DEPTH: u32 = 32;
 
@@ -391,19 +391,41 @@ impl TsApi {
         Ok(signatures)
     }
 
-    fn operand_of_indexed_access(&self, method: &str, id: u32) -> String {
+    fn operand_of(&self, table: &mut TypeTable, method: &str, id: u32, depth: u32) -> Answer {
         match self.checker_call(method, "objectId", id) {
-            Ok(operand) => describe(type_flags_of(&operand)).to_string(),
-            Err(error) => format!("a type the checker would not hand over ({error})"),
+            Ok(operand) => self.intern_response(table, &operand, depth + 1),
+            Err(error) => Answer::Unsupported(format!(
+                "the checker would not hand over the operand of a deferred type ({error})"
+            )),
         }
     }
 
-    fn refuse_indexed_access(&self, id: u32) -> Answer {
-        Answer::Unsupported(format!(
-            "`T[K]` stays deferred: {} indexed by {}",
-            self.operand_of_indexed_access("getObjectTypeOfType", id),
-            self.operand_of_indexed_access("getIndexTypeOfType", id)
-        ))
+    fn intern_indexed_access(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        let object = match self.operand_of(table, "getObjectTypeOfType", id, depth) {
+            Answer::Known(object) => object,
+            other => return refusal_reached_through_member("the shape `T[K]` indexes", other),
+        };
+        let index = match self.operand_of(table, "getIndexTypeOfType", id, depth) {
+            Answer::Known(index) => index,
+            other => return refusal_reached_through_member("the key of `T[K]`", other),
+        };
+        Answer::Known(table.indexed_access(object, index))
+    }
+
+    fn intern_conditional(&self, table: &mut TypeTable, id: u32, depth: u32) -> Answer {
+        let mut operands = Vec::with_capacity(4);
+        for method in [
+            "getCheckTypeOfType",
+            "getExtendsTypeOfType",
+            "getTrueTypeOfConditionalType",
+            "getFalseTypeOfConditionalType",
+        ] {
+            match self.operand_of(table, method, id, depth) {
+                Answer::Known(operand) => operands.push(operand),
+                other => return refusal_reached_through_member("a conditional type", other),
+            }
+        }
+        Answer::Known(table.conditional(operands[0], operands[1], operands[2], operands[3]))
     }
 
     fn symbol_is_readonly(&self, reference: &Value) -> Result<bool, TsApiError> {
@@ -833,7 +855,20 @@ impl TsApi {
                 None => return Answer::Unsupported("a boolean literal with no value".into()),
             },
             Classified::TypeParameter => table.fresh_type_parameter(),
-            Classified::IndexedAccess => return self.refuse_indexed_access(id),
+            Classified::IndexedAccess => {
+                let answer = self.intern_indexed_access(table, id, depth);
+                if let Answer::Known(interned) = answer {
+                    self.cache.borrow_mut().insert(id, interned);
+                }
+                return answer;
+            }
+            Classified::Conditional => {
+                let answer = self.intern_conditional(table, id, depth);
+                if let Answer::Known(interned) = answer {
+                    self.cache.borrow_mut().insert(id, interned);
+                }
+                return answer;
+            }
             Classified::Intersection => {
                 let answer = self.intern_intersection(table, id, depth);
                 if let Answer::Known(interned) = answer {

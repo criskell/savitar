@@ -180,6 +180,35 @@ fn replace(
                 returns: replace(table, returns, bindings, entered)?,
             }
         }
+        TypeKind::Conditional {
+            check,
+            bound,
+            when_true,
+            when_false,
+        } => {
+            let check = replace(table, check, bindings, entered)?;
+            let bound = replace(table, bound, bindings, entered)?;
+            let when_true = replace(table, when_true, bindings, entered)?;
+            let when_false = replace(table, when_false, bindings, entered)?;
+            entered.remove(&id);
+            if mentions_a_type_parameter(table, check) || mentions_a_type_parameter(table, bound) {
+                return Ok(table.conditional(check, bound, when_true, when_false));
+            }
+            return Ok(if crate::assignable(table, check, bound) {
+                when_true
+            } else {
+                when_false
+            });
+        }
+        TypeKind::IndexedAccess { object, index } => {
+            let object = replace(table, object, bindings, entered)?;
+            let index = replace(table, index, bindings, entered)?;
+            entered.remove(&id);
+            if mentions_a_type_parameter(table, object) || mentions_a_type_parameter(table, index) {
+                return Ok(table.indexed_access(object, index));
+            }
+            return reach(table, object, index);
+        }
         TypeKind::Overloaded(forms) => {
             let mut built = Vec::with_capacity(forms.len());
             for form in forms {
@@ -199,6 +228,42 @@ fn replace(
     };
     entered.remove(&id);
     Ok(table.intern(built))
+}
+
+fn reach(table: &TypeTable, object: TypeId, index: TypeId) -> Result<TypeId, String> {
+    match (table.kind(object), table.kind(index)) {
+        (TypeKind::Object { fields, .. }, TypeKind::StringLiteral(name)) => fields
+            .iter()
+            .find(|field| field.name == *name)
+            .map(|field| field.type_id)
+            .ok_or_else(|| format!("`T[K]` reaches no field named `{name}`")),
+        (
+            TypeKind::Array(element) | TypeKind::ReadonlyArray(element),
+            TypeKind::Number | TypeKind::NumberLiteral(_),
+        ) => Ok(*element),
+        (TypeKind::Object { indexes, .. }, key) if !indexes.is_empty() => indexes
+            .iter()
+            .find(|index| match table.kind(index.key) {
+                TypeKind::String => {
+                    matches!(key, TypeKind::String | TypeKind::StringLiteral(_))
+                }
+                TypeKind::Number => {
+                    matches!(key, TypeKind::Number | TypeKind::NumberLiteral(_))
+                }
+                _ => false,
+            })
+            .map(|index| index.value)
+            .ok_or_else(|| "`T[K]` has no index signature that takes this key".to_string()),
+        (TypeKind::Tuple { elements, .. }, TypeKind::NumberLiteral(bits)) => {
+            let wanted = f64::from_bits(*bits);
+            elements
+                .iter()
+                .enumerate()
+                .find_map(|(position, &element)| (position as f64 == wanted).then_some(element))
+                .ok_or_else(|| "`T[K]` reaches outside the tuple".to_string())
+        }
+        _ => Err("`T[K]` over a shape Savitar cannot index yet".to_string()),
+    }
 }
 
 #[must_use]
@@ -238,6 +303,20 @@ fn mentioned(table: &TypeTable, id: TypeId, seen: &mut HashSet<TypeId>) -> bool 
                 || mentioned(table, *returns, seen)
         }
         TypeKind::Overloaded(forms) => forms.iter().any(|&form| mentioned(table, form, seen)),
+        TypeKind::Conditional {
+            check,
+            bound,
+            when_true,
+            when_false,
+        } => {
+            mentioned(table, *check, seen)
+                || mentioned(table, *bound, seen)
+                || mentioned(table, *when_true, seen)
+                || mentioned(table, *when_false, seen)
+        }
+        TypeKind::IndexedAccess { object, index } => {
+            mentioned(table, *object, seen) || mentioned(table, *index, seen)
+        }
         TypeKind::Union(members) => members.iter().any(|&member| mentioned(table, member, seen)),
         _ => false,
     }
