@@ -1,0 +1,18 @@
+[package]
+name = "savitar-modules"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The module graph: which files exist, who imports whom, and in what order they may be evaluated"
+
+[dependencies]
+savitar-diagnostics.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true
+oxc_resolver = "11.24.3"
+
+[lints]
+workspace = true
