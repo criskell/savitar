@@ -43,6 +43,10 @@ fn lowering_gap_ceiling_path(corpus: &Path) -> PathBuf {
     corpus.join("lowering-gap-ceiling.txt")
 }
 
+fn module_initializer_floor_path(corpus: &Path) -> PathBuf {
+    corpus.join("module-initializer-floor.txt")
+}
+
 fn assert_ceiling(ceiling_file: &Path, measured: &Measured, counted: usize) {
     let ceiling: usize = std::fs::read_to_string(ceiling_file)
         .expect("the ceiling should be recorded")
@@ -67,6 +71,7 @@ fn assert_ceiling(ceiling_file: &Path, measured: &Measured, counted: usize) {
 struct Measured {
     coverage: Coverage,
     gaps: Vec<String>,
+    initializers: usize,
 }
 
 fn measure(directory: &Path, binary: &OsString) -> Measured {
@@ -97,7 +102,11 @@ fn measure(directory: &Path, binary: &OsString) -> Measured {
         }
     }
 
-    Measured { coverage, gaps }
+    Measured {
+        coverage,
+        gaps,
+        initializers: 0,
+    }
 }
 
 fn assert_ratchet(directory: &Path, measured: &Measured, counted: usize) {
@@ -144,6 +153,7 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
     let mut table = TypeTable::new();
     let mut coverage = Coverage::default();
     let mut gaps: Vec<String> = Vec::new();
+    let mut initializers = 0usize;
 
     for path in &files {
         let text = std::fs::read_to_string(path).expect("the file should be readable");
@@ -152,6 +162,15 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         let report = lower(&file, &api, &mut table);
         coverage.known += report.functions.len();
         coverage.unsupported += report.diagnostics.len();
+        if let Some(initializer) = report.initializer.as_ref() {
+            initializers += 1;
+            assert_eq!(
+                savitar_ir::verify(&initializer.function),
+                vec![],
+                "the module initializer of {} should be valid code",
+                file.name()
+            );
+        }
         for diagnostic in &report.diagnostics {
             let at = file.line_col(diagnostic.span.start);
             gaps.push(format!(
@@ -164,7 +183,11 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         }
     }
 
-    Measured { coverage, gaps }
+    Measured {
+        coverage,
+        gaps,
+        initializers,
+    }
 }
 
 #[test]
@@ -204,6 +227,23 @@ fn the_number_of_functions_lowered_never_falls() {
         &lowering_gap_ceiling_path(&corpus),
         &measured,
         measured.gaps.len(),
+    );
+}
+
+#[test]
+fn the_number_of_module_initializers_lowered_never_falls() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = lower_corpus(&corpus, &binary);
+    assert_floor(
+        &module_initializer_floor_path(&corpus),
+        &measured,
+        measured.initializers,
     );
 }
 

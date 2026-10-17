@@ -10669,41 +10669,91 @@ fn walked(source: &str) -> savitar_lower::LowerReport {
     lower(&file, &provider, &mut table)
 }
 
+fn module_bindings(initializer: &savitar_lower::ModuleInitializer) -> Vec<String> {
+    initializer
+        .function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::BindModule { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
-fn a_module_variable_declaration_is_refused_instead_of_skipped() {
+fn a_module_variable_declaration_becomes_a_binding_of_the_module_initializer() {
     let report = walked("const limit = 8;\n");
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics.len(), 1);
-    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
-    assert!(
-        report.diagnostics[0]
-            .message
-            .contains("a variable declaration at module level"),
-        "{:?}",
-        report.diagnostics[0].message
-    );
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(verify(&initializer.function), vec![]);
+    assert_eq!(module_bindings(initializer), vec!["limit".to_string()]);
 }
 
 #[test]
-fn an_exported_module_variable_declaration_is_refused_instead_of_skipped() {
+fn an_exported_module_variable_declaration_becomes_a_binding_too() {
     let report = walked("export const host = \"0.0.0.0\";\n");
 
-    assert!(report.functions.is_empty());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(module_bindings(initializer), vec!["host".to_string()]);
+}
+
+#[test]
+fn a_module_with_no_top_level_code_has_no_initializer() {
+    let report = walked("export interface Shape {\n  size: number;\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(report.initializer.is_none());
+}
+
+#[test]
+fn a_var_declaration_at_module_level_is_refused_because_it_hoists() {
+    let report = walked("var limit = 8;\n");
+
+    assert!(report.initializer.is_none());
     assert_eq!(report.diagnostics.len(), 1);
     assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
     assert!(
         report.diagnostics[0]
             .message
-            .contains("a variable declaration at module level"),
+            .contains("a `var` declaration at module level"),
         "{:?}",
         report.diagnostics[0].message
     );
 }
 
 #[test]
-fn a_module_level_refusal_carries_the_line_and_column_of_the_statement() {
-    let source = "export interface Shape {\n  size: number;\n}\n\nexport const limit = 8;\n";
+fn a_module_level_declaration_with_no_initialiser_is_refused_by_name() {
+    let source = "let limit: number;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("limit", Answer::Known(number))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0].message.contains("no initialiser"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_refusal_in_the_module_initializer_carries_the_line_and_column() {
+    let source = "export interface Shape {\n  size: number;\n}\n\nvar limit = 8;\n";
     let mut table = TypeTable::new();
     let provider = ByName::new(source, Vec::new());
     let file = SourceFile::new("module.ts", source);
@@ -10717,16 +10767,39 @@ fn a_module_level_refusal_carries_the_line_and_column_of_the_statement() {
 }
 
 #[test]
-fn every_module_variable_declaration_is_refused_once() {
+fn every_module_variable_declaration_reaches_the_same_initializer_in_source_order() {
     let report = walked("const host = \"0.0.0.0\";\nconst port = 8080;\n");
 
-    assert_eq!(report.diagnostics.len(), 2);
-    assert!(
-        report
-            .diagnostics
-            .iter()
-            .all(|gap| gap.rule == "unsupported-module-statement")
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(
+        module_bindings(initializer),
+        vec!["host".to_string(), "port".to_string()]
     );
+}
+
+#[test]
+fn a_call_while_the_module_initialises_is_refused_by_name() {
+    let source = "function size(): number {\n  return 1;\n}\n\nconst limit = size();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
 }
 
 #[test]
@@ -10849,7 +10922,7 @@ fn an_overload_signature_carries_no_body_and_is_not_refused() {
 }
 
 #[test]
-fn a_function_beside_a_refused_module_variable_declaration_still_lowers() {
+fn a_function_beside_a_module_variable_declaration_lowers_apart_from_the_initializer() {
     let source = "export const limit = 8;\n\nfunction twice(count: number): number {\n  return count * 2;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -10864,9 +10937,9 @@ fn a_function_beside_a_refused_module_variable_declaration_still_lowers() {
 
     let report = lower(&file, &provider, &mut table);
 
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert_eq!(report.functions.len(), 1);
-    assert_eq!(report.diagnostics.len(), 1);
-    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(report.initializer.is_some());
 }
 
 #[test]
@@ -11665,5 +11738,297 @@ fn an_annotation_on_a_pattern_declarator_does_not_type_the_position_so_the_initi
             .any(|diagnostic| diagnostic.severity == savitar_diagnostics::Severity::Unsupported),
         "{:?}",
         report.diagnostics
+    );
+}
+
+fn reads_of(function: &savitar_ir::Function) -> Vec<Rvalue> {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Assign { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_function_reads_a_module_level_binding_as_a_module_binding_and_not_as_a_global() {
+    let source = "const limit = 8;\n\nfunction under(count: number): boolean {\n  return count < limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("under", returning(&mut table, boolean)),
+            ("count", Answer::Known(number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0])
+            .iter()
+            .any(|read| matches!(read, Rvalue::ModuleBinding(name) if name == "limit")),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn a_function_reads_a_module_level_function_by_name_as_a_module_binding() {
+    let source = "function helper(): number {\n  return 1;\n}\n\nfunction use(): number {\n  return helper();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("helper", returning(&mut table, number)),
+            ("use", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[1])
+            .iter()
+            .any(|read| matches!(read, Rvalue::ModuleBinding(name) if name == "helper")),
+        "{:?}",
+        reads_of(&report.functions[1])
+    );
+}
+
+#[test]
+fn a_function_reads_an_imported_name_as_an_import_and_not_as_a_global() {
+    let source = "import { address } from \"./config.ts\";\n\nfunction show(): string {\n  return address;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("show", returning(&mut table, text)),
+            ("address", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("service.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0]).iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./config.ts" && name == "address"
+        )),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn an_import_renamed_at_the_brace_keeps_the_name_the_other_module_exports() {
+    let source = "import { address as shown } from \"./config.ts\";\n\nfunction show(): string {\n  return shown;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("show", returning(&mut table, text)),
+            ("shown", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("service.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0]).iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./config.ts" && name == "address"
+        )),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn a_name_no_module_level_declaration_binds_is_still_read_as_a_global() {
+    let source = "function use(): number {\n  return elsewhere;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("elsewhere", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0])
+            .iter()
+            .any(|read| matches!(read, Rvalue::Global(name) if name == "elsewhere")),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn reading_a_name_imported_whole_is_refused_by_name() {
+    let source = "import * as config from \"./config.ts\";\n\nfunction host(): string {\n  return config.host;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(source, vec![("host", returning(&mut table, text))]);
+    let file = SourceFile::new("service.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-import");
+    assert!(
+        report.diagnostics[0].message.contains("imported whole"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn reading_a_name_a_package_exports_is_refused_by_name() {
+    let source = "import { pool } from \"pg\";\n\nfunction size(): number {\n  return pool;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("pool", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("service.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-package-import");
+}
+
+#[test]
+fn writing_a_module_level_binding_from_a_function_is_refused_by_name() {
+    let source = "let limit = 8;\n\nfunction raise(): void {\n  limit = 9;\n}\n";
+    let mut table = TypeTable::new();
+    let void = table.intern(TypeKind::Void);
+    let provider = ByName::new(source, vec![("raise", returning(&mut table, void))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-write");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("bound by the initializer of this module"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_an_imported_name_from_a_function_is_refused_by_name() {
+    let source =
+        "import { port } from \"./config.ts\";\n\nfunction bump(): void {\n  port = 1;\n}\n";
+    let mut table = TypeTable::new();
+    let void = table.intern(TypeKind::Void);
+    let provider = ByName::new(source, vec![("bump", returning(&mut table, void))]);
+    let file = SourceFile::new("service.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-write");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("imported from another module"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_module_declaration_reads_the_one_the_initializer_bound_before_it() {
+    let report = walked("const base = 8;\nconst doubled = base + base;\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(verify(&initializer.function), vec![]);
+    assert_eq!(
+        module_bindings(initializer),
+        vec!["base".to_string(), "doubled".to_string()]
+    );
+}
+
+#[test]
+fn a_module_declaration_that_reads_a_name_declared_after_it_is_refused() {
+    let report = walked("const early = later;\nconst later = 8;\n");
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+}
+
+#[test]
+fn a_destructured_module_declaration_binds_every_name_it_names() {
+    let source = "const { host, port } = whole;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let whole = table.object(vec![
+        Field {
+            name: "host".to_string(),
+            type_id: text,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+        Field {
+            name: "port".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        },
+    ]);
+    let provider = ByName::new(source, vec![("whole", Answer::Known(whole))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(
+        module_bindings(initializer),
+        vec!["host".to_string(), "port".to_string()]
     );
 }

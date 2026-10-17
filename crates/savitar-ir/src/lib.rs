@@ -76,6 +76,11 @@ pub struct Capture {
 pub enum Rvalue {
     Parameter(u32),
     Global(String),
+    ModuleBinding(String),
+    Imported {
+        specifier: String,
+        name: String,
+    },
     Constant(Constant),
     Widen(ValueId),
     Narrow(ValueId),
@@ -149,6 +154,11 @@ pub enum Statement {
         base_class: String,
         object: ValueId,
         arguments: Vec<ValueId>,
+        span: Span,
+    },
+    BindModule {
+        name: String,
+        value: ValueId,
         span: Span,
     },
 }

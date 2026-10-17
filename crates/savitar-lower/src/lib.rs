@@ -1,4 +1,5 @@
 mod assigned;
+mod names;
 mod types;
 
 use std::collections::{BTreeSet, HashMap};
@@ -9,7 +10,7 @@ use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration,
     ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft, FunctionBody,
     MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
-    SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
+    SimpleAssignmentTarget, Statement as AstStatement, VariableDeclaration, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -24,12 +25,20 @@ use savitar_ir::{
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
+use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
 #[derive(Debug)]
 pub struct LowerReport {
     pub functions: Vec<Function>,
+    pub initializer: Option<ModuleInitializer>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug)]
+pub struct ModuleInitializer {
+    pub function: Function,
+    pub closures: Vec<Function>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,6 +469,8 @@ struct Capturing<'a> {
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
+    module_names: &'a ModuleNames,
+    initialising_the_module: bool,
     returns: TypeId,
     scope: Scope,
     statements: Vec<Statement>,
@@ -490,23 +501,32 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
     if parsed.fatal_error {
         return LowerReport {
             functions: Vec::new(),
+            initializer: None,
             diagnostics: Vec::new(),
         };
     }
 
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
+    let module_names = ModuleNames::of(&parsed.program.body);
+    let surroundings = Surroundings {
+        file,
+        provider,
+        module_names: &module_names,
+    };
+    let mut initializes: Vec<&VariableDeclaration<'_>> = Vec::new();
 
     for statement in &parsed.program.body {
         match at_module_level(statement) {
             AtModuleLevel::Lowered(declared) => {
-                for outcome in lower_declared(file, provider, table, declared) {
+                for outcome in lower_declared(surroundings, table, declared) {
                     match outcome {
                         Ok(function) => functions.push(function),
                         Err(problems) => diagnostics.extend(problems),
                     }
                 }
             }
+            AtModuleLevel::Initializes(declaration) => initializes.push(declaration),
             AtModuleLevel::CarriesNoCode => {}
             AtModuleLevel::NotLowered(form) => {
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
@@ -514,9 +534,20 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
         }
     }
 
+    let initializer =
+        match lower_module_initializer(surroundings, table, &parsed.program.body, &initializes) {
+            None => None,
+            Some(Ok(initializer)) => Some(initializer),
+            Some(Err(problems)) => {
+                diagnostics.extend(problems);
+                None
+            }
+        };
+
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
     LowerReport {
         functions,
+        initializer,
         diagnostics,
     }
 }
@@ -529,8 +560,16 @@ enum Declared<'a> {
 
 enum AtModuleLevel<'a> {
     Lowered(Declared<'a>),
+    Initializes(&'a VariableDeclaration<'a>),
     CarriesNoCode,
     NotLowered(&'static str),
+}
+
+fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtModuleLevel<'a> {
+    if declaration.kind == VariableDeclarationKind::Var {
+        return AtModuleLevel::NotLowered("a `var` declaration");
+    }
+    AtModuleLevel::Initializes(declaration)
 }
 
 fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnostic {
@@ -569,6 +608,7 @@ fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
         | AstStatement::ExportNamedDeclaration(_)
         | AstStatement::ExportAllDeclaration(_)
         | AstStatement::EmptyStatement(_) => AtModuleLevel::CarriesNoCode,
+        AstStatement::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
         other => AtModuleLevel::NotLowered(module_level_form(other)),
     }
 }
@@ -582,7 +622,7 @@ fn declared_by_export<'a>(declaration: &'a Declaration<'a>) -> AtModuleLevel<'a>
         Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
             AtModuleLevel::CarriesNoCode
         }
-        Declaration::VariableDeclaration(_) => AtModuleLevel::NotLowered("a variable declaration"),
+        Declaration::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
         Declaration::TSEnumDeclaration(_) => AtModuleLevel::NotLowered("an enum declaration"),
         Declaration::TSExternalModuleDeclaration(_) => {
             AtModuleLevel::NotLowered("a `declare module` declaration")
@@ -601,7 +641,6 @@ fn declared_by_export<'a>(declaration: &'a Declaration<'a>) -> AtModuleLevel<'a>
 
 fn module_level_form(statement: &AstStatement<'_>) -> &'static str {
     match statement {
-        AstStatement::VariableDeclaration(_) => "a variable declaration",
         AstStatement::ExpressionStatement(_) => "an expression statement",
         AstStatement::BlockStatement(_) => "a block",
         AstStatement::IfStatement(_) => "an `if`",
@@ -632,9 +671,123 @@ fn module_level_form(statement: &AstStatement<'_>) -> &'static str {
 
 type Outcome = Result<Function, Vec<Diagnostic>>;
 
+#[derive(Clone, Copy)]
+struct Surroundings<'a> {
+    file: &'a SourceFile,
+    provider: &'a dyn TypeProvider,
+    module_names: &'a ModuleNames,
+}
+
+fn lower_module_initializer(
+    surroundings: Surroundings<'_>,
+    table: &mut TypeTable,
+    body: &[AstStatement<'_>],
+    initializes: &[&VariableDeclaration<'_>],
+) -> Option<Result<ModuleInitializer, Vec<Diagnostic>>> {
+    if initializes.is_empty() {
+        return None;
+    }
+    let written = assigned::names_written_through_closures(body);
+    Some(build_module_initializer(
+        surroundings,
+        table,
+        &written,
+        initializes,
+    ))
+}
+
+fn build_module_initializer<'a>(
+    surroundings: Surroundings<'a>,
+    table: &mut TypeTable,
+    written_names: &'a BTreeSet<String>,
+    initializes: &[&VariableDeclaration<'_>],
+) -> Result<ModuleInitializer, Vec<Diagnostic>> {
+    let mut function = Function::new(format!("{}@module", surroundings.file.name()));
+    let entry = function.add_block(empty_block());
+    let void = table.intern(TypeKind::Void);
+    let mut context = Context {
+        file: surroundings.file,
+        provider: surroundings.provider,
+        module_names: surroundings.module_names,
+        initialising_the_module: true,
+        returns: void,
+        scope: Scope::new(),
+        statements: Vec::new(),
+        current: entry,
+        enclosing: Vec::new(),
+        shadowed: Vec::new(),
+        constructing: None,
+        written_names,
+        capturing: None,
+        nested: Vec::new(),
+        closures: 0,
+    };
+
+    for declaration in initializes {
+        let widening = declaration.kind != VariableDeclarationKind::Const;
+        for declarator in &declaration.declarations {
+            if declarator.init.is_none() {
+                return Err(vec![refuse(
+                    "unsupported-module-statement",
+                    declarator.span,
+                    "a module-level declaration with no initialiser is not lowered yet, because the module initializer would leave the name unbound",
+                )]);
+            }
+            context.lower_declarator(table, &mut function, declarator, widening)?;
+            for name in names_bound_by(&declarator.id) {
+                let held = context.bound(&name, declarator.id.span())?;
+                let value = held.value_or_refuse(&name, declarator.span)?;
+                context.statements.push(Statement::BindModule {
+                    name,
+                    value,
+                    span: span_of(declarator.span),
+                });
+            }
+        }
+    }
+    context.seal(&mut function, Terminator::Return(None));
+
+    if let Some(at) = a_call_the_initializer_makes(&function) {
+        return Err(vec![Diagnostic::unsupported(
+            "unsupported-module-initializer",
+            at,
+            "a call while this module initialises could reach a module binding that is not bound yet",
+        )
+        .with_help(
+            "showing that it does not needs the call graph, which Savitar does not build yet",
+        )]);
+    }
+
+    let malformations = verify(&function);
+    if !malformations.is_empty() {
+        return Err(vec![refuse(
+            "malformed-ir",
+            initializes[0].span,
+            format!("lowering produced invalid code: {malformations:?}"),
+        )]);
+    }
+    Ok(ModuleInitializer {
+        function,
+        closures: context.nested,
+    })
+}
+
+fn a_call_the_initializer_makes(function: &Function) -> Option<Span> {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .find_map(|statement| match statement {
+            Statement::Assign {
+                value: Rvalue::Call { .. } | Rvalue::New { .. },
+                span,
+                ..
+            } => Some(*span),
+            _ => None,
+        })
+}
+
 fn lower_declared(
-    file: &SourceFile,
-    provider: &dyn TypeProvider,
+    surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     declared: Declared<'_>,
 ) -> Vec<Outcome> {
@@ -661,16 +814,19 @@ fn lower_declared(
             };
             let written = assigned::names_written_through_closures(&body.statements);
             outcomes_of(lower_function(
-                file, provider, table, &written, &lowering, None,
+                surroundings,
+                table,
+                &written,
+                &lowering,
+                None,
             ))
         }
-        Declared::Class(class) => lower_class(file, provider, table, class),
+        Declared::Class(class) => lower_class(surroundings, table, class),
     }
 }
 
 fn lower_class(
-    file: &SourceFile,
-    provider: &dyn TypeProvider,
+    surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     class: &Class<'_>,
 ) -> Vec<Outcome> {
@@ -702,8 +858,7 @@ fn lower_class(
         match element {
             ClassElement::MethodDefinition(method) => {
                 outcomes.extend(lower_method(
-                    file,
-                    provider,
+                    surroundings,
                     table,
                     id.name.as_str(),
                     id.span,
@@ -737,8 +892,7 @@ fn lower_class(
 }
 
 fn lower_method<'a>(
-    file: &SourceFile,
-    provider: &dyn TypeProvider,
+    surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     class: &str,
     class_at: oxc_span::Span,
@@ -787,7 +941,11 @@ fn lower_method<'a>(
     };
     let written = assigned::names_written_through_closures(&body.statements);
     outcomes_of(lower_function(
-        file, provider, table, &written, &lowering, None,
+        surroundings,
+        table,
+        &written,
+        &lowering,
+        None,
     ))
 }
 
@@ -940,8 +1098,7 @@ fn empty_block() -> Block {
 }
 
 fn lower_function<'a>(
-    file: &'a SourceFile,
-    provider: &'a dyn TypeProvider,
+    surroundings: Surroundings<'a>,
     table: &mut TypeTable,
     written_names: &'a BTreeSet<String>,
     lowering: &Lowering<'_>,
@@ -984,8 +1141,10 @@ fn lower_function<'a>(
     let mut function = Function::new(&lowering.name);
     let entry = function.add_block(empty_block());
     let mut context = Context {
-        file,
-        provider,
+        file: surroundings.file,
+        provider: surroundings.provider,
+        module_names: surroundings.module_names,
+        initialising_the_module: false,
         returns: table.intern(TypeKind::Unknown),
         scope: Scope::new(),
         statements: Vec::new(),
@@ -1410,8 +1569,11 @@ impl Context<'_> {
             body,
         };
         let lowered = lower_function(
-            self.file,
-            self.provider,
+            Surroundings {
+                file: self.file,
+                provider: self.provider,
+                module_names: self.module_names,
+            },
             table,
             self.written_names,
             &lowering,
@@ -3858,6 +4020,20 @@ impl Context<'_> {
                 ),
             )]);
         }
+        if let Some(held) = self.module_names.get(name) {
+            let what = match held {
+                ModuleName::BoundByTheInitializer => "bound by the initializer of this module",
+                ModuleName::Declared => "declared at the top of this module",
+                ModuleName::Imported { .. } | ModuleName::AWholeModule { .. } => {
+                    "imported from another module"
+                }
+            };
+            return Err(vec![refuse(
+                "unsupported-module-write",
+                span,
+                format!("`{name}` is {what}, and writing to it from here is not lowered yet"),
+            )]);
+        }
         Err(vec![refuse(
             "unsupported-reference",
             span,
@@ -4586,8 +4762,52 @@ impl Context<'_> {
                         id.span,
                     ));
                 }
+                let held = self.module_names.get(id.name.as_str()).cloned();
+                let read = match held {
+                    None => Rvalue::Global(id.name.to_string()),
+                    Some(ModuleName::BoundByTheInitializer) if self.initialising_the_module => {
+                        return Err(vec![refuse(
+                            "unsupported-reference",
+                            id.span,
+                            format!(
+                                "`{}` is read before the initializer of this module binds it",
+                                id.name
+                            ),
+                        )]);
+                    }
+                    Some(ModuleName::BoundByTheInitializer | ModuleName::Declared) => {
+                        Rvalue::ModuleBinding(id.name.to_string())
+                    }
+                    Some(ModuleName::AWholeModule { specifier }) => {
+                        return Err(vec![refuse(
+                            "unsupported-import",
+                            id.span,
+                            format!(
+                                "`{specifier}` is imported whole, and the shape of a module object is not lowered yet"
+                            ),
+                        )]);
+                    }
+                    Some(ModuleName::Imported {
+                        specifier,
+                        exported,
+                    }) => {
+                        if is_a_package_specifier(&specifier) {
+                            return Err(vec![refuse(
+                                "unsupported-package-import",
+                                id.span,
+                                format!(
+                                    "`{exported}` comes from the package `{specifier}`, and nothing a package declares is checked by Savitar"
+                                ),
+                            )]);
+                        }
+                        Rvalue::Imported {
+                            specifier,
+                            name: exported,
+                        }
+                    }
+                };
                 let ty = self.type_at(table, id.span)?;
-                Ok(self.assign(function, ty, Rvalue::Global(id.name.to_string()), id.span))
+                Ok(self.assign(function, ty, read, id.span))
             }
             Expression::ThisExpression(this) => {
                 if let Some(held) = self.scope.get(THIS) {

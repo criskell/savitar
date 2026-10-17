@@ -440,3 +440,98 @@ fn base_construction_with_an_argument_never_defined_is_caught() {
         vec![Malformation::ValueNeverDefined(stray)]
     );
 }
+
+#[test]
+fn a_module_initializer_that_binds_a_name_verifies() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("config@module");
+
+    let port = function.fresh_value(number);
+    function.add_block(block(
+        vec![
+            Statement::Assign {
+                target: port,
+                value: Rvalue::Constant(Constant::Number(8080.0f64.to_bits())),
+                span: nowhere(),
+            },
+            Statement::BindModule {
+                name: "defaultPort".to_string(),
+                value: port,
+                span: nowhere(),
+            },
+        ],
+        Terminator::Return(None),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}
+
+#[test]
+fn binding_a_module_name_to_a_value_defined_later_is_caught() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("config@module");
+
+    let port = function.fresh_value(number);
+    function.add_block(block(
+        vec![
+            Statement::BindModule {
+                name: "defaultPort".to_string(),
+                value: port,
+                span: nowhere(),
+            },
+            Statement::Assign {
+                target: port,
+                value: Rvalue::Constant(Constant::Number(8080.0f64.to_bits())),
+                span: nowhere(),
+            },
+        ],
+        Terminator::Return(None),
+    ));
+
+    assert!(matches!(
+        verify(&function).as_slice(),
+        [Malformation::UseBeforeDefinition { .. }]
+    ));
+}
+
+#[test]
+fn reading_a_module_binding_or_an_import_uses_no_other_value() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("probe");
+
+    let held = function.fresh_value(number);
+    let brought = function.fresh_value(number);
+    let sum = function.fresh_value(number);
+    function.add_block(block(
+        vec![
+            Statement::Assign {
+                target: held,
+                value: Rvalue::ModuleBinding("defaultPort".to_string()),
+                span: nowhere(),
+            },
+            Statement::Assign {
+                target: brought,
+                value: Rvalue::Imported {
+                    specifier: "./config.ts".to_string(),
+                    name: "defaultPort".to_string(),
+                },
+                span: nowhere(),
+            },
+            Statement::Assign {
+                target: sum,
+                value: Rvalue::Binary {
+                    op: BinaryOp::Add,
+                    left: held,
+                    right: brought,
+                },
+                span: nowhere(),
+            },
+        ],
+        Terminator::Return(Some(sum)),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}

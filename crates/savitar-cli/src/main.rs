@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::{SourceFile, render};
+use savitar_modules::ModuleGraph;
 use savitar_typeinfo_tsapi::TsApi;
 use savitar_types::TypeTable;
 
@@ -113,6 +114,31 @@ fn main() -> ExitCode {
     };
     let mut table = TypeTable::new();
 
+    let graph = ModuleGraph::build(&root, &absolute);
+    let order = graph.evaluation_order();
+    for finding in graph.findings().iter().chain(order.findings.iter()) {
+        let module = graph.module(finding.module);
+        let Ok(text) = std::fs::read_to_string(&module.path) else {
+            continue;
+        };
+        let named = SourceFile::new(module.path.display().to_string(), text);
+        print!(
+            "{}",
+            render(&named, std::slice::from_ref(&finding.diagnostic))
+        );
+        findings += 1;
+        if finding.diagnostic.severity.rejects() {
+            rejected = true;
+        }
+    }
+    if report_lowering {
+        println!(
+            "savitar: {} of {} module(s) have a place in the evaluation order",
+            order.evaluated.len(),
+            graph.module_count()
+        );
+    }
+
     for path in &paths {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -154,9 +180,14 @@ fn main() -> ExitCode {
         print!("{}", render(&file, &lowered.diagnostics));
         if report_lowering {
             println!(
-                "savitar: {} function(s) lowered, {} refused",
+                "savitar: {} function(s) lowered, {} refused, {} module initializer",
                 lowered.functions.len(),
-                lowered.diagnostics.len()
+                lowered.diagnostics.len(),
+                if lowered.initializer.is_some() {
+                    "one"
+                } else {
+                    "no"
+                }
             );
         }
     }

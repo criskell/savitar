@@ -16,6 +16,7 @@ savitar-lower = { path = "crates/savitar-lower" }
 savitar-typeinfo = { path = "crates/savitar-typeinfo" }
 savitar-typeinfo-tsapi = { path = "crates/savitar-typeinfo-tsapi" }
 savitar-sound = { path = "crates/savitar-sound" }
+savitar-modules = { path = "crates/savitar-modules" }
 
 oxc_allocator = "0.154.0"
 oxc_ast = "0.154.0"
