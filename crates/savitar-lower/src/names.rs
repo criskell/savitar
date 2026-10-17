@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use oxc_ast::ast::{
-    BindingPattern, Declaration, ExportDefaultDeclarationKind, ImportDeclaration,
+    BindingPattern, Class, Declaration, ExportDefaultDeclarationKind, Function, ImportDeclaration,
     ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, Statement as AstStatement,
     VariableDeclaration,
 };
@@ -9,7 +9,9 @@ use oxc_ast::ast::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleName {
     BoundByTheInitializer,
-    Declared,
+    AHoistedFunction,
+    AClassBoundWhereDeclared,
+    DeclaredWithNoCodeBehindIt,
     Imported { specifier: String, exported: String },
     AWholeModule { specifier: String },
 }
@@ -30,28 +32,18 @@ impl ModuleNames {
                     names.take_variables(declaration);
                 }
                 AstStatement::FunctionDeclaration(declaration) => {
-                    if let Some(id) = declaration.id.as_ref() {
-                        names.put(id.name.as_str(), ModuleName::Declared);
-                    }
+                    names.take_function(declaration);
                 }
-                AstStatement::ClassDeclaration(class) => {
-                    if let Some(id) = class.id.as_ref() {
-                        names.put(id.name.as_str(), ModuleName::Declared);
-                    }
-                }
+                AstStatement::ClassDeclaration(class) => names.take_class(class),
                 AstStatement::ExportDeclaration(export) => {
                     names.take_declaration(&export.declaration);
                 }
                 AstStatement::ExportDefaultDeclaration(export) => match &export.declaration {
                     ExportDefaultDeclarationKind::FunctionDeclaration(declaration) => {
-                        if let Some(id) = declaration.id.as_ref() {
-                            names.put(id.name.as_str(), ModuleName::Declared);
-                        }
+                        names.take_function(declaration);
                     }
                     ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                        if let Some(id) = class.id.as_ref() {
-                            names.put(id.name.as_str(), ModuleName::Declared);
-                        }
+                        names.take_class(class)
                     }
                     _ => {}
                 },
@@ -70,19 +62,34 @@ impl ModuleNames {
         self.held.entry(name.to_string()).or_insert(held);
     }
 
+    fn take_function(&mut self, declaration: &Function<'_>) {
+        let Some(id) = declaration.id.as_ref() else {
+            return;
+        };
+        if declaration.body.is_some() {
+            self.held
+                .insert(id.name.to_string(), ModuleName::AHoistedFunction);
+        } else {
+            self.put(id.name.as_str(), ModuleName::DeclaredWithNoCodeBehindIt);
+        }
+    }
+
+    fn take_class(&mut self, class: &Class<'_>) {
+        let Some(id) = class.id.as_ref() else {
+            return;
+        };
+        if class.declare {
+            self.put(id.name.as_str(), ModuleName::DeclaredWithNoCodeBehindIt);
+        } else {
+            self.put(id.name.as_str(), ModuleName::AClassBoundWhereDeclared);
+        }
+    }
+
     fn take_declaration(&mut self, declaration: &Declaration<'_>) {
         match declaration {
             Declaration::VariableDeclaration(variables) => self.take_variables(variables),
-            Declaration::FunctionDeclaration(function) => {
-                if let Some(id) = function.id.as_ref() {
-                    self.put(id.name.as_str(), ModuleName::Declared);
-                }
-            }
-            Declaration::ClassDeclaration(class) => {
-                if let Some(id) = class.id.as_ref() {
-                    self.put(id.name.as_str(), ModuleName::Declared);
-                }
-            }
+            Declaration::FunctionDeclaration(function) => self.take_function(function),
+            Declaration::ClassDeclaration(class) => self.take_class(class),
             _ => {}
         }
     }

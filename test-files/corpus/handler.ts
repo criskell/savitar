@@ -101,6 +101,10 @@ export function describe(outcome: Outcome): string {
   }
 }
 
+export function loggerFor(route: Route): Logger {
+  return new Logger(route.path);
+}
+
 export async function fetchBody(route: Route): Promise<Outcome> {
   if (route.method === "GET") {
     return { kind: "ok", body: route.path };

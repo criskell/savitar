@@ -62,7 +62,7 @@ impl Run {
         function
             .blocks()
             .filter(|(id, block)| {
-                dominance.reachable(*id) && block.terminator == Terminator::Unreachable
+                dominance.reachable(*id) && matches!(block.terminator, Terminator::Unreachable(_))
             })
             .count()
     }

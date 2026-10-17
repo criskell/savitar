@@ -106,7 +106,7 @@ enum Refusal {
 
 fn what_a_refusal_means(rule: &str) -> Refusal {
     match rule {
-        "malformed-ir" => Refusal::TheCompilerConfusingItself,
+        "malformed-ir" | "flow-invented-a-path" => Refusal::TheCompilerConfusingItself,
         "no-type-answer" => Refusal::TheProviderAnsweringNothing,
         _ => Refusal::ALanguageGap,
     }
@@ -184,18 +184,22 @@ fn assert_floor(floor_file: &Path, counted: usize, listed: &[String]) {
     }
 }
 
-fn dead_ends_of(file: &str, function: &Function) -> Vec<String> {
+fn dead_ends_of(file: &SourceFile, function: &Function) -> Vec<String> {
     let dominance = Dominance::of(function);
     function
         .blocks()
-        .filter(|(id, block)| {
-            matches!(block.terminator, Terminator::Unreachable) && dominance.reachable(*id)
+        .filter_map(|(id, block)| match block.terminator {
+            Terminator::Unreachable(at) if dominance.reachable(id) => Some(at),
+            _ => None,
         })
-        .map(|(id, _)| {
+        .map(|at| {
+            let where_it_is = file.line_col(at.start);
             format!(
-                "{file}: `{}` block {} is reached and ends unreachable",
-                function.name(),
-                id.index()
+                "{}:{}:{} a path into `{}` is reached and ends unreachable",
+                file.name(),
+                where_it_is.line,
+                where_it_is.column,
+                function.name()
             )
         })
         .collect()
@@ -231,7 +235,7 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         coverage.known += report.functions.len();
         coverage.unsupported += report.diagnostics.len();
         for function in &report.functions {
-            dead_ends.extend(dead_ends_of(file.name(), function));
+            dead_ends.extend(dead_ends_of(&file, function));
         }
         if let Some(initializer) = report.initializer.as_ref() {
             initializers += 1;
@@ -241,9 +245,9 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
                 "the module initializer of {} should be valid code",
                 file.name()
             );
-            dead_ends.extend(dead_ends_of(file.name(), &initializer.function));
+            dead_ends.extend(dead_ends_of(&file, &initializer.function));
             for closure in &initializer.closures {
-                dead_ends.extend(dead_ends_of(file.name(), closure));
+                dead_ends.extend(dead_ends_of(&file, closure));
             }
         }
         for diagnostic in &report.diagnostics {
@@ -274,6 +278,18 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         confusions,
         unanswered,
     }
+}
+
+#[test]
+fn the_id_that_says_the_flow_invented_a_path_is_registered_as_a_bug_and_not_a_language_gap() {
+    assert!(
+        what_a_refusal_means("flow-invented-a-path") == Refusal::TheCompilerConfusingItself,
+        "an unregistered id passes for a language gap, which is how a bug buys a budget"
+    );
+    assert!(
+        what_a_refusal_means("unsupported-read") == Refusal::ALanguageGap,
+        "a field or element the shape does not offer is a gap and keeps its budget"
+    );
 }
 
 #[test]

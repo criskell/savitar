@@ -102,16 +102,16 @@ fn a_value_defined_on_one_arm_does_not_dominate_the_join() {
     let flag = function.declare_parameter(boolean);
     let only_on_one_arm = function.fresh_value(number);
 
-    let entry = function.add_block(block(vec![], Terminator::Unreachable));
+    let entry = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
     let left = function.add_block(block(
         vec![Statement::Assign {
             target: only_on_one_arm,
             value: Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
             span: nowhere(),
         }],
-        Terminator::Unreachable,
+        Terminator::Unreachable(nowhere()),
     ));
-    let right = function.add_block(block(vec![], Terminator::Unreachable));
+    let right = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
     let join = function.add_block(block(vec![], Terminator::Return(Some(only_on_one_arm))));
 
     function.block_mut(entry).terminator = Terminator::Branch {
@@ -158,14 +158,14 @@ fn a_block_parameter_carries_the_value_across_the_join() {
     let two = function.fresh_value(number);
     let merged = function.fresh_value(number);
 
-    let entry = function.add_block(block(vec![], Terminator::Unreachable));
+    let entry = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
     let left = function.add_block(block(
         vec![Statement::Assign {
             target: one,
             value: Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
             span: nowhere(),
         }],
-        Terminator::Unreachable,
+        Terminator::Unreachable(nowhere()),
     ));
     let right = function.add_block(block(
         vec![Statement::Assign {
@@ -173,7 +173,7 @@ fn a_block_parameter_carries_the_value_across_the_join() {
             value: Rvalue::Constant(Constant::Number(2.0f64.to_bits())),
             span: nowhere(),
         }],
-        Terminator::Unreachable,
+        Terminator::Unreachable(nowhere()),
     ));
     let join = function.add_block(Block {
         parameters: vec![merged],
@@ -210,7 +210,7 @@ fn a_jump_must_match_the_arity_and_types_of_the_block_it_enters() {
     let value = function.declare_parameter(text);
     let parameter = function.fresh_value(number);
 
-    let entry = function.add_block(block(vec![], Terminator::Unreachable));
+    let entry = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
     let target = function.add_block(Block {
         parameters: vec![parameter],
         statements: Vec::new(),
@@ -252,9 +252,9 @@ fn a_loop_is_dominated_by_its_header() {
     let mut function = Function::new("spin");
 
     let flag = function.declare_parameter(boolean);
-    let entry = function.add_block(block(vec![], Terminator::Unreachable));
-    let header = function.add_block(block(vec![], Terminator::Unreachable));
-    let body = function.add_block(block(vec![], Terminator::Unreachable));
+    let entry = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
+    let header = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
+    let body = function.add_block(block(vec![], Terminator::Unreachable(nowhere())));
     let exit = function.add_block(block(vec![], Terminator::Return(None)));
 
     function.block_mut(entry).terminator = Terminator::Jump {
@@ -531,6 +531,20 @@ fn reading_a_module_binding_or_an_import_uses_no_other_value() {
             },
         ],
         Terminator::Return(Some(sum)),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}
+
+#[test]
+fn a_declared_binding_names_a_name_and_uses_no_value() {
+    let mut function = Function::new("module");
+    function.add_block(block(
+        vec![Statement::BindDeclared {
+            name: "handle".to_string(),
+            span: nowhere(),
+        }],
+        Terminator::Return(None),
     ));
 
     assert_eq!(verify(&function), vec![]);

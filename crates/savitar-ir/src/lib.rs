@@ -161,6 +161,10 @@ pub enum Statement {
         value: ValueId,
         span: Span,
     },
+    BindDeclared {
+        name: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,7 +181,7 @@ pub enum Terminator {
         else_arguments: Vec<ValueId>,
     },
     Return(Option<ValueId>),
-    Unreachable,
+    Unreachable(Span),
 }
 
 impl Terminator {
@@ -190,7 +194,7 @@ impl Terminator {
                 else_block,
                 ..
             } => vec![*then_block, *else_block],
-            Self::Return(_) | Self::Unreachable => Vec::new(),
+            Self::Return(_) | Self::Unreachable(_) => Vec::new(),
         }
     }
 }

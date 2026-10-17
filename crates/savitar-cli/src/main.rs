@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use savitar_diagnostics::{SourceFile, render};
-use savitar_lower::{LowerReport, ModuleStanding, Ran};
+use savitar_diagnostics::{Diagnostic, SourceFile, Span, render};
+use savitar_lower::{LowerReport, ModuleStanding, Standing, TwoModulesForOneSpecifier};
 use savitar_modules::{Carries, ModuleGraph, ModuleId, Order, Target};
 use savitar_typeinfo::TypeProvider;
 use savitar_typeinfo_tsapi::TsApi;
@@ -70,10 +70,10 @@ fn standing_of(
     graph: &ModuleGraph,
     order: &Order,
     id: ModuleId,
-    lowered: &BTreeSet<ModuleId>,
-    published: &BTreeSet<ModuleId>,
-) -> ModuleStanding {
+    published: &BTreeMap<ModuleId, BTreeSet<String>>,
+) -> (ModuleStanding, Vec<Diagnostic>) {
     let mut standing = ModuleStanding::alone();
+    let mut clashes = Vec::new();
     let place = order.position_of(id);
     for import in &graph.module(id).imports {
         if import.carries != Carries::Values {
@@ -84,20 +84,33 @@ fn standing_of(
         };
         let other = *other;
         let ran = match (place, order.position_of(other)) {
-            (Some(place), Some(before)) if before < place => {
-                if !lowered.contains(&other) {
-                    Ran::Unchecked
-                } else if published.contains(&other) {
-                    Ran::BeforeAndPublished
-                } else {
-                    Ran::WithoutPublishing
-                }
-            }
-            _ => Ran::NotBefore,
+            (Some(place), Some(before)) if before < place => match published.get(&other) {
+                None => Standing::NotChecked,
+                Some(names) => Standing::RanBeforeBinding(names.clone()),
+            },
+            _ => Standing::DidNotRunBefore,
         };
-        standing.note(&import.specifier, ran);
+        let resolved = graph.module(other).path.display().to_string();
+        if let Err(clash) = standing.note(&import.specifier, &resolved, ran) {
+            clashes.push(two_modules_for_one_specifier(import.span, &clash));
+        }
     }
-    standing
+    (standing, clashes)
+}
+
+fn two_modules_for_one_specifier(at: Span, clash: &TwoModulesForOneSpecifier) -> Diagnostic {
+    let specifier = &clash.specifier;
+    let first = &clash.first;
+    let second = &clash.second;
+    Diagnostic::error(
+        "two-modules-for-one-specifier",
+        at,
+        format!(
+            "`{specifier}` resolves to `{first}` and to `{second}` in this module, so the \
+             evidence of evaluation order cannot say which one ran"
+        ),
+    )
+    .with_help("the order evidence is looked up by the text the module writes, so that text has to name one module")
 }
 
 fn lower_one(
@@ -138,22 +151,22 @@ fn lower_the_whole_graph(
     table: &mut TypeTable,
 ) -> LoweredGraph {
     let of_index: Vec<Option<ModuleId>> = absolute.iter().map(|path| graph.id_of(path)).collect();
-    let mut lowered: BTreeSet<ModuleId> = BTreeSet::new();
-    let mut published: BTreeSet<ModuleId> = BTreeSet::new();
+    let mut published: BTreeMap<ModuleId, BTreeSet<String>> = BTreeMap::new();
     let mut held: BTreeMap<ModuleId, LowerReport> = BTreeMap::new();
 
     for id in every_module_in_evaluation_order(graph, order) {
-        let standing = standing_of(graph, order, id, &lowered, &published);
+        let (standing, clashes) = standing_of(graph, order, id, &published);
         let Some(path) = graph.module(id).path.to_str() else {
             continue;
         };
-        let Some(report) = lower_one(path, provider, table, &standing) else {
+        let Some(mut report) = lower_one(path, provider, table, &standing) else {
             continue;
         };
-        lowered.insert(id);
-        if report.publishes_its_names {
-            published.insert(id);
-        }
+        report.diagnostics.extend(clashes);
+        report
+            .diagnostics
+            .sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
+        published.insert(id, report.published.clone());
         held.insert(id, report);
     }
 

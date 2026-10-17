@@ -10,7 +10,7 @@ use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration,
     ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft, FunctionBody,
-    MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
+    ImportOrExportKind, MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
     SimpleAssignmentTarget, Statement as AstStatement, VariableDeclaration, VariableDeclarator,
 };
 use oxc_parser::Parser;
@@ -28,7 +28,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
 use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
-pub use standing::{ModuleStanding, Ran};
+pub use standing::{ModuleStanding, Ran, Standing, TwoModulesForOneSpecifier};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
 #[derive(Debug)]
@@ -36,7 +36,7 @@ pub struct LowerReport {
     pub functions: Vec<Function>,
     pub initializer: Option<ModuleInitializer>,
     pub diagnostics: Vec<Diagnostic>,
-    pub publishes_its_names: bool,
+    pub published: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -79,11 +79,17 @@ impl Binding {
 
     fn value_or_refuse(self, name: &str, span: oxc_span::Span) -> Result<ValueId, Vec<Diagnostic>> {
         self.value.ok_or_else(|| {
-            vec![refuse(
-                "unsupported-read",
-                span,
-                format!("`{name}` is read on a path where it was declared and never written"),
-            )]
+            vec![
+                Diagnostic::unsupported(
+                    "flow-invented-a-path",
+                    span_of(span),
+                    format!("`{name}` is read on a path where it was declared and never written"),
+                )
+                .with_help(
+                    "strict TypeScript refuses that program, so reaching this means the path \
+                     analysis of Savitar walked a path the source does not have",
+                ),
+            ]
         })
     }
 }
@@ -476,6 +482,7 @@ struct Context<'a> {
     module_names: &'a ModuleNames,
     standing: &'a ModuleStanding,
     initialising_the_module: bool,
+    declarations_bound_so_far: BTreeSet<String>,
     returns: TypeId,
     scope: Scope,
     statements: Vec<Statement>,
@@ -505,8 +512,8 @@ fn unordered_read(
     span: oxc_span::Span,
 ) -> Option<Diagnostic> {
     let at = span_of(span);
-    match standing.of(specifier) {
-        Ran::BeforeAndPublished => None,
+    match standing.of(specifier, exported) {
+        Ran::BeforeAndBoundTheName => None,
         Ran::NotBefore => Some(
             Diagnostic::unsupported(
                 "unsupported-import-order",
@@ -519,15 +526,17 @@ fn unordered_read(
                 "the initializer of this module would read a name that nothing has bound yet",
             ),
         ),
-        Ran::WithoutPublishing => Some(
+        Ran::WithoutBindingTheName => Some(
             Diagnostic::unsupported(
                 "unsupported-import-unpublished",
                 at,
                 format!(
-                    "`{exported}` comes from `{specifier}`, whose module-level code Savitar refuses, so nothing binds the name"
+                    "`{specifier}` runs before this module and binds no `{exported}`, so this read points where nothing is bound"
                 ),
             )
-            .with_help("the refusal in that module goes before this module can read what it exports"),
+            .with_help(
+                "either the module-level code that would bind it is refused there, or that module forwards the name instead of binding it",
+            ),
         ),
         Ran::Unchecked => Some(
             Diagnostic::unsupported(
@@ -562,7 +571,7 @@ pub fn lower_in_order(
             functions: Vec::new(),
             initializer: None,
             diagnostics: Vec::new(),
-            publishes_its_names: false,
+            published: BTreeSet::new(),
         };
     }
 
@@ -575,12 +584,15 @@ pub fn lower_in_order(
         module_names: &module_names,
         standing,
     };
-    let mut initializes: Vec<&VariableDeclaration<'_>> = Vec::new();
-    let mut publishes_its_names = true;
+    let mut hoisted: Vec<Hoisted> = Vec::new();
+    let mut binds: Vec<Binds<'_>> = Vec::new();
+    let mut refused_before: Option<usize> = None;
+    let mut rebound_by_refused_code: BTreeSet<String> = BTreeSet::new();
 
     for statement in &parsed.program.body {
         match at_module_level(statement) {
             AtModuleLevel::Lowered(declared) => {
+                note_what_a_declaration_binds(declared, &mut hoisted, &mut binds);
                 for outcome in lower_declared(surroundings, table, declared) {
                     match outcome {
                         Ok(function) => functions.push(function),
@@ -588,10 +600,19 @@ pub fn lower_in_order(
                     }
                 }
             }
-            AtModuleLevel::Initializes(declaration) => initializes.push(declaration),
+            AtModuleLevel::Initializes(declaration) => binds.push(Binds::Variables(declaration)),
             AtModuleLevel::CarriesNoCode => {}
+            AtModuleLevel::Forwards(form) => {
+                if refused_before.is_none() {
+                    refused_before = Some(binds.len());
+                }
+                diagnostics.push(refuse_a_forwarded_name(statement_span(statement), form));
+            }
             AtModuleLevel::NotLowered(form) => {
-                publishes_its_names = false;
+                if refused_before.is_none() {
+                    refused_before = Some(binds.len());
+                }
+                rebound_by_refused_code.extend(names_a_refused_statement_could_rebind(statement));
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
             }
         }
@@ -601,16 +622,21 @@ pub fn lower_in_order(
         surroundings,
         table,
         &parsed.program.body,
-        &initializes,
+        &hoisted,
+        &binds,
         &functions,
     ) {
         None => None,
         Some(Ok(initializer)) => Some(initializer),
         Some(Err(problems)) => {
-            publishes_its_names = false;
             diagnostics.extend(problems);
             None
         }
+    };
+    let published = if initializer.is_some() {
+        names_the_module_publishes(&hoisted, &binds, refused_before, &rebound_by_refused_code)
+    } else {
+        BTreeSet::new()
     };
 
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
@@ -618,8 +644,52 @@ pub fn lower_in_order(
         functions,
         initializer,
         diagnostics,
-        publishes_its_names,
+        published,
     }
+}
+
+fn names_a_refused_statement_could_rebind(statement: &AstStatement<'_>) -> BTreeSet<String> {
+    let mut found = assigned::names_written_through_closures(std::slice::from_ref(statement));
+    let declares = match statement {
+        AstStatement::VariableDeclaration(declaration) => Some(&**declaration),
+        AstStatement::ExportDeclaration(export) => match &export.declaration {
+            Declaration::VariableDeclaration(declaration) => Some(&**declaration),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(declaration) = declares {
+        for declarator in &declaration.declarations {
+            found.extend(names_bound_by(&declarator.id));
+        }
+    }
+    found
+}
+
+fn names_the_module_publishes(
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
+    refused_before: Option<usize>,
+    rebound_by_refused_code: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let bound_before_any_refusal = refused_before.unwrap_or(binds.len());
+    let mut published: BTreeSet<String> = hoisted.iter().map(|one| one.name.clone()).collect();
+    for binding in &binds[..bound_before_any_refusal] {
+        match binding {
+            Binds::AClass { name, .. } => {
+                published.insert(name.clone());
+            }
+            Binds::Variables(declaration) => {
+                for declarator in &declaration.declarations {
+                    published.extend(names_bound_by(&declarator.id));
+                }
+            }
+        }
+    }
+    for name in rebound_by_refused_code {
+        published.remove(name);
+    }
+    published
 }
 
 #[derive(Clone, Copy)]
@@ -628,11 +698,51 @@ enum Declared<'a> {
     Class(&'a Class<'a>),
 }
 
+struct Hoisted {
+    name: String,
+    at: oxc_span::Span,
+}
+
+enum Binds<'a> {
+    Variables(&'a VariableDeclaration<'a>),
+    AClass { name: String, at: oxc_span::Span },
+}
+
+fn note_what_a_declaration_binds<'a>(
+    declared: Declared<'a>,
+    hoisted: &mut Vec<Hoisted>,
+    binds: &mut Vec<Binds<'a>>,
+) {
+    match declared {
+        Declared::Standalone(declaration) => {
+            if let Some(id) = declaration.id.as_ref()
+                && declaration.body.is_some()
+            {
+                hoisted.push(Hoisted {
+                    name: id.name.to_string(),
+                    at: id.span,
+                });
+            }
+        }
+        Declared::Class(class) => {
+            if let Some(id) = class.id.as_ref()
+                && !class.declare
+            {
+                binds.push(Binds::AClass {
+                    name: id.name.to_string(),
+                    at: id.span,
+                });
+            }
+        }
+    }
+}
+
 enum AtModuleLevel<'a> {
     Lowered(Declared<'a>),
     Initializes(&'a VariableDeclaration<'a>),
     CarriesNoCode,
     NotLowered(&'static str),
+    Forwards(&'static str),
 }
 
 fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtModuleLevel<'a> {
@@ -640,6 +750,26 @@ fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtMod
         return AtModuleLevel::NotLowered("a `var` declaration");
     }
     AtModuleLevel::Initializes(declaration)
+}
+
+fn every_forwarded_name_is_a_type(declaration: &oxc_ast::ast::ExportFromDeclaration<'_>) -> bool {
+    !declaration.specifiers.is_empty()
+        && declaration
+            .specifiers
+            .iter()
+            .all(|specifier| specifier.export_kind == ImportOrExportKind::Type)
+}
+
+fn refuse_a_forwarded_name(span: oxc_span::Span, form: &'static str) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsupported-reexport",
+        span_of(span),
+        format!("{form} forwards a name this module never binds"),
+    )
+    .with_help(
+        "the name table of a module holds what the module binds, so a module that reads a \
+         forwarded name from here is refused by that name",
+    )
 }
 
 fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnostic {
@@ -676,8 +806,23 @@ fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
         }
         AstStatement::ImportDeclaration(_)
         | AstStatement::ExportNamedDeclaration(_)
-        | AstStatement::ExportAllDeclaration(_)
         | AstStatement::EmptyStatement(_) => AtModuleLevel::CarriesNoCode,
+        AstStatement::ExportFromDeclaration(declaration) => {
+            if declaration.export_kind == ImportOrExportKind::Type
+                || every_forwarded_name_is_a_type(declaration)
+            {
+                AtModuleLevel::CarriesNoCode
+            } else {
+                AtModuleLevel::Forwards("a re-export")
+            }
+        }
+        AstStatement::ExportAllDeclaration(declaration) => {
+            if declaration.export_kind == ImportOrExportKind::Type {
+                AtModuleLevel::CarriesNoCode
+            } else {
+                AtModuleLevel::Forwards("a re-export of everything another module exports")
+            }
+        }
         AstStatement::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
         other => AtModuleLevel::NotLowered(module_level_form(other)),
     }
@@ -753,10 +898,11 @@ fn lower_module_initializer(
     surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     body: &[AstStatement<'_>],
-    initializes: &[&VariableDeclaration<'_>],
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
     lowered_alongside: &[Function],
 ) -> Option<Result<ModuleInitializer, Vec<Diagnostic>>> {
-    if initializes.is_empty() {
+    if hoisted.is_empty() && binds.is_empty() {
         return None;
     }
     let written = assigned::names_written_through_closures(body);
@@ -764,20 +910,33 @@ fn lower_module_initializer(
         surroundings,
         table,
         &written,
-        initializes,
+        hoisted,
+        binds,
         lowered_alongside,
     ))
+}
+
+fn where_the_module_starts_binding(hoisted: &[Hoisted], binds: &[Binds<'_>]) -> oxc_span::Span {
+    let from_a_declaration = hoisted.first().map(|one| one.at);
+    let from_the_body = binds.first().map(|one| match one {
+        Binds::Variables(declaration) => declaration.span,
+        Binds::AClass { at, .. } => *at,
+    });
+    from_a_declaration
+        .or(from_the_body)
+        .unwrap_or_else(|| oxc_span::Span::new(0, 0))
 }
 
 fn build_module_initializer<'a>(
     surroundings: Surroundings<'a>,
     table: &mut TypeTable,
     written_names: &'a BTreeSet<String>,
-    initializes: &[&VariableDeclaration<'_>],
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
     lowered_alongside: &[Function],
 ) -> Result<ModuleInitializer, Vec<Diagnostic>> {
     let mut function = Function::new(format!("{}@module", surroundings.file.name()));
-    let entry = function.add_block(empty_block());
+    let entry = function.add_block(empty_block(where_the_module_starts_binding(hoisted, binds)));
     let void = table.intern(TypeKind::Void);
     let mut context = Context {
         file: surroundings.file,
@@ -785,6 +944,7 @@ fn build_module_initializer<'a>(
         module_names: surroundings.module_names,
         standing: surroundings.standing,
         initialising_the_module: true,
+        declarations_bound_so_far: BTreeSet::new(),
         returns: void,
         scope: Scope::new(),
         statements: Vec::new(),
@@ -798,25 +958,43 @@ fn build_module_initializer<'a>(
         closures: 0,
     };
 
-    for declaration in initializes {
-        let widening = declaration.kind != VariableDeclarationKind::Const;
-        for declarator in &declaration.declarations {
-            if declarator.init.is_none() {
-                return Err(vec![refuse(
-                    "unsupported-module-statement",
-                    declarator.span,
-                    "a module-level declaration with no initialiser is not lowered yet, because the module initializer would leave the name unbound",
-                )]);
-            }
-            context.lower_declarator(table, &mut function, declarator, widening)?;
-            for name in names_bound_by(&declarator.id) {
-                let held = context.bound(&name, declarator.id.span())?;
-                let value = held.value_or_refuse(&name, declarator.span)?;
-                context.statements.push(Statement::BindModule {
-                    name,
-                    value,
-                    span: span_of(declarator.span),
+    for one in hoisted {
+        context.statements.push(Statement::BindDeclared {
+            name: one.name.clone(),
+            span: span_of(one.at),
+        });
+    }
+
+    for binding in binds {
+        match binding {
+            Binds::AClass { name, at } => {
+                context.statements.push(Statement::BindDeclared {
+                    name: name.clone(),
+                    span: span_of(*at),
                 });
+                context.declarations_bound_so_far.insert(name.clone());
+            }
+            Binds::Variables(declaration) => {
+                let widening = declaration.kind != VariableDeclarationKind::Const;
+                for declarator in &declaration.declarations {
+                    if declarator.init.is_none() {
+                        return Err(vec![refuse(
+                            "unsupported-module-statement",
+                            declarator.span,
+                            "a module-level declaration with no initialiser is not lowered yet, because the module initializer would leave the name unbound",
+                        )]);
+                    }
+                    context.lower_declarator(table, &mut function, declarator, widening)?;
+                    for name in names_bound_by(&declarator.id) {
+                        let held = context.bound(&name, declarator.id.span())?;
+                        let value = held.value_or_refuse(&name, declarator.span)?;
+                        context.statements.push(Statement::BindModule {
+                            name,
+                            value,
+                            span: span_of(declarator.span),
+                        });
+                    }
+                }
             }
         }
     }
@@ -832,7 +1010,7 @@ fn build_module_initializer<'a>(
     if !malformations.is_empty() {
         return Err(vec![refuse(
             "malformed-ir",
-            initializes[0].span,
+            where_the_module_starts_binding(hoisted, binds),
             format!("lowering produced invalid code: {malformations:?}"),
         )]);
     }
@@ -1203,11 +1381,11 @@ fn outcomes_of(lowered: Result<Lowered, Vec<Diagnostic>>) -> Vec<Outcome> {
     }
 }
 
-fn empty_block() -> Block {
+fn empty_block(at: oxc_span::Span) -> Block {
     Block {
         parameters: Vec::new(),
         statements: Vec::new(),
-        terminator: Terminator::Unreachable,
+        terminator: Terminator::Unreachable(span_of(at)),
     }
 }
 
@@ -1253,13 +1431,14 @@ fn lower_function<'a>(
     }
 
     let mut function = Function::new(&lowering.name);
-    let entry = function.add_block(empty_block());
+    let entry = function.add_block(empty_block(at));
     let mut context = Context {
         file: surroundings.file,
         provider: surroundings.provider,
         module_names: surroundings.module_names,
         standing: surroundings.standing,
         initialising_the_module: false,
+        declarations_bound_so_far: BTreeSet::new(),
         returns: table.intern(TypeKind::Unknown),
         scope: Scope::new(),
         statements: Vec::new(),
@@ -2705,7 +2884,7 @@ impl Context<'_> {
         repeating: Repeating,
         span: oxc_span::Span,
     ) -> Looping {
-        let header = function.add_block(empty_block());
+        let header = function.add_block(empty_block(span));
         let mut parameters = Vec::with_capacity(entering.len() + carried.len());
         let mut arguments = Vec::with_capacity(entering.len() + carried.len());
         for value in entering {
@@ -2725,7 +2904,7 @@ impl Context<'_> {
         let (repeat, landing) = match repeating {
             Repeating::AtHeader => (header, parameters.clone()),
             Repeating::ThroughLatch => {
-                let latch = function.add_block(empty_block());
+                let latch = function.add_block(empty_block(span));
                 let landing = held
                     .into_iter()
                     .map(|ty| function.fresh_value(ty))
@@ -2733,7 +2912,7 @@ impl Context<'_> {
                 (latch, landing)
             }
         };
-        let exit = function.add_block(empty_block());
+        let exit = function.add_block(empty_block(span));
 
         self.seal(
             function,
@@ -2967,8 +3146,8 @@ impl Context<'_> {
             statement.span,
         );
 
-        let body = function.add_block(empty_block());
-        let leaving = function.add_block(empty_block());
+        let body = function.add_block(empty_block(statement.span));
+        let leaving = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3086,7 +3265,7 @@ impl Context<'_> {
                 let leaving = carried_value(&self.scope, held, statement.span)?;
                 back.push(self.coerced(function, table, leaving, held.declared, statement.span));
             }
-            let block = function.add_block(empty_block());
+            let block = function.add_block(empty_block(statement.span));
             self.seal(
                 function,
                 Terminator::Branch {
@@ -3168,8 +3347,8 @@ impl Context<'_> {
         let leaving = match &statement.test {
             Some(test) => {
                 let condition = self.lower_expression(table, function, test)?;
-                let body = function.add_block(empty_block());
-                let leaving = function.add_block(empty_block());
+                let body = function.add_block(empty_block(statement.span));
+                let leaving = function.add_block(empty_block(statement.span));
                 self.seal(
                     function,
                     Terminator::Branch {
@@ -3247,8 +3426,8 @@ impl Context<'_> {
         );
 
         let condition = self.lower_expression(table, function, &statement.test)?;
-        let body = function.add_block(empty_block());
-        let leaving = function.add_block(empty_block());
+        let body = function.add_block(empty_block(statement.span));
+        let leaving = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3530,8 +3709,8 @@ impl Context<'_> {
         let tested = self.tested_fact(&statement.test);
         let before = self.scope.clone();
 
-        let then_entry = function.add_block(empty_block());
-        let else_entry = function.add_block(empty_block());
+        let then_entry = function.add_block(empty_block(statement.span));
+        let else_entry = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3543,7 +3722,7 @@ impl Context<'_> {
             },
         );
 
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(statement.span));
 
         self.current = then_entry;
         self.statements.clear();
@@ -3702,7 +3881,7 @@ impl Context<'_> {
     ) -> Result<Flow, Vec<Diagnostic>> {
         let span = statement_span(body);
         let before = self.scope.clone();
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(span));
         self.enclosing
             .push(Breakable::around(labels, Target::Labelled(join)));
         let flow = self.lower_statement(table, function, body)?;
@@ -3831,11 +4010,11 @@ impl Context<'_> {
         let discriminant = self.lower_expression(table, function, &statement.discriminant)?;
         let before = self.scope.clone();
 
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(statement.span));
         let bodies: Vec<BlockId> = statement
             .cases
             .iter()
-            .map(|_| function.add_block(empty_block()))
+            .map(|_| function.add_block(empty_block(statement.span)))
             .collect();
         let fallback = statement
             .cases
@@ -3861,7 +4040,7 @@ impl Context<'_> {
                 label,
                 case.span,
             )?;
-            let next = function.add_block(empty_block());
+            let next = function.add_block(empty_block(statement.span));
             arrival[position] = Some(self.current);
             self.seal(
                 function,
@@ -3882,7 +4061,7 @@ impl Context<'_> {
         let exhaustive = fallback.is_none()
             && types::exhausted(table, function.type_of(discriminant), &label_types);
         if exhaustive {
-            self.seal(function, Terminator::Unreachable);
+            self.seal(function, Terminator::Unreachable(span_of(statement.span)));
         } else {
             self.seal(
                 function,
@@ -3931,7 +4110,7 @@ impl Context<'_> {
                             "a `case` run into from the one before it has no matching edge of its own",
                         )]);
                     };
-                    let stub = function.add_block(empty_block());
+                    let stub = function.add_block(empty_block(statement.span));
                     retarget(function, tested, bodies[position], stub);
                     let arriving = vec![(stub, before.clone()), fell];
                     self.joined(
@@ -4139,7 +4318,9 @@ impl Context<'_> {
         if let Some(held) = self.module_names.get(name) {
             let what = match held {
                 ModuleName::BoundByTheInitializer => "bound by the initializer of this module",
-                ModuleName::Declared => "declared at the top of this module",
+                ModuleName::AHoistedFunction
+                | ModuleName::AClassBoundWhereDeclared
+                | ModuleName::DeclaredWithNoCodeBehindIt => "declared at the top of this module",
                 ModuleName::Imported { .. } | ModuleName::AWholeModule { .. } => {
                     "imported from another module"
                 }
@@ -4200,9 +4381,9 @@ impl Context<'_> {
         let condition = self.lower_expression(table, function, &conditional.test)?;
         let tested = self.tested_fact(&conditional.test);
         let before = self.scope.clone();
-        let then_entry = function.add_block(empty_block());
-        let else_entry = function.add_block(empty_block());
-        let join = function.add_block(empty_block());
+        let then_entry = function.add_block(empty_block(conditional.span));
+        let else_entry = function.add_block(empty_block(conditional.span));
+        let join = function.add_block(empty_block(conditional.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -4360,9 +4541,9 @@ impl Context<'_> {
             left
         };
 
-        let right_entry = function.add_block(empty_block());
-        let carry_entry = function.add_block(empty_block());
-        let join = function.add_block(empty_block());
+        let right_entry = function.add_block(empty_block(logical.span));
+        let carry_entry = function.add_block(empty_block(logical.span));
+        let join = function.add_block(empty_block(logical.span));
         let right_on_then = logical.operator != LogicalOperator::Or;
         let (then_block, else_block) = if right_on_then {
             (right_entry, carry_entry)
@@ -4434,7 +4615,7 @@ impl Context<'_> {
                     },
                 );
             }
-            None => self.seal(function, Terminator::Unreachable),
+            None => self.seal(function, Terminator::Unreachable(span_of(logical.span))),
         }
 
         let parameter = function.fresh_value(merged);
@@ -4569,8 +4750,8 @@ impl Context<'_> {
         };
 
         let missing = self.tests_undefined(table, function, read, span);
-        let fallback_entry = function.add_block(empty_block());
-        let kept_entry = function.add_block(empty_block());
+        let fallback_entry = function.add_block(empty_block(span));
+        let kept_entry = function.add_block(empty_block(span));
         self.seal(
             function,
             Terminator::Branch {
@@ -4581,7 +4762,7 @@ impl Context<'_> {
                 else_arguments: Vec::new(),
             },
         );
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(span));
 
         let before = self.scope.clone();
         self.current = fallback_entry;
@@ -4891,9 +5072,34 @@ impl Context<'_> {
                             ),
                         )]);
                     }
-                    Some(ModuleName::BoundByTheInitializer | ModuleName::Declared) => {
-                        Rvalue::ModuleBinding(id.name.to_string())
+                    Some(ModuleName::AClassBoundWhereDeclared)
+                        if self.initialising_the_module
+                            && !self.declarations_bound_so_far.contains(id.name.as_str()) =>
+                    {
+                        return Err(vec![refuse(
+                            "unsupported-reference",
+                            id.span,
+                            format!(
+                                "`{}` names a class this module declares further down, and a class binds where it is declared and not before",
+                                id.name
+                            ),
+                        )]);
                     }
+                    Some(ModuleName::DeclaredWithNoCodeBehindIt) => {
+                        return Err(vec![refuse(
+                            "unsupported-ambient-name",
+                            id.span,
+                            format!(
+                                "`{}` is declared without code behind it, so nothing this module emits binds the name",
+                                id.name
+                            ),
+                        )]);
+                    }
+                    Some(
+                        ModuleName::BoundByTheInitializer
+                        | ModuleName::AHoistedFunction
+                        | ModuleName::AClassBoundWhereDeclared,
+                    ) => Rvalue::ModuleBinding(id.name.to_string()),
                     Some(ModuleName::AWholeModule { specifier }) => {
                         return Err(vec![refuse(
                             "unsupported-import",
