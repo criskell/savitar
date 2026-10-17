@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "Lowers TypeScript to savitar-ir, deriving every value type or refusing"
 
 [dependencies]
+savitar-analysis.workspace = true
 savitar-diagnostics.workspace = true
 savitar-ir.workspace = true
 savitar-typeinfo.workspace = true

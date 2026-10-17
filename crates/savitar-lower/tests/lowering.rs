@@ -10782,7 +10782,7 @@ fn every_module_variable_declaration_reaches_the_same_initializer_in_source_orde
 }
 
 #[test]
-fn a_call_while_the_module_initialises_is_refused_by_name() {
+fn a_call_while_the_module_initialises_is_allowed_when_the_graph_clears_the_target() {
     let source = "function size(): number {\n  return 1;\n}\n\nconst limit = size();\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -10797,9 +10797,150 @@ fn a_call_while_the_module_initialises_is_refused_by_name() {
 
     let report = lower(&file, &provider, &mut table);
 
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(verify(&initializer.function), vec![]);
+    assert_eq!(module_bindings(initializer), vec!["limit".to_string()]);
+    assert!(report.publishes_its_names);
+}
+
+#[test]
+fn a_call_while_the_module_initialises_that_reaches_a_module_name_is_refused_with_the_path() {
+    let source = "const defaults = 1;\n\nfunction size(): number {\n  return defaults;\n}\n\nconst limit = size();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("defaults", Answer::Known(number)),
+            ("size", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
     assert!(report.initializer.is_none());
-    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
     assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("reads the module name `defaults`"),
+        "{:?}",
+        report.diagnostics[0]
+    );
+    assert!(
+        report.diagnostics[0]
+            .help
+            .as_ref()
+            .is_some_and(|help| help.contains("`size`")),
+        "the refusal must say by which path the name is reached: {:?}",
+        report.diagnostics[0]
+    );
+}
+
+#[test]
+fn a_call_while_the_module_initialises_to_a_target_the_graph_does_not_resolve_is_refused() {
+    let source = "const limit = size();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("the global name `size`"),
+        "{:?}",
+        report.diagnostics[0]
+    );
+    assert!(
+        report.diagnostics[0].message.contains("does not resolve"),
+        "{:?}",
+        report.diagnostics[0]
+    );
+}
+
+#[test]
+fn a_call_while_the_module_initialises_to_a_function_the_lowering_refused_stays_refused() {
+    let source =
+        "function* counted(): Generator<number> {\n  yield 1;\n}\n\nconst limit = counted();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("counted", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.initializer.is_none());
+    let said: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.rule)
+        .collect();
+    assert!(
+        said.contains(&"unsupported-module-initializer"),
+        "a body this run does not hold is the worst case, not an absent edge: {said:?}"
+    );
+    assert!(
+        report.diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("whose body this run does not hold")),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_call_while_the_module_initialises_into_a_closure_of_the_called_function_is_cleared() {
+    let source = "function size(): number {\n  const twice = (value: number): number => value + value;\n  return twice(2);\n}\n\nconst limit = size();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let twice = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: false,
+        }],
+        number,
+    );
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("twice", Answer::Known(twice)),
+            ("limit", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(report.initializer.is_some());
+    assert!(report.publishes_its_names);
 }
 
 #[test]
@@ -12158,8 +12299,7 @@ fn a_function_reading_an_imported_name_lowers_without_the_other_module_being_pla
 
 #[test]
 fn a_module_whose_initializer_is_refused_publishes_no_names() {
-    let source =
-        "function readPort(): number {\n  return 8080;\n}\n\nexport const port = readPort();\n";
+    let source = "export const port = readPort();\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
     let provider = ByName::new(source, vec![("readPort", returning(&mut table, number))]);

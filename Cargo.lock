@@ -845,6 +845,7 @@ dependencies = [
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",
+ "savitar-analysis",
  "savitar-diagnostics",
  "savitar-ir",
  "savitar-typeinfo",

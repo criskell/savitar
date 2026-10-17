@@ -18,6 +18,7 @@ use oxc_span::{GetSpan, SourceType};
 use oxc_syntax::operator::{
     AssignmentOperator, BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator,
 };
+use savitar_analysis::{CallGraph, Reach, said_as_a_path};
 use savitar_diagnostics::{Diagnostic, SourceFile, Span};
 use savitar_ir::{
     BinaryOp, Block, BlockId, Constant, Function, Rvalue, Statement, Terminator, UnaryOp, ValueId,
@@ -596,16 +597,21 @@ pub fn lower_in_order(
         }
     }
 
-    let initializer =
-        match lower_module_initializer(surroundings, table, &parsed.program.body, &initializes) {
-            None => None,
-            Some(Ok(initializer)) => Some(initializer),
-            Some(Err(problems)) => {
-                publishes_its_names = false;
-                diagnostics.extend(problems);
-                None
-            }
-        };
+    let initializer = match lower_module_initializer(
+        surroundings,
+        table,
+        &parsed.program.body,
+        &initializes,
+        &functions,
+    ) {
+        None => None,
+        Some(Ok(initializer)) => Some(initializer),
+        Some(Err(problems)) => {
+            publishes_its_names = false;
+            diagnostics.extend(problems);
+            None
+        }
+    };
 
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
     LowerReport {
@@ -748,6 +754,7 @@ fn lower_module_initializer(
     table: &mut TypeTable,
     body: &[AstStatement<'_>],
     initializes: &[&VariableDeclaration<'_>],
+    lowered_alongside: &[Function],
 ) -> Option<Result<ModuleInitializer, Vec<Diagnostic>>> {
     if initializes.is_empty() {
         return None;
@@ -758,6 +765,7 @@ fn lower_module_initializer(
         table,
         &written,
         initializes,
+        lowered_alongside,
     ))
 }
 
@@ -766,6 +774,7 @@ fn build_module_initializer<'a>(
     table: &mut TypeTable,
     written_names: &'a BTreeSet<String>,
     initializes: &[&VariableDeclaration<'_>],
+    lowered_alongside: &[Function],
 ) -> Result<ModuleInitializer, Vec<Diagnostic>> {
     let mut function = Function::new(format!("{}@module", surroundings.file.name()));
     let entry = function.add_block(empty_block());
@@ -813,15 +822,10 @@ fn build_module_initializer<'a>(
     }
     context.seal(&mut function, Terminator::Return(None));
 
-    if let Some(at) = a_call_the_initializer_makes(&function) {
-        return Err(vec![Diagnostic::unsupported(
-            "unsupported-module-initializer",
-            at,
-            "a call while this module initialises could reach a module binding that is not bound yet",
-        )
-        .with_help(
-            "showing that it does not needs the call graph, which Savitar does not build yet",
-        )]);
+    if let Some(problem) =
+        a_call_the_graph_cannot_clear(&function, &context.nested, lowered_alongside)
+    {
+        return Err(vec![problem]);
     }
 
     let malformations = verify(&function);
@@ -838,18 +842,62 @@ fn build_module_initializer<'a>(
     })
 }
 
-fn a_call_the_initializer_makes(function: &Function) -> Option<Span> {
-    function
-        .blocks()
-        .flat_map(|(_, block)| block.statements.iter())
-        .find_map(|statement| match statement {
-            Statement::Assign {
-                value: Rvalue::Call { .. } | Rvalue::New { .. },
-                span,
-                ..
-            } => Some(*span),
-            _ => None,
-        })
+fn a_call_the_graph_cannot_clear(
+    initializer: &Function,
+    closures: &[Function],
+    lowered_alongside: &[Function],
+) -> Option<Diagnostic> {
+    let graph = CallGraph::over(
+        std::iter::once(initializer)
+            .chain(closures)
+            .chain(lowered_alongside),
+    );
+    for site in graph.calls_made_by(initializer.name()) {
+        match graph.what_a_call_reaches(&site) {
+            Reach::NoModuleNameIsTouched => {}
+            Reach::AModuleNameIsTouched { touch, through, .. } => {
+                return Some(
+                    Diagnostic::unsupported(
+                        "unsupported-module-initializer",
+                        site.at,
+                        format!("a call while this module initialises reaches code where {touch}"),
+                    )
+                    .with_help(format!(
+                        "the call graph reaches that read through {}, and a name read while the module initialises may hold memory nothing has written",
+                        said_as_a_path(&through)
+                    )),
+                );
+            }
+            Reach::ACalleeIsNotKnown {
+                callee, through, ..
+            } => {
+                return Some(
+                    Diagnostic::unsupported(
+                        "unsupported-module-initializer",
+                        site.at,
+                        if through.is_empty() {
+                            format!(
+                                "a call while this module initialises goes to {callee}, which the call graph does not resolve"
+                            )
+                        } else {
+                            format!(
+                                "a call while this module initialises reaches a call to {callee}, which the call graph does not resolve"
+                            )
+                        },
+                    )
+                    .with_help(if through.is_empty() {
+                        "a target the call graph cannot resolve is treated as the worst case, so nothing shows the call stays away from module bindings".to_string()
+                    } else {
+                        format!(
+                            "the call graph reaches that call through {}, and a target it cannot resolve is treated as the worst case",
+                            said_as_a_path(&through)
+                        )
+                    }),
+                );
+            }
+        }
+    }
+    None
 }
 
 fn lower_declared(

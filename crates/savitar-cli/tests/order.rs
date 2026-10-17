@@ -246,7 +246,7 @@ fn an_initializer_reading_a_module_whose_own_module_code_is_refused_is_refused()
         &[
             (
                 "settings.ts",
-                "function readPort(): number {\n  return 8080;\n}\n\nexport const port = readPort();\n",
+                "const defaults = { port: 8080 };\n\nfunction readPort(): number {\n  return defaults.port;\n}\n\nexport const port = readPort();\n",
             ),
             (
                 "server.ts",
