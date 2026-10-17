@@ -1223,3 +1223,166 @@ fn the_refusal_behind_regexp_names_the_recursion_it_cannot_unroll() {
 
     std::fs::remove_dir_all(&project).ok();
 }
+
+fn scratch_project_of(files: &[(&str, &str)]) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("savitar-merged-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("could not create the scratch project");
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        "{ \"compilerOptions\": { \"strict\": true }, \"include\": [\".\"] }",
+    )
+    .expect("could not write tsconfig.json");
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).expect("could not write a fixture file");
+    }
+    dir
+}
+
+fn position_in(text: &str, needle: &str) -> u32 {
+    let at = text
+        .find(needle)
+        .unwrap_or_else(|| panic!("needle not in the fixture: {needle}"));
+    u32::try_from(at + needle.len() - 1).expect("fixture is small")
+}
+
+fn literal_names(table: &TypeTable, id: savitar_types::TypeId) -> Vec<String> {
+    let members = match table.kind(id).clone() {
+        TypeKind::Union(members) => members,
+        _ => vec![id],
+    };
+    let mut names: Vec<String> = members
+        .iter()
+        .map(|&member| match table.kind(member) {
+            TypeKind::StringLiteral(text) => text.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+const DECLARED_TWICE: &str = concat!(
+    "interface Config { host: string }\n",
+    "interface Config { port: number }\n",
+    "declare const config: Config;\n",
+);
+
+#[test]
+fn an_interface_declared_twice_arrives_with_the_members_of_both_declarations() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[("a.ts", DECLARED_TWICE)]);
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(DECLARED_TWICE, "const config"), 0),
+    );
+    let Answer::Known(shape) = answer else {
+        panic!("expected a known type for `config`, got {answer:?}");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(shape).clone() else {
+        panic!("expected an object, got {:?}", table.kind(shape));
+    };
+    let mut named: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    named.sort_unstable();
+    assert_eq!(
+        named,
+        vec!["host", "port"],
+        "the provider must fuse both declarations itself"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+const UNION_IN_SEPARATE_DECLARATIONS: &str = concat!(
+    "interface Shapes { circle: { kind: \"circle\"; radius: number } }\n",
+    "interface Shapes { square: { kind: \"square\"; side: number } }\n",
+    "type Shape = Shapes[keyof Shapes];\n",
+    "declare const tag: Shape[\"kind\"];\n",
+);
+
+#[test]
+fn a_union_assembled_in_separate_declarations_arrives_with_every_member() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[("a.ts", UNION_IN_SEPARATE_DECLARATIONS)]);
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(UNION_IN_SEPARATE_DECLARATIONS, "const tag"), 0),
+    );
+    let Answer::Known(tag) = answer else {
+        panic!("expected a known type for `tag`, got {answer:?}");
+    };
+    assert_eq!(
+        literal_names(&table, tag),
+        vec!["circle".to_string(), "square".to_string()],
+        "a discriminant built over two declarations must arrive whole"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+const FUSED_FROM_ANOTHER_FILE: &str = concat!(
+    "interface Shapes { circle: { kind: \"circle\"; radius: number } }\n",
+    "declare const tag: Shapes[keyof Shapes][\"kind\"];\n",
+);
+
+#[test]
+fn a_declaration_in_an_unopened_file_still_reaches_the_fused_type() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[
+        ("a.ts", FUSED_FROM_ANOTHER_FILE),
+        (
+            "b.ts",
+            "interface Shapes { square: { kind: \"square\"; side: number } }\n",
+        ),
+    ]);
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(FUSED_FROM_ANOTHER_FILE, "const tag"), 0),
+    );
+    let Answer::Known(tag) = answer else {
+        panic!("expected a known type for `tag`, got {answer:?}");
+    };
+    assert_eq!(
+        literal_names(&table, tag),
+        vec!["circle".to_string(), "square".to_string()],
+        "the provider's program spans the project, so no module graph of ours is needed"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
