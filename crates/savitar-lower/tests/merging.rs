@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use savitar_diagnostics::SourceFile;
 
@@ -21,12 +20,11 @@ fn provider_binary() -> Option<OsString> {
 }
 
 fn scratch_project_of(files: &[(&str, &str)]) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before the epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("savitar-fused-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("could not create the scratch project");
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("savitar-fused-{}-{unique}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir(&dir).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
         "{ \"compilerOptions\": { \"strict\": true }, \"include\": [\".\"] }",

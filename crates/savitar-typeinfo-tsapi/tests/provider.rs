@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
@@ -73,12 +72,11 @@ fn provider_binary() -> Option<OsString> {
 }
 
 fn scratch_project_with(options: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before the epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("savitar-tsapi-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("could not create the scratch project");
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("savitar-tsapi-{}-{unique}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir(&dir).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
         format!("{{ \"compilerOptions\": {{ {options} }} }}"),
@@ -1225,12 +1223,11 @@ fn the_refusal_behind_regexp_names_the_recursion_it_cannot_unroll() {
 }
 
 fn scratch_project_of(files: &[(&str, &str)]) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before the epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("savitar-merged-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("could not create the scratch project");
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("savitar-merged-{}-{unique}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir(&dir).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
         "{ \"compilerOptions\": { \"strict\": true }, \"include\": [\".\"] }",
@@ -1449,11 +1446,10 @@ fn a_position_in_a_file_the_snapshot_never_opened_still_answers() {
 }
 
 fn scratch_project_including_only(folder: &str, files: &[(&str, &str)]) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before the epoch")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("savitar-outside-{}-{nanos}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("savitar-outside-{}-{unique}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(dir.join(folder)).expect("could not create the scratch project");
     std::fs::write(
         dir.join("tsconfig.json"),
