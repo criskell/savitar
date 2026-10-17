@@ -106,7 +106,7 @@ enum Refusal {
 
 fn what_a_refusal_means(rule: &str) -> Refusal {
     match rule {
-        "malformed-ir" => Refusal::TheCompilerConfusingItself,
+        "malformed-ir" | "flow-invented-a-path" => Refusal::TheCompilerConfusingItself,
         "no-type-answer" => Refusal::TheProviderAnsweringNothing,
         _ => Refusal::ALanguageGap,
     }
@@ -274,6 +274,18 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         confusions,
         unanswered,
     }
+}
+
+#[test]
+fn the_id_that_says_the_flow_invented_a_path_is_registered_as_a_bug_and_not_a_language_gap() {
+    assert!(
+        what_a_refusal_means("flow-invented-a-path") == Refusal::TheCompilerConfusingItself,
+        "an unregistered id passes for a language gap, which is how a bug buys a budget"
+    );
+    assert!(
+        what_a_refusal_means("unsupported-read") == Refusal::ALanguageGap,
+        "a field or element the shape does not offer is a gap and keeps its budget"
+    );
 }
 
 #[test]

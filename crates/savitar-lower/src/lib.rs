@@ -78,11 +78,17 @@ impl Binding {
 
     fn value_or_refuse(self, name: &str, span: oxc_span::Span) -> Result<ValueId, Vec<Diagnostic>> {
         self.value.ok_or_else(|| {
-            vec![refuse(
-                "unsupported-read",
-                span,
-                format!("`{name}` is read on a path where it was declared and never written"),
-            )]
+            vec![
+                Diagnostic::unsupported(
+                    "flow-invented-a-path",
+                    span_of(span),
+                    format!("`{name}` is read on a path where it was declared and never written"),
+                )
+                .with_help(
+                    "strict TypeScript refuses that program, so reaching this means the path \
+                     analysis of Savitar walked a path the source does not have",
+                ),
+            ]
         })
     }
 }

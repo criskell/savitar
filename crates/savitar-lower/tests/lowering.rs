@@ -5575,7 +5575,7 @@ fn a_name_declared_and_never_written_is_refused_when_it_is_read() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert_eq!(report.diagnostics[0].rule, "flow-invented-a-path");
     assert!(
         report.diagnostics[0].message.contains("never written"),
         "{}",
@@ -5603,7 +5603,7 @@ fn a_name_written_on_only_one_branch_is_still_refused_after_the_join() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert_eq!(report.diagnostics[0].rule, "flow-invented-a-path");
 }
 
 #[test]
@@ -5644,7 +5644,7 @@ fn a_compound_write_to_a_name_never_written_is_refused_because_it_reads_first() 
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert_eq!(report.diagnostics[0].rule, "flow-invented-a-path");
 }
 
 #[test]
