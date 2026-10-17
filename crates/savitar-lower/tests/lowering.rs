@@ -11429,3 +11429,27 @@ fn passing_undefined_picks_the_only_optional_overload_that_takes_it() {
     assert_eq!(verify(function), vec![]);
     assert_eq!(function.type_of(returned_value(function)), number);
 }
+
+#[test]
+fn an_annotation_on_a_pattern_declarator_does_not_type_the_position_so_the_initialiser_widens() {
+    let source = "function hold(): number {\n  const [a, b]: [number, string] = [1, \"x\"];\n  return a;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("hold", returning(&mut table, number))]);
+    let file = SourceFile::new("hold.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(
+        report.functions.is_empty(),
+        "the annotation is ignored, so `a` does not hold a number"
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == savitar_diagnostics::Severity::Unsupported),
+        "{:?}",
+        report.diagnostics
+    );
+}
