@@ -9967,3 +9967,744 @@ fn a_nullish_narrowing_survives_a_call_because_no_call_can_rebind_a_name() {
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert!(narrowed(&report.functions[0]).contains(&text));
 }
+
+fn resolver(table: &mut TypeTable) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    table.function(Vec::new(), number)
+}
+
+fn made_closures(function: &savitar_ir::Function) -> Vec<(String, Vec<savitar_ir::ValueId>)> {
+    function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::Assign {
+                value:
+                    Rvalue::Closure {
+                        function: made,
+                        captured,
+                    },
+                ..
+            } => Some((made.clone(), captured.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_arrow_declared_by_an_annotated_name_lowers_to_a_function_of_its_own() {
+    let source =
+        "function use(): number {\n  const resolve: Resolver = () => 1;\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    assert_eq!(report.functions[0].name(), "use");
+    assert_eq!(report.functions[1].name(), "use#0");
+    assert_eq!(verify(&report.functions[0]), vec![]);
+    assert_eq!(verify(&report.functions[1]), vec![]);
+    assert_eq!(
+        made_closures(&report.functions[0]),
+        vec![("use#0".to_string(), Vec::new())]
+    );
+    assert!(report.functions[1].captures().is_empty());
+}
+
+#[test]
+fn an_arrow_takes_its_signature_from_the_name_it_is_bound_to_without_an_annotation() {
+    let source = "function use(): number {\n  const resolve = () => 1;\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    assert_eq!(report.functions[1].name(), "use#0");
+}
+
+#[test]
+fn an_arrow_whose_type_no_position_declares_is_refused_rather_than_guessed() {
+    let source = "function use(): number {\n  const resolve = () => 1;\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("use", returning(&mut table, number))]);
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-expression");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("nothing at this position declares the type"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_passed_as_an_argument_takes_the_signature_the_parameter_declares() {
+    let source = "function use(): number {\n  return resolved(() => 1);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let resolved = taking(&mut table, signature, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolved", Answer::Known(resolved)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    assert_eq!(report.functions[1].name(), "use#0");
+}
+
+#[test]
+fn an_arrow_with_a_block_body_lowers_its_statements() {
+    let source = "function use(): number {\n  const resolve: Resolver = () => {\n    const held = 2;\n    return held;\n  };\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let made = &report.functions[1];
+    let entry = made.entry().expect("the closure should have a block");
+    let Terminator::Return(Some(returned)) = made.block(entry).terminator else {
+        panic!("expected a return, got {:?}", made.block(entry).terminator);
+    };
+    assert_eq!(table.kind(made.type_of(returned)), &TypeKind::Number);
+}
+
+#[test]
+fn a_function_expression_lowers_like_an_arrow() {
+    let source = "function use(): number {\n  const resolve: Resolver = function () {\n    return 1;\n  };\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    assert_eq!(report.functions[1].name(), "use#0");
+}
+
+#[test]
+fn a_function_expression_with_a_name_of_its_own_is_refused() {
+    let source = "function use(): number {\n  const resolve: Resolver = function again() {\n    return 1;\n  };\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-expression");
+    assert!(
+        report.diagnostics[0].message.contains("name of its own"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_parameter_takes_its_type_from_the_position_not_from_the_provider() {
+    let source = "function use(): number {\n  const measure: Measure = (text) => text.length;\n  return measure(\"ab\");\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let signature = taking(&mut table, text, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("measure", Answer::Known(signature)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    assert_eq!(made.parameters().len(), 1);
+    assert_eq!(made.type_of(made.parameters()[0]), text);
+}
+
+#[test]
+fn an_arrow_with_more_parameters_than_its_position_declares_is_refused() {
+    let source = "function use(): number {\n  const resolve: Resolver = (extra) => 1;\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("declares no type for this parameter"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_captures_a_parameter_of_the_function_around_it() {
+    let source = "function use(base: number): number {\n  const add: Resolver = () => base + 1;\n  return add();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("base", Answer::Known(number)),
+            ("add", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let holder = &report.functions[0];
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "base");
+    assert_eq!(made.type_of(made.captures()[0].value), number);
+    assert_eq!(
+        made_closures(holder),
+        vec![("use#0".to_string(), vec![holder.parameters()[0]])],
+        "the creation site passes the value the name holds outside"
+    );
+    assert_eq!(verify(made), vec![]);
+}
+
+#[test]
+fn an_arrow_captures_the_narrowed_type_a_name_holds_where_it_is_made() {
+    let source = "function use(host: string | undefined): number {\n  if (host !== undefined) {\n    const size: Resolver = () => host.length;\n    return size();\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let undefined = table.intern(TypeKind::Undefined);
+    let maybe = table.union(vec![text, undefined]);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("host", Answer::Known(maybe)),
+            ("size", Answer::Known(signature)),
+            ("length", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(
+        made.type_of(made.captures()[0].value),
+        text,
+        "the closure captures the value the test narrowed, not the declared union"
+    );
+}
+
+#[test]
+fn an_arrow_that_writes_a_name_it_captured_is_refused() {
+    let source = "function use(base: number): number {\n  const bump: Resolver = () => {\n    base = base + 1;\n    return base;\n  };\n  return bump();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("base", Answer::Known(number)),
+            ("bump", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-capture");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("writing to a captured name"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_that_captures_a_name_the_function_writes_later_is_refused() {
+    let source = "function use(limit: number): number {\n  let seen = 0;\n  const read: Resolver = () => seen;\n  seen = seen + 1;\n  return read() + limit;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("limit", Answer::Known(number)),
+            ("read", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-capture");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("written somewhere in this function"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_inside_an_arrow_is_named_after_the_one_around_it() {
+    let source = "function use(): number {\n  const outer: Resolver = () => {\n    const inner: Resolver = () => 1;\n    return inner();\n  };\n  return outer();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("outer", Answer::Known(signature)),
+            ("inner", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let names: Vec<&str> = report
+        .functions
+        .iter()
+        .map(savitar_ir::Function::name)
+        .collect();
+    assert_eq!(names, vec!["use", "use#0", "use#0#0"]);
+}
+
+#[test]
+fn capturing_a_name_from_two_functions_out_is_refused_rather_than_read_as_a_global() {
+    let source = "function use(base: number): number {\n  const outer: Resolver = () => {\n    const inner: Resolver = () => base + 1;\n    return inner();\n  };\n  return outer();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("base", Answer::Known(number)),
+            ("outer", Answer::Known(signature)),
+            ("inner", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-capture");
+    assert!(
+        report.diagnostics[0].message.contains("further out"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_in_a_method_captures_the_receiver_because_an_arrow_inherits_this() {
+    let source = "class Counter {\n  reading(): number {\n    const reader: Resolver = () => this.held;\n    return reader();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("reading", returning(&mut table, number)),
+            ("reader", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let made = &report.functions[1];
+    assert_eq!(made.name(), "Counter.reading#0");
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "this");
+    assert_eq!(made.type_of(made.captures()[0].value), shape);
+}
+
+#[test]
+fn a_function_expression_in_a_method_cannot_see_this_because_its_own_is_dynamic() {
+    let source = "class Counter {\n  reading(): number {\n    const reader: Resolver = function () {\n      return this.held;\n    };\n    return reader();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("reading", returning(&mut table, number)),
+            ("reader", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-expression");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("`this` is not bound"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_reads_a_module_level_name_as_a_global_and_not_as_a_capture() {
+    let source = "function use(): number {\n  const resolve: Resolver = () => shared;\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+            ("shared", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    assert!(made.captures().is_empty());
+    assert!(
+        made.blocks()
+            .flat_map(|(_, block)| block.statements.iter())
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Global(_),
+                    ..
+                }
+            )),
+        "a name no enclosing function holds stays a global read"
+    );
+}
+
+#[test]
+fn an_arrow_whose_declared_type_takes_type_arguments_is_refused() {
+    let source = "function use(): number {\n  const resolve: Generic = () => 1;\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let parameter = table.intern(TypeKind::TypeParameter(0));
+    let signature = table.generic_function(vec![parameter], Vec::new(), number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-expression");
+    assert!(
+        report.diagnostics[0].message.contains("type arguments"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_that_does_not_return_what_its_position_declares_is_refused() {
+    let source = "function use(): number {\n  const resolve: Resolver = () => \"late\";\n  return resolve();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("resolve", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-return");
+}
+
+#[test]
+fn an_arrow_whose_position_declares_void_drops_the_value_of_its_body() {
+    let source = "function use(): number {\n  const note: Logger = () => record();\n  note();\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let void = table.intern(TypeKind::Void);
+    let signature = table.function(Vec::new(), void);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("note", Answer::Known(signature)),
+            ("record", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    let entry = made.entry().expect("the closure should have a block");
+    assert_eq!(made.block(entry).terminator, Terminator::Return(None));
+}
+
+#[test]
+fn a_name_read_on_two_paths_of_a_closure_is_captured_once() {
+    let source = "function use(base: number, flag: boolean): number {\n  const pick: Resolver = () => {\n    if (flag) {\n      return base;\n    }\n    return base + 1;\n  };\n  return pick();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let boolean = table.intern(TypeKind::Boolean);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("base", Answer::Known(number)),
+            ("flag", Answer::Known(boolean)),
+            ("pick", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    let names: Vec<&str> = made
+        .captures()
+        .iter()
+        .map(|capture| capture.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["flag", "base"]);
+    assert_eq!(verify(made), vec![]);
+    assert_eq!(
+        made_closures(&report.functions[0])[0].1.len(),
+        2,
+        "the creation site passes one value per capture"
+    );
+}
+
+#[test]
+fn an_arrow_captures_a_const_of_the_function_around_it() {
+    let source = "function use(): number {\n  const base = 2;\n  const add: Resolver = () => base + 1;\n  return add();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("add", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "base");
+}
+
+#[test]
+fn an_arrow_made_in_a_loop_captures_the_name_the_loop_binds() {
+    let source = "function use(items: readonly number[]): number {\n  let total = 0;\n  for (const item of items) {\n    const read: Resolver = () => item;\n    total = total + read();\n  }\n  return total;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::ReadonlyArray(number));
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("items", Answer::Known(items)),
+            ("read", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "item");
+    assert_eq!(verify(&report.functions[0]), vec![]);
+    assert_eq!(verify(made), vec![]);
+}
+
+#[test]
+fn an_arrow_that_captures_a_name_a_loop_writes_is_refused() {
+    let source = "function use(items: readonly number[]): number {\n  let total = 0;\n  for (const item of items) {\n    total = total + item;\n  }\n  const read: Resolver = () => total;\n  return read();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let items = table.intern(TypeKind::ReadonlyArray(number));
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("items", Answer::Known(items)),
+            ("read", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-capture");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("written somewhere in this function"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_returned_from_the_function_that_made_it_lowers_because_its_capture_is_by_value() {
+    let source = "function use(base: number): Resolver {\n  return () => base + 1;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, signature)),
+            ("base", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "base");
+    let entry = report.functions[0]
+        .entry()
+        .expect("the maker should have a block");
+    let Terminator::Return(Some(returned)) = report.functions[0].block(entry).terminator else {
+        panic!("expected the closure to be returned");
+    };
+    assert_eq!(report.functions[0].type_of(returned), signature);
+}

@@ -1,7 +1,7 @@
 mod assigned;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
@@ -385,6 +385,20 @@ enum Written<'target, 'source> {
 
 const THIS: &str = "this";
 
+struct Captured {
+    name: String,
+    outer: ValueId,
+    inner: ValueId,
+}
+
+struct Capturing<'a> {
+    scope: &'a Scope,
+    holder: &'a Function,
+    names_further_out: Vec<String>,
+    inherits_this: bool,
+    taken: Vec<Captured>,
+}
+
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
@@ -395,6 +409,10 @@ struct Context<'a> {
     enclosing: Vec<Breakable>,
     shadowed: Vec<Key>,
     constructing: Option<(ValueId, types::Writing)>,
+    written_names: &'a BTreeSet<String>,
+    capturing: Option<Capturing<'a>>,
+    nested: Vec<Function>,
+    closures: usize,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -487,12 +505,20 @@ fn lower_declared(
                 .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
             let lowering = Lowering {
                 name,
-                signature_at: declaration.id.as_ref().map(|id| id.span),
+                signature: declaration
+                    .id
+                    .as_ref()
+                    .map_or(Signature::NoPositionAnswersOne, |id| {
+                        Signature::AtTheName(id.span)
+                    }),
                 receiver: Receiver::Detached,
-                declaration,
-                body,
+                code: Code::AFunction(declaration),
+                body: Body::Statements(body),
             };
-            vec![lower_function(file, provider, table, &lowering)]
+            let written = assigned::names_written_through_closures(&body.statements);
+            outcomes_of(lower_function(
+                file, provider, table, &written, &lowering, None,
+            ))
         }
         Declared::Class(class) => lower_class(file, provider, table, class),
     }
@@ -515,7 +541,7 @@ fn lower_class(
     for element in &class.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
-                if let Some(outcome) = lower_method(
+                outcomes.extend(lower_method(
                     file,
                     provider,
                     table,
@@ -523,9 +549,7 @@ fn lower_class(
                     id.span,
                     class.heritage.is_some(),
                     method,
-                ) {
-                    outcomes.push(outcome);
-                }
+                ));
             }
             ClassElement::StaticBlock(block) => outcomes.push(Err(vec![refuse(
                 "unsupported-class-member",
@@ -560,42 +584,51 @@ fn lower_method(
     class_at: oxc_span::Span,
     inherits: bool,
     method: &MethodDefinition<'_>,
-) -> Option<Outcome> {
-    let body = method.value.body.as_ref()?;
+) -> Vec<Outcome> {
+    let Some(body) = method.value.body.as_ref() else {
+        return Vec::new();
+    };
     let member = match &method.key {
         PropertyKey::StaticIdentifier(id) => id,
         _ => {
-            return Some(Err(vec![refuse(
+            return vec![Err(vec![refuse(
                 "unsupported-class-member",
                 method.span,
                 "a computed or private member name is not lowered yet",
-            )]));
+            )])];
         }
     };
     if matches!(
         method.kind,
         MethodDefinitionKind::Get | MethodDefinitionKind::Set
     ) {
-        return Some(Err(vec![refuse(
+        return vec![Err(vec![refuse(
             "unsupported-class-member",
             method.span,
             "an accessor body is not lowered yet",
-        )]));
+        )])];
     }
     let name = format!("{class}.{}", member.name);
     let constructing = method.kind == MethodDefinitionKind::Constructor;
     let lowering = Lowering {
         name,
-        signature_at: (!constructing).then_some(member.span),
+        signature: if constructing {
+            Signature::NoPositionAnswersOne
+        } else {
+            Signature::AtTheName(member.span)
+        },
         receiver: match (constructing, method.r#static) {
             (true, _) => Receiver::UnderConstruction { class_at, inherits },
             (false, true) => Receiver::Detached,
             (false, false) => Receiver::Instance(class_at),
         },
-        declaration: &method.value,
-        body,
+        code: Code::AFunction(&method.value),
+        body: Body::Statements(body),
     };
-    Some(lower_function(file, provider, table, &lowering))
+    let written = assigned::names_written_through_closures(&body.statements);
+    outcomes_of(lower_function(
+        file, provider, table, &written, &lowering, None,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -629,12 +662,96 @@ impl Receiver {
     }
 }
 
+enum Signature {
+    AtTheName(oxc_span::Span),
+    Declared(TypeId),
+    NoPositionAnswersOne,
+}
+
+#[derive(Clone, Copy)]
+enum Code<'a> {
+    AFunction(&'a oxc_ast::ast::Function<'a>),
+    AnArrow(&'a oxc_ast::ast::ArrowFunctionExpression<'a>),
+}
+
+impl<'a> Code<'a> {
+    const fn span(self) -> oxc_span::Span {
+        match self {
+            Self::AFunction(declaration) => declaration.span,
+            Self::AnArrow(arrow) => arrow.span,
+        }
+    }
+
+    const fn is_a_generator(self) -> bool {
+        match self {
+            Self::AFunction(declaration) => declaration.generator,
+            Self::AnArrow(_) => false,
+        }
+    }
+
+    const fn writes_its_own_this(self) -> bool {
+        match self {
+            Self::AFunction(declaration) => declaration.this_param.is_some(),
+            Self::AnArrow(_) => false,
+        }
+    }
+
+    const fn is_async(self) -> bool {
+        match self {
+            Self::AFunction(declaration) => declaration.r#async,
+            Self::AnArrow(arrow) => arrow.r#async,
+        }
+    }
+
+    const fn inherits_this(self) -> bool {
+        matches!(self, Self::AnArrow(_))
+    }
+
+    fn params(self) -> &'a oxc_ast::ast::FormalParameters<'a> {
+        match self {
+            Self::AFunction(declaration) => &declaration.params,
+            Self::AnArrow(arrow) => &arrow.params,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Body<'a> {
+    Statements(&'a FunctionBody<'a>),
+    OneExpression(&'a Expression<'a>),
+}
+
+impl Body<'_> {
+    fn span(self) -> oxc_span::Span {
+        match self {
+            Self::Statements(body) => body.span,
+            Self::OneExpression(expression) => expression_span(expression),
+        }
+    }
+}
+
 struct Lowering<'a> {
     name: String,
-    signature_at: Option<oxc_span::Span>,
+    signature: Signature,
     receiver: Receiver,
-    declaration: &'a oxc_ast::ast::Function<'a>,
-    body: &'a FunctionBody<'a>,
+    code: Code<'a>,
+    body: Body<'a>,
+}
+
+struct Lowered {
+    function: Function,
+    nested: Vec<Function>,
+    taken: Vec<Captured>,
+}
+
+fn outcomes_of(lowered: Result<Lowered, Vec<Diagnostic>>) -> Vec<Outcome> {
+    match lowered {
+        Ok(lowered) => std::iter::once(lowered.function)
+            .chain(lowered.nested)
+            .map(Ok)
+            .collect(),
+        Err(problems) => vec![Err(problems)],
+    }
 }
 
 fn empty_block() -> Block {
@@ -645,39 +762,44 @@ fn empty_block() -> Block {
     }
 }
 
-fn lower_function(
-    file: &SourceFile,
-    provider: &dyn TypeProvider,
+fn lower_function<'a>(
+    file: &'a SourceFile,
+    provider: &'a dyn TypeProvider,
     table: &mut TypeTable,
+    written_names: &'a BTreeSet<String>,
     lowering: &Lowering<'_>,
-) -> Result<Function, Vec<Diagnostic>> {
-    let declaration = lowering.declaration;
+    capturing: Option<Capturing<'a>>,
+) -> Result<Lowered, Vec<Diagnostic>> {
+    let code = lowering.code;
     let body = lowering.body;
-    if declaration.generator {
+    let at = code.span();
+    if code.is_a_generator() {
         return Err(vec![refuse(
             "unsupported-function",
-            declaration.span,
+            at,
             "a generator function is not lowered yet",
         )]);
     }
-    if declaration.this_param.is_some() {
+    if code.writes_its_own_this() {
         return Err(vec![refuse(
             "unsupported-function",
-            declaration.span,
+            at,
             "a written `this` parameter is not lowered yet",
         )]);
     }
-    if let Some(rest) = declaration.params.rest.as_ref() {
+    if let Some(rest) = code.params().rest.as_ref() {
         return Err(vec![refuse(
             "unsupported-pattern",
             rest.span,
             "a rest parameter is not lowered yet, and lowering the function without it would hide every argument it takes",
         )]);
     }
-    if lowering.signature_at.is_none() && lowering.receiver.constructs().is_none() {
+    if matches!(lowering.signature, Signature::NoPositionAnswersOne)
+        && lowering.receiver.constructs().is_none()
+    {
         return Err(vec![refuse(
             "unsupported-function",
-            declaration.span,
+            at,
             "a function with no name is not lowered yet, because its signature is asked for by name and no position of it answers one",
         )]);
     }
@@ -694,6 +816,10 @@ fn lower_function(
         enclosing: Vec::new(),
         shadowed: Vec::new(),
         constructing: None,
+        written_names,
+        capturing,
+        nested: Vec::new(),
+        closures: 0,
     };
 
     if let Some(class_at) = lowering.receiver.shape_at() {
@@ -701,7 +827,7 @@ fn lower_function(
         if !types::is_shaped(table, shape) {
             return Err(vec![refuse(
                 "unsupported-class-member",
-                declaration.span,
+                at,
                 "the provider answers no shape at the name of this class, so `this` has no type",
             )]);
         }
@@ -713,24 +839,26 @@ fn lower_function(
             .map(|writing| (held, writing));
     }
 
-    let signature = match lowering.signature_at {
-        Some(at) => Some(context.type_at(table, at)?),
-        None => None,
+    let signature = match lowering.signature {
+        Signature::AtTheName(name_at) => Some(context.type_at(table, name_at)?),
+        Signature::Declared(declared) => Some(declared),
+        Signature::NoPositionAnswersOne => None,
     };
     let declared = match signature {
         Some(signature) => types::declared_return(table, signature)
-            .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?,
+            .map_err(|reason| vec![refuse("unsupported-function", at, reason)])?,
         None => table.intern(TypeKind::Void),
     };
-    context.returns = if declaration.r#async {
+    context.returns = if code.is_async() {
         types::awaited(table, declared)
-            .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?
+            .map_err(|reason| vec![refuse("unsupported-function", at, reason)])?
     } else {
         declared
     };
 
+    let takes_from_the_position = matches!(lowering.signature, Signature::Declared(_));
     let mut entering = Vec::new();
-    for (position, parameter) in declaration.params.items.iter().enumerate() {
+    for (position, parameter) in code.params().items.iter().enumerate() {
         if parameter.accessibility.is_some() || parameter.readonly || parameter.r#override {
             return Err(vec![refuse(
                 "unsupported-pattern",
@@ -740,7 +868,9 @@ fn lower_function(
         }
         let default = parameter.initializer.as_deref();
         let declared = match &parameter.pattern {
-            BindingPattern::BindingIdentifier(id) => context.type_at(table, id.span)?,
+            BindingPattern::BindingIdentifier(id) if !takes_from_the_position => {
+                context.type_at(table, id.span)?
+            }
             _ => {
                 let Some(signature) = signature else {
                     return Err(vec![refuse(
@@ -775,12 +905,19 @@ fn lower_function(
         context.bind_pattern(table, &mut function, pattern, value)?;
     }
 
-    let flow = context.lower_statements(table, &mut function, &body.statements)?;
+    let flow = match body {
+        Body::Statements(statements) => {
+            context.lower_statements(table, &mut function, &statements.statements)?
+        }
+        Body::OneExpression(returned) => {
+            context.lower_one_expression_body(table, &mut function, returned)?
+        }
+    };
     if flow == Flow::Continues {
         if !types::leaving_without_a_value_fits(table, context.returns) {
             return Err(vec![refuse(
                 "unsupported-return",
-                body.span,
+                body.span(),
                 "this function can reach its end without returning a value the declared type admits",
             )]);
         }
@@ -791,11 +928,18 @@ fn lower_function(
     if !malformations.is_empty() {
         return Err(vec![refuse(
             "malformed-ir",
-            body.span,
+            body.span(),
             format!("lowering produced invalid code: {malformations:?}"),
         )]);
     }
-    Ok(function)
+    Ok(Lowered {
+        function,
+        nested: context.nested,
+        taken: context
+            .capturing
+            .map(|capturing| capturing.taken)
+            .unwrap_or_default(),
+    })
 }
 
 fn statement_span(statement: &AstStatement<'_>) -> oxc_span::Span {
@@ -873,6 +1017,182 @@ impl Context<'_> {
         let block = function.block_mut(self.current);
         block.statements = std::mem::take(&mut self.statements);
         block.terminator = terminator;
+    }
+
+    fn lower_one_expression_body(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        returned: &Expression<'_>,
+    ) -> Result<Flow, Vec<Diagnostic>> {
+        let at = expression_span(returned);
+        if matches!(table.kind(self.returns), TypeKind::Void) {
+            self.lower_effect(table, function, returned)?;
+            self.seal(function, Terminator::Return(None));
+            return Ok(Flow::Returned);
+        }
+        let wanted = self.returns;
+        let value = self.lower_expression_expecting(table, function, returned, Some(wanted))?;
+        if !savitar_types::assignable(table, function.type_of(value), wanted) {
+            return Err(vec![refuse(
+                "unsupported-return",
+                at,
+                "Savitar cannot show this value fits the declared return type",
+            )]);
+        }
+        let carried = self.coerced(function, table, value, wanted, at);
+        self.seal(function, Terminator::Return(Some(carried)));
+        Ok(Flow::Returned)
+    }
+
+    fn captured(
+        &mut self,
+        function: &mut Function,
+        name: &str,
+        span: oxc_span::Span,
+    ) -> Result<Option<ValueId>, Vec<Diagnostic>> {
+        let Some(capturing) = self.capturing.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(held) = capturing.taken.iter().find(|held| held.name == name) {
+            let inner = held.inner;
+            let declared = function.type_of(inner);
+            self.hold_a_capture(name, inner, declared);
+            return Ok(Some(inner));
+        }
+        let Some(binding) = capturing.scope.get(name) else {
+            if capturing.names_further_out.iter().any(|held| held == name) {
+                return Err(vec![refuse(
+                    "unsupported-capture",
+                    span,
+                    format!(
+                        "`{name}` is a local of a function further out than the one around this closure, and capture reaches only one function out yet"
+                    ),
+                )]);
+            }
+            return Ok(None);
+        };
+        if self.written_names.contains(name) {
+            return Err(vec![refuse(
+                "unsupported-capture",
+                span,
+                format!(
+                    "`{name}` is written somewhere in this function, and a closure that captured it by value would not see the write"
+                ),
+            )]);
+        }
+        let outer = binding.value_or_refuse(name, span)?;
+        let declared = capturing.holder.type_of(outer);
+        let inner = function.declare_capture(name, declared);
+        if let Some(capturing) = self.capturing.as_mut() {
+            capturing.taken.push(Captured {
+                name: name.to_string(),
+                outer,
+                inner,
+            });
+        }
+        self.hold_a_capture(name, inner, declared);
+        Ok(Some(inner))
+    }
+
+    fn hold_a_capture(&mut self, name: &str, value: ValueId, declared: TypeId) {
+        self.scope.put(
+            &Key {
+                name: name.to_string(),
+                depth: 0,
+            },
+            Binding::written(value, declared),
+        );
+    }
+
+    fn holds_a_capture_of(&self, name: &str) -> bool {
+        self.capturing.as_ref().is_some_and(|capturing| {
+            capturing.taken.iter().any(|held| held.name == name)
+                && self.scope.innermost(name).is_some_and(|key| key.depth == 0)
+        })
+    }
+
+    fn reaches_a_name_further_out(&self, name: &str) -> bool {
+        self.capturing.as_ref().is_some_and(|capturing| {
+            capturing.scope.holds(name)
+                || capturing.names_further_out.iter().any(|held| held == name)
+        })
+    }
+
+    fn lower_closure(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        code: Code<'_>,
+        body: Body<'_>,
+        expected: Option<TypeId>,
+    ) -> Result<ValueId, Vec<Diagnostic>> {
+        let at = code.span();
+        let Some(expected) = expected else {
+            return Err(vec![refuse(
+                "unsupported-expression",
+                at,
+                "nothing at this position declares the type of this function, and a signature is asked for by name",
+            )]);
+        };
+        let forms = types::callable_forms(table, expected)
+            .map_err(|reason| vec![refuse("unsupported-expression", at, reason)])?;
+        let [signature] = forms.as_slice() else {
+            return Err(vec![refuse(
+                "unsupported-expression",
+                at,
+                "the type declared at this position holds more than one call form, and Savitar does not choose between them",
+            )]);
+        };
+        let signature = *signature;
+        if types::takes_type_arguments(table, signature) {
+            return Err(vec![refuse(
+                "unsupported-expression",
+                at,
+                "a function whose declared type takes type arguments of its own is not lowered yet",
+            )]);
+        }
+
+        let name = format!("{}#{}", function.name(), self.closures);
+        self.closures += 1;
+        let mut names_further_out = Vec::new();
+        if let Some(capturing) = self.capturing.as_ref() {
+            names_further_out.extend(capturing.scope.keys().into_iter().map(|key| key.name));
+            names_further_out.extend(capturing.names_further_out.iter().cloned());
+        }
+        let lowering = Lowering {
+            name: name.clone(),
+            signature: Signature::Declared(signature),
+            receiver: Receiver::Detached,
+            code,
+            body,
+        };
+        let lowered = lower_function(
+            self.file,
+            self.provider,
+            table,
+            self.written_names,
+            &lowering,
+            Some(Capturing {
+                scope: &self.scope,
+                holder: function,
+                names_further_out,
+                inherits_this: code.inherits_this(),
+                taken: Vec::new(),
+            }),
+        )?;
+        let captured: Vec<ValueId> = lowered.taken.iter().map(|held| held.outer).collect();
+        self.nested.push(lowered.function);
+        self.nested.extend(lowered.nested);
+        Ok(self.assign(
+            function,
+            signature,
+            Rvalue::Closure {
+                function: name,
+                captured,
+            },
+            at,
+        ))
     }
 
     fn lower_statements(
@@ -1265,6 +1585,15 @@ impl Context<'_> {
         value: ValueId,
         span: oxc_span::Span,
     ) -> Result<(), Vec<Diagnostic>> {
+        if self.holds_a_capture_of(name) {
+            return Err(vec![refuse(
+                "unsupported-capture",
+                span,
+                format!(
+                    "`{name}` is captured from the function around this closure, and writing to a captured name is not lowered yet"
+                ),
+            )]);
+        }
         let held = self.bound(name, at)?;
         let stored = self.kept(table, function, value, held.declared, name, span)?;
         self.scope
@@ -3188,13 +3517,23 @@ impl Context<'_> {
     }
 
     fn bound(&self, name: &str, span: oxc_span::Span) -> Result<Binding, Vec<Diagnostic>> {
-        self.scope.get(name).ok_or_else(|| {
-            vec![refuse(
-                "unsupported-reference",
+        if let Some(binding) = self.scope.get(name) {
+            return Ok(binding);
+        }
+        if self.reaches_a_name_further_out(name) {
+            return Err(vec![refuse(
+                "unsupported-capture",
                 span,
-                format!("`{name}` is not bound in this function"),
-            )]
-        })
+                format!(
+                    "`{name}` comes from the function around this closure, and writing to a captured name is not lowered yet"
+                ),
+            )]);
+        }
+        Err(vec![refuse(
+            "unsupported-reference",
+            span,
+            format!("`{name}` is not bound in this function"),
+        )])
     }
 
     fn declare(&mut self, name: &str, binding: Binding) {
@@ -3509,10 +3848,11 @@ impl Context<'_> {
         let BindingPattern::BindingIdentifier(id) = &declarator.id else {
             return self.lower_destructuring(table, function, declarator);
         };
-        let declared = declarator
-            .type_annotation
-            .as_ref()
-            .and_then(|_| self.type_at(table, id.span).ok());
+        let names_a_signature = declarator.type_annotation.is_some()
+            || declarator.init.as_ref().is_some_and(is_a_closure);
+        let declared = names_a_signature
+            .then(|| self.type_at(table, id.span).ok())
+            .flatten();
         let Some(init) = &declarator.init else {
             let Some(declared) = declared else {
                 return Err(vec![refuse(
@@ -3905,6 +4245,9 @@ impl Context<'_> {
                 if let Some(known) = self.scope.get(id.name.as_str()) {
                     return known.value_or_refuse(id.name.as_str(), id.span);
                 }
+                if let Some(held) = self.captured(function, id.name.as_str(), id.span)? {
+                    return Ok(held);
+                }
                 if id.name == "undefined" {
                     let ty = table.intern(TypeKind::Undefined);
                     return Ok(self.assign(
@@ -3918,14 +4261,22 @@ impl Context<'_> {
                 Ok(self.assign(function, ty, Rvalue::Global(id.name.to_string()), id.span))
             }
             Expression::ThisExpression(this) => {
-                let Some(held) = self.scope.get(THIS) else {
-                    return Err(vec![refuse(
-                        "unsupported-expression",
-                        this.span,
-                        "`this` is not bound here, because the shape it would take is not known",
-                    )]);
-                };
-                held.value_or_refuse(THIS, this.span)
+                if let Some(held) = self.scope.get(THIS) {
+                    return held.value_or_refuse(THIS, this.span);
+                }
+                if self
+                    .capturing
+                    .as_ref()
+                    .is_some_and(|capturing| capturing.inherits_this)
+                    && let Some(held) = self.captured(function, THIS, this.span)?
+                {
+                    return Ok(held);
+                }
+                Err(vec![refuse(
+                    "unsupported-expression",
+                    this.span,
+                    "`this` is not bound here, because the shape it would take is not known",
+                )])
             }
             Expression::ParenthesizedExpression(inner) => {
                 self.lower_expression_expecting(table, function, &inner.expression, expected)
@@ -4117,6 +4468,47 @@ impl Context<'_> {
                 let ty = table.intern(TypeKind::Array(element));
                 Ok(self.assign(function, ty, Rvalue::NewArray { elements }, array.span))
             }
+            Expression::ArrowFunctionExpression(arrow) => {
+                let body = match &arrow.body {
+                    oxc_ast::ast::ArrowFunctionBody::FunctionBody(statements) => {
+                        Body::Statements(statements)
+                    }
+                    returned => {
+                        let Some(returned) = returned.as_expression() else {
+                            return Err(vec![refuse(
+                                "unsupported-expression",
+                                arrow.span,
+                                "this arrow body is not lowered yet",
+                            )]);
+                        };
+                        Body::OneExpression(returned)
+                    }
+                };
+                self.lower_closure(table, function, Code::AnArrow(arrow), body, expected)
+            }
+            Expression::FunctionExpression(declaration) => {
+                if declaration.id.is_some() {
+                    return Err(vec![refuse(
+                        "unsupported-expression",
+                        declaration.span,
+                        "a function expression with a name of its own is not lowered yet, because that name is bound inside its own body",
+                    )]);
+                }
+                let Some(body) = declaration.body.as_ref() else {
+                    return Err(vec![refuse(
+                        "unsupported-expression",
+                        declaration.span,
+                        "a function expression with no body is not lowered yet",
+                    )]);
+                };
+                self.lower_closure(
+                    table,
+                    function,
+                    Code::AFunction(declaration),
+                    Body::Statements(body),
+                    expected,
+                )
+            }
             Expression::CallExpression(call) => self.lower_call(table, function, call),
             Expression::NewExpression(new_expression) => {
                 self.lower_new(table, function, new_expression)
@@ -4149,6 +4541,14 @@ impl Context<'_> {
                 )])
             }
         }
+    }
+}
+
+fn is_a_closure(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
+        Expression::ParenthesizedExpression(inner) => is_a_closure(&inner.expression),
+        _ => false,
     }
 }
 
