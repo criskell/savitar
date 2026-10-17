@@ -9783,3 +9783,187 @@ fn a_rest_parameter_is_refused_rather_than_dropped() {
         report.diagnostics[0].message
     );
 }
+
+#[test]
+fn a_discriminant_narrowing_is_forgotten_after_a_call_that_could_write_the_field() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    audit();\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("audit", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+    assert!(
+        report.diagnostics[0].message.contains("size"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_discriminant_narrowing_still_types_the_argument_of_the_call_that_forgets_it() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    return sizeOf(frame);\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let size_of = taking(&mut table, shapes.binary, number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("sizeOf", Answer::Known(size_of)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&shapes.binary),
+        "the argument is proved against the member the test named, before the call forgets it"
+    );
+}
+
+#[test]
+fn a_discriminant_narrowing_in_a_switch_case_is_forgotten_after_a_call() {
+    let source = "function use(frame: Frame): number {\n  switch (frame.kind) {\n    case \"binary\":\n      audit();\n      return frame.size;\n    default:\n      return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("audit", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn an_in_narrowing_is_forgotten_after_a_call_that_could_write_the_field() {
+    let source = "function use(frame: Frame): number {\n  if (\"size\" in frame) {\n    audit();\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("audit", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn an_await_forgets_field_narrowing_because_other_code_runs_while_it_is_suspended() {
+    let source = "async function use(frame: Frame): Promise<number> {\n  if (frame.kind === \"binary\") {\n    const ready = await later();\n    return frame.size;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let promised = table.intern(TypeKind::Promise(number));
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, promised)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("later", returning(&mut table, promised)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-read");
+}
+
+#[test]
+fn a_typeof_narrowing_survives_a_call_because_no_call_can_rebind_a_name() {
+    let source = "function use(value: string | number, extra: number): number {\n  if (typeof value === \"number\") {\n    audit();\n    return value + extra;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let (number, either) = text_or_number(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("value", Answer::Known(either)),
+            ("extra", Answer::Known(number)),
+            ("audit", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        narrowed(function).contains(&number),
+        "a fact about the value a name holds outlives the call"
+    );
+}
+
+#[test]
+fn a_nullish_narrowing_survives_a_call_because_no_call_can_rebind_a_name() {
+    let source = "function use(host: string | undefined): number {\n  if (host !== undefined) {\n    audit();\n    return host.length;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let undefined = table.intern(TypeKind::Undefined);
+    let maybe = table.union(vec![text, undefined]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("host", Answer::Known(maybe)),
+            ("length", Answer::Known(number)),
+            ("audit", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(narrowed(&report.functions[0]).contains(&text));
+}

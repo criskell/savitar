@@ -36,6 +36,7 @@ pub struct LowerReport {
 struct Binding {
     value: Option<ValueId>,
     declared: TypeId,
+    narrowed_by_a_field: bool,
 }
 
 impl Binding {
@@ -43,6 +44,7 @@ impl Binding {
         Self {
             value: Some(value),
             declared,
+            narrowed_by_a_field: false,
         }
     }
 
@@ -50,6 +52,15 @@ impl Binding {
         Self {
             value: None,
             declared,
+            narrowed_by_a_field: false,
+        }
+    }
+
+    const fn narrowed(value: ValueId, declared: TypeId, by_a_field: bool) -> Self {
+        Self {
+            value: Some(value),
+            declared,
+            narrowed_by_a_field: by_a_field,
         }
     }
 
@@ -305,6 +316,12 @@ enum Fact {
         literals: Vec<TypeKind>,
     },
     Among(Vec<TypeKind>),
+}
+
+impl Fact {
+    const fn is_about_a_field(&self) -> bool {
+        matches!(self, Self::Declares(_) | Self::Discriminant { .. })
+    }
 }
 
 struct Subject {
@@ -1559,12 +1576,14 @@ impl Context<'_> {
                 spans[position],
             ));
         }
-        Ok(self.assign(
+        let made = self.assign(
             function,
             fitted.returns,
             Rvalue::New { callee, arguments },
             new_expression.span,
-        ))
+        );
+        self.forget_narrowing_a_call_could_falsify(function, new_expression.span);
+        Ok(made)
     }
 
     fn lower_call(
@@ -1615,12 +1634,14 @@ impl Context<'_> {
                     self.lower_expression_expecting(table, function, expression, Some(slot))?;
                 arguments.push(self.argued(table, function, value, slot, expression.span())?);
             }
-            return Ok(self.assign(
+            let answered = self.assign(
                 function,
                 returns,
                 Rvalue::Call { callee, arguments },
                 call.span,
-            ));
+            );
+            self.forget_narrowing_a_call_could_falsify(function, call.span);
+            return Ok(answered);
         }
 
         let mut values = Vec::with_capacity(expressions.len());
@@ -1644,12 +1665,14 @@ impl Context<'_> {
                 expressions[position].span(),
             ));
         }
-        Ok(self.assign(
+        let answered = self.assign(
             function,
             fitted.returns,
             Rvalue::Call { callee, arguments },
             call.span,
-        ))
+        );
+        self.forget_narrowing_a_call_could_falsify(function, call.span);
+        Ok(answered)
     }
 
     fn argued(
@@ -2497,8 +2520,33 @@ impl Context<'_> {
             return;
         }
         let value = self.assign(function, narrowed, Rvalue::Narrow(standing), span);
-        self.scope
-            .store(&tested.name, Binding::written(value, binding.declared));
+        let by_a_field = binding.narrowed_by_a_field || tested.fact.is_about_a_field();
+        self.scope.store(
+            &tested.name,
+            Binding::narrowed(value, binding.declared, by_a_field),
+        );
+    }
+
+    fn forget_narrowing_a_call_could_falsify(
+        &mut self,
+        function: &mut Function,
+        span: oxc_span::Span,
+    ) {
+        for (key, binding) in self.scope.entries() {
+            if !binding.narrowed_by_a_field {
+                continue;
+            }
+            let Some(standing) = binding.value else {
+                continue;
+            };
+            let forgotten = if function.type_of(standing) == binding.declared {
+                standing
+            } else {
+                self.assign(function, binding.declared, Rvalue::Widen(standing), span)
+            };
+            self.scope
+                .put(&key, Binding::written(forgotten, binding.declared));
+        }
     }
 
     fn switch_subject(&self, discriminant: &Expression<'_>) -> Option<Subject> {
@@ -2614,6 +2662,8 @@ impl Context<'_> {
         if then_flow.continues() && else_flow.continues() {
             for key in before.keys() {
                 let declared = before.held_at(&key).declared;
+                let narrowed_by_a_field = then_scope.held_at(&key).narrowed_by_a_field
+                    || else_scope.held_at(&key).narrowed_by_a_field;
                 let from_then = then_scope.held_at(&key).value;
                 let from_else = else_scope.held_at(&key).value;
                 if from_then == from_else {
@@ -2622,6 +2672,7 @@ impl Context<'_> {
                         Binding {
                             value: from_then,
                             declared,
+                            narrowed_by_a_field,
                         },
                     );
                     continue;
@@ -2642,7 +2693,10 @@ impl Context<'_> {
                 parameters.push(parameter);
                 then_arguments.push(carried_then);
                 else_arguments.push(carried_else);
-                merged.put(&key, Binding::written(parameter, declared));
+                merged.put(
+                    &key,
+                    Binding::narrowed(parameter, declared, narrowed_by_a_field),
+                );
             }
         } else if then_flow.continues() {
             merged = then_scope;
@@ -3029,6 +3083,9 @@ impl Context<'_> {
         let mut merged = shape.clone();
         for key in shape.keys() {
             let declared = shape.held_at(&key).declared;
+            let narrowed_by_a_field = edges
+                .iter()
+                .any(|(_, scope)| scope.held_at(&key).narrowed_by_a_field);
             let first = edges[0].1.held_at(&key).value;
             if edges
                 .iter()
@@ -3039,6 +3096,7 @@ impl Context<'_> {
                     Binding {
                         value: first,
                         declared,
+                        narrowed_by_a_field,
                     },
                 );
                 continue;
@@ -3062,7 +3120,10 @@ impl Context<'_> {
             }
             let parameter = function.fresh_value(wanted);
             parameters.push(parameter);
-            merged.put(&key, Binding::written(parameter, declared));
+            merged.put(
+                &key,
+                Binding::narrowed(parameter, declared, narrowed_by_a_field),
+            );
         }
 
         function.block_mut(join).parameters = parameters;
@@ -4070,12 +4131,14 @@ impl Context<'_> {
                         "`await` of something that is not a promise is not lowered yet",
                     )]
                 })?;
-                Ok(self.assign(
+                let settled = self.assign(
                     function,
                     held,
                     Rvalue::Await(promised),
                     await_expression.span,
-                ))
+                );
+                self.forget_narrowing_a_call_could_falsify(function, await_expression.span);
+                Ok(settled)
             }
             other => {
                 use oxc_span::GetSpan;
