@@ -10,7 +10,7 @@ use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
     Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration,
     ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft, FunctionBody,
-    MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
+    ImportOrExportKind, MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
     SimpleAssignmentTarget, Statement as AstStatement, VariableDeclaration, VariableDeclarator,
 };
 use oxc_parser::Parser;
@@ -595,6 +595,12 @@ pub fn lower_in_order(
             }
             AtModuleLevel::Initializes(declaration) => binds.push(Binds::Variables(declaration)),
             AtModuleLevel::CarriesNoCode => {}
+            AtModuleLevel::Forwards(form) => {
+                if refused_before.is_none() {
+                    refused_before = Some(binds.len());
+                }
+                diagnostics.push(refuse_a_forwarded_name(statement_span(statement), form));
+            }
             AtModuleLevel::NotLowered(form) => {
                 if refused_before.is_none() {
                     refused_before = Some(binds.len());
@@ -708,6 +714,7 @@ enum AtModuleLevel<'a> {
     Initializes(&'a VariableDeclaration<'a>),
     CarriesNoCode,
     NotLowered(&'static str),
+    Forwards(&'static str),
 }
 
 fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtModuleLevel<'a> {
@@ -715,6 +722,26 @@ fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtMod
         return AtModuleLevel::NotLowered("a `var` declaration");
     }
     AtModuleLevel::Initializes(declaration)
+}
+
+fn every_forwarded_name_is_a_type(declaration: &oxc_ast::ast::ExportFromDeclaration<'_>) -> bool {
+    !declaration.specifiers.is_empty()
+        && declaration
+            .specifiers
+            .iter()
+            .all(|specifier| specifier.export_kind == ImportOrExportKind::Type)
+}
+
+fn refuse_a_forwarded_name(span: oxc_span::Span, form: &'static str) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsupported-reexport",
+        span_of(span),
+        format!("{form} forwards a name this module never binds"),
+    )
+    .with_help(
+        "the name table of a module holds what the module binds, so a module that reads a \
+         forwarded name from here is refused by that name",
+    )
 }
 
 fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnostic {
@@ -751,8 +778,23 @@ fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
         }
         AstStatement::ImportDeclaration(_)
         | AstStatement::ExportNamedDeclaration(_)
-        | AstStatement::ExportAllDeclaration(_)
         | AstStatement::EmptyStatement(_) => AtModuleLevel::CarriesNoCode,
+        AstStatement::ExportFromDeclaration(declaration) => {
+            if declaration.export_kind == ImportOrExportKind::Type
+                || every_forwarded_name_is_a_type(declaration)
+            {
+                AtModuleLevel::CarriesNoCode
+            } else {
+                AtModuleLevel::Forwards("a re-export")
+            }
+        }
+        AstStatement::ExportAllDeclaration(declaration) => {
+            if declaration.export_kind == ImportOrExportKind::Type {
+                AtModuleLevel::CarriesNoCode
+            } else {
+                AtModuleLevel::Forwards("a re-export of everything another module exports")
+            }
+        }
         AstStatement::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
         other => AtModuleLevel::NotLowered(module_level_form(other)),
     }

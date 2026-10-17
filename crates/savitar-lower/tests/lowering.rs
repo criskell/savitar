@@ -12270,6 +12270,54 @@ fn a_module_whose_initializer_is_refused_publishes_not_even_the_function_it_decl
 }
 
 #[test]
+fn a_re_export_is_refused_because_it_forwards_a_name_the_module_never_binds() {
+    let report = walked("export { port } from \"./settings.ts\";\n");
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reexport");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("forwards a name this module never binds"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    assert!(report.published.is_empty(), "{:?}", report.published);
+}
+
+#[test]
+fn a_re_export_of_everything_is_refused_too() {
+    let report = walked("export * from \"./settings.ts\";\n");
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reexport");
+}
+
+#[test]
+fn a_re_export_of_a_type_carries_no_code_and_is_not_refused() {
+    let report = walked("export type { Shape } from \"./shapes.ts\";\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_re_export_whose_every_name_is_a_type_carries_no_code_either() {
+    let report = walked("export { type Shape, type Size } from \"./shapes.ts\";\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_re_exporting_module_publishes_nothing_it_binds_after_the_forward() {
+    let report =
+        walked("export { port } from \"./settings.ts\";\n\nexport const host = \"0.0.0.0\";\n");
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reexport");
+    assert!(report.published.is_empty(), "{:?}", report.published);
+}
+
+#[test]
 fn an_initializer_reading_a_name_the_other_module_does_not_bind_is_refused_by_that_name() {
     let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
     let mut table = TypeTable::new();

@@ -381,3 +381,40 @@ fn reading_a_name_a_refused_dependency_binds_only_after_the_refusal_is_refused_b
     );
     assert!(!output.status.success());
 }
+
+#[test]
+fn reading_a_name_a_module_re_exports_instead_of_binding_is_refused_by_that_name() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let root = project(
+        "order-reexport",
+        &[
+            ("settings.ts", "export const port = 8080;\n"),
+            ("gateway.ts", "export { port } from \"./settings.ts\";\n"),
+            (
+                "server.ts",
+                "import { port } from \"./gateway.ts\";\n\nexport const chosen = port;\n",
+            ),
+        ],
+    );
+    assert!(
+        the_type_checker_accepts(&bench, &root),
+        "the type checker accepts a re-export, which is why Savitar has to answer for it"
+    );
+
+    let output = check_project(&bench, &root, &["settings.ts", "gateway.ts", "server.ts"]);
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-reexport"),
+        "the module that forwards the name must say so; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("unsupported-import-unpublished") && printed.contains("binds no `port`"),
+        "the module that reads the forwarded name must be refused by that name; the output \
+         was:\n{printed}"
+    );
+    assert!(!output.status.success());
+}
