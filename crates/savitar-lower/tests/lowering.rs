@@ -9650,14 +9650,13 @@ fn a_computed_member_name_is_refused_rather_than_skipped() {
 
     let report = lower(&file, &provider, &mut table);
 
-    assert_eq!(report.diagnostics.len(), 1);
-    assert!(
-        report.diagnostics[0]
-            .message
-            .contains("computed or private"),
-        "{}",
-        report.diagnostics[0].message
-    );
+    let computed: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .map(|gap| gap.message.as_str())
+        .filter(|message| message.contains("computed or private"))
+        .collect();
+    assert_eq!(computed.len(), 1, "{:?}", report.diagnostics);
 }
 
 #[test]
@@ -9742,7 +9741,7 @@ fn a_default_exported_class_with_a_name_has_its_members_reached() {
 }
 
 #[test]
-fn a_default_exported_arrow_function_stays_the_refusal_it_already_was() {
+fn a_default_exported_arrow_function_is_refused_instead_of_vanishing() {
     let source = "export default (at: number): number => at;\n";
     let mut table = TypeTable::new();
     let provider = ByName::new(source, vec![]);
@@ -9751,7 +9750,15 @@ fn a_default_exported_arrow_function_stays_the_refusal_it_already_was() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("an `export default` of a value at module level"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }
 
 #[test]
@@ -10764,4 +10771,211 @@ fn an_arrow_in_an_object_literal_takes_the_signature_the_field_declares() {
     let made = &report.functions[1];
     assert_eq!(made.captures().len(), 1);
     assert_eq!(made.captures()[0].name, "base");
+}
+
+fn walked(source: &str) -> savitar_lower::LowerReport {
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, Vec::new());
+    let file = SourceFile::new("module.ts", source);
+    lower(&file, &provider, &mut table)
+}
+
+#[test]
+fn a_module_variable_declaration_is_refused_instead_of_skipped() {
+    let report = walked("const limit = 8;\n");
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("a variable declaration at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_exported_module_variable_declaration_is_refused_instead_of_skipped() {
+    let report = walked("export const host = \"0.0.0.0\";\n");
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("a variable declaration at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_module_level_refusal_carries_the_line_and_column_of_the_statement() {
+    let source = "export interface Shape {\n  size: number;\n}\n\nexport const limit = 8;\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, Vec::new());
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!(at.line, 5);
+    assert_eq!(at.column, 1);
+}
+
+#[test]
+fn every_module_variable_declaration_is_refused_once() {
+    let report = walked("const host = \"0.0.0.0\";\nconst port = 8080;\n");
+
+    assert_eq!(report.diagnostics.len(), 2);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .all(|gap| gap.rule == "unsupported-module-statement")
+    );
+}
+
+#[test]
+fn a_module_level_expression_statement_is_refused_instead_of_skipped() {
+    let report = walked("start();\n");
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("an expression statement at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn module_level_control_flow_is_refused_instead_of_skipped() {
+    let report = walked("if (ready) {\n  start();\n}\n");
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("an `if` at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_export_default_of_a_value_is_refused_instead_of_skipped() {
+    let report = walked("export default 8;\n");
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("an `export default` of a value at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_enum_declaration_at_module_level_is_refused_instead_of_skipped() {
+    let report = walked("export enum Level {\n  Low = 1,\n}\n");
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("an enum declaration at module level"),
+        "{:?}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_type_alias_at_module_level_carries_no_code_and_is_not_refused() {
+    let report = walked("export type Budget = () => number;\ntype Host = string;\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(report.functions.is_empty());
+}
+
+#[test]
+fn an_interface_at_module_level_carries_no_code_and_is_not_refused() {
+    let report = walked("export interface Shape {\n  size: number;\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn an_import_at_module_level_carries_no_code_and_is_not_refused() {
+    let report = walked(
+        "import { address } from \"./config.ts\";\nimport type { Sample } from \"./metrics.ts\";\n",
+    );
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_bare_export_list_at_module_level_carries_no_code_and_is_not_refused() {
+    let source =
+        "function held(): number {\n  return 1;\n}\n\nexport { held };\nexport type { Shape };\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("held", returning(&mut table, number))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn an_overload_signature_carries_no_body_and_is_not_refused() {
+    let source = "function pick(at: number): number;\nfunction pick(at: number): number {\n  return at;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, number)),
+            ("at", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_function_beside_a_refused_module_variable_declaration_still_lowers() {
+    let source = "export const limit = 8;\n\nfunction twice(count: number): number {\n  return count * 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("twice", returning(&mut table, number)),
+            ("count", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.functions.len(), 1);
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
 }

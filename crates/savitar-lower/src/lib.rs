@@ -497,13 +497,18 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
     let mut diagnostics = Vec::new();
 
     for statement in &parsed.program.body {
-        let Some(declared) = declared_at_module_level(statement) else {
-            continue;
-        };
-        for outcome in lower_declared(file, provider, table, declared) {
-            match outcome {
-                Ok(function) => functions.push(function),
-                Err(problems) => diagnostics.extend(problems),
+        match at_module_level(statement) {
+            AtModuleLevel::Lowered(declared) => {
+                for outcome in lower_declared(file, provider, table, declared) {
+                    match outcome {
+                        Ok(function) => functions.push(function),
+                        Err(problems) => diagnostics.extend(problems),
+                    }
+                }
+            }
+            AtModuleLevel::CarriesNoCode => {}
+            AtModuleLevel::NotLowered(form) => {
+                diagnostics.push(refuse_at_module_level(statement_span(statement), form));
             }
         }
     }
@@ -521,25 +526,106 @@ enum Declared<'a> {
     Class(&'a Class<'a>),
 }
 
-fn declared_at_module_level<'a>(statement: &'a AstStatement<'a>) -> Option<Declared<'a>> {
+enum AtModuleLevel<'a> {
+    Lowered(Declared<'a>),
+    CarriesNoCode,
+    NotLowered(&'static str),
+}
+
+fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsupported-module-statement",
+        span_of(span),
+        format!("{form} at module level is not lowered yet"),
+    )
+    .with_help(
+        "Savitar lowers function bodies; module-level code needs a module initializer, \
+         which does not exist yet",
+    )
+}
+
+fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
     match statement {
-        AstStatement::FunctionDeclaration(declaration) => Some(Declared::Standalone(declaration)),
-        AstStatement::ClassDeclaration(class) => Some(Declared::Class(class)),
-        AstStatement::ExportDeclaration(export) => match &export.declaration {
-            Declaration::FunctionDeclaration(declaration) => {
-                Some(Declared::Standalone(declaration))
-            }
-            Declaration::ClassDeclaration(class) => Some(Declared::Class(class)),
-            _ => None,
-        },
+        AstStatement::FunctionDeclaration(declaration) => {
+            AtModuleLevel::Lowered(Declared::Standalone(declaration))
+        }
+        AstStatement::ClassDeclaration(class) => AtModuleLevel::Lowered(Declared::Class(class)),
+        AstStatement::ExportDeclaration(export) => declared_by_export(&export.declaration),
         AstStatement::ExportDefaultDeclaration(export) => match &export.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(declaration) => {
-                Some(Declared::Standalone(declaration))
+                AtModuleLevel::Lowered(Declared::Standalone(declaration))
             }
-            ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(Declared::Class(class)),
-            _ => None,
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => {
+                AtModuleLevel::Lowered(Declared::Class(class))
+            }
+            ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => AtModuleLevel::CarriesNoCode,
+            _ => AtModuleLevel::NotLowered("an `export default` of a value"),
         },
-        _ => None,
+        AstStatement::TSTypeAliasDeclaration(_) | AstStatement::TSInterfaceDeclaration(_) => {
+            AtModuleLevel::CarriesNoCode
+        }
+        AstStatement::ImportDeclaration(_)
+        | AstStatement::ExportNamedDeclaration(_)
+        | AstStatement::ExportAllDeclaration(_)
+        | AstStatement::EmptyStatement(_) => AtModuleLevel::CarriesNoCode,
+        other => AtModuleLevel::NotLowered(module_level_form(other)),
+    }
+}
+
+fn declared_by_export<'a>(declaration: &'a Declaration<'a>) -> AtModuleLevel<'a> {
+    match declaration {
+        Declaration::FunctionDeclaration(declaration) => {
+            AtModuleLevel::Lowered(Declared::Standalone(declaration))
+        }
+        Declaration::ClassDeclaration(class) => AtModuleLevel::Lowered(Declared::Class(class)),
+        Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
+            AtModuleLevel::CarriesNoCode
+        }
+        Declaration::VariableDeclaration(_) => AtModuleLevel::NotLowered("a variable declaration"),
+        Declaration::TSEnumDeclaration(_) => AtModuleLevel::NotLowered("an enum declaration"),
+        Declaration::TSExternalModuleDeclaration(_) => {
+            AtModuleLevel::NotLowered("a `declare module` declaration")
+        }
+        Declaration::TSNamespaceDeclaration(_) => {
+            AtModuleLevel::NotLowered("a namespace declaration")
+        }
+        Declaration::TSGlobalDeclaration(_) => {
+            AtModuleLevel::NotLowered("a `declare global` declaration")
+        }
+        Declaration::TSImportEqualsDeclaration(_) => {
+            AtModuleLevel::NotLowered("an `import =` declaration")
+        }
+    }
+}
+
+fn module_level_form(statement: &AstStatement<'_>) -> &'static str {
+    match statement {
+        AstStatement::VariableDeclaration(_) => "a variable declaration",
+        AstStatement::ExpressionStatement(_) => "an expression statement",
+        AstStatement::BlockStatement(_) => "a block",
+        AstStatement::IfStatement(_) => "an `if`",
+        AstStatement::ForStatement(_) => "a `for`",
+        AstStatement::ForInStatement(_) => "a `for in`",
+        AstStatement::ForOfStatement(_) => "a `for of`",
+        AstStatement::WhileStatement(_) => "a `while`",
+        AstStatement::DoWhileStatement(_) => "a `do while`",
+        AstStatement::SwitchStatement(_) => "a `switch`",
+        AstStatement::TryStatement(_) => "a `try`",
+        AstStatement::ThrowStatement(_) => "a `throw`",
+        AstStatement::LabeledStatement(_) => "a labelled statement",
+        AstStatement::WithStatement(_) => "a `with`",
+        AstStatement::DebuggerStatement(_) => "a `debugger`",
+        AstStatement::ReturnStatement(_) => "a `return`",
+        AstStatement::BreakStatement(_) => "a `break`",
+        AstStatement::ContinueStatement(_) => "a `continue`",
+        AstStatement::TSEnumDeclaration(_) => "an enum declaration",
+        AstStatement::TSExternalModuleDeclaration(_) => "a `declare module` declaration",
+        AstStatement::TSNamespaceDeclaration(_) => "a namespace declaration",
+        AstStatement::TSGlobalDeclaration(_) => "a `declare global` declaration",
+        AstStatement::TSImportEqualsDeclaration(_) => "an `import =` declaration",
+        AstStatement::TSExportAssignment(_) => "an `export =` assignment",
+        AstStatement::TSNamespaceExportDeclaration(_) => "a namespace export declaration",
+        _ => "this statement",
     }
 }
 
