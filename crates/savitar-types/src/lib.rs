@@ -1,9 +1,11 @@
 mod assign;
+mod divergence;
 mod generic;
 
 use std::collections::HashMap;
 
 pub use assign::assignable;
+pub use divergence::{Divergence, INTENTIONAL_DIVERGENCES, is_registered};
 pub use generic::{Bindings, infer, mentions_a_type_parameter, substitute};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

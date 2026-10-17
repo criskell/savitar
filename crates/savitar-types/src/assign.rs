@@ -147,7 +147,7 @@ fn object_fits(
                 if field.optional && !want.optional {
                     return false;
                 }
-                if !fits_in_slot(table, field.type_id, field.readonly, want, seen) {
+                if !fits_in_slot(table, field.type_id, takes_no_write(field), want, seen) {
                     return false;
                 }
             }
@@ -179,14 +179,18 @@ fn object_fits(
 fn fits_in_slot(
     table: &TypeTable,
     held: TypeId,
-    held_readonly: bool,
+    held_takes_no_write: bool,
     want: &Field,
     seen: &mut HashSet<(TypeId, TypeId)>,
 ) -> bool {
-    if want.readonly {
+    if takes_no_write(want) {
         return relate(table, held, want.type_id, seen);
     }
-    !held_readonly && alike(table, held, want.type_id, seen)
+    !held_takes_no_write && alike(table, held, want.type_id, seen)
+}
+
+fn takes_no_write(want: &Field) -> bool {
+    want.readonly || want.method
 }
 
 fn alike(

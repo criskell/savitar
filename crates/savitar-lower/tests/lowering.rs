@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+
 use std::collections::BTreeSet;
 
 use savitar_diagnostics::{SourceFile, Span};
@@ -12981,4 +12982,318 @@ fn an_interface_in_a_declaration_file_still_carries_no_code_and_is_not_refused()
 
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert!(report.initializer.is_none());
+}
+
+fn a_slot(name: &str, type_id: savitar_types::TypeId, readonly: bool) -> Field {
+    Field {
+        name: name.to_string(),
+        type_id,
+        optional: false,
+        method: false,
+        readonly,
+    }
+}
+
+fn a_method_slot(name: &str, type_id: savitar_types::TypeId) -> Field {
+    Field {
+        name: name.to_string(),
+        type_id,
+        optional: false,
+        method: true,
+        readonly: false,
+    }
+}
+
+fn taking_one(table: &mut TypeTable, parameter: savitar_types::TypeId) -> savitar_types::TypeId {
+    let void = table.intern(TypeKind::Void);
+    table.function(
+        vec![savitar_types::Parameter {
+            type_id: parameter,
+            rest: false,
+            optional: false,
+        }],
+        void,
+    )
+}
+
+#[test]
+fn a_derived_class_narrowing_a_mutable_field_is_refused_where_tsc_accepts_it() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let wide = table.object(vec![a_slot("value", either, false)]);
+    let narrow = table.object(vec![a_slot("value", number, false)]);
+    let base = constructing_shape(&mut table, Vec::new(), wide);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(narrow)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsound-inheritance");
+    assert!(
+        report.diagnostics[0].message.contains("`Base`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_derived_class_narrowing_a_readonly_field_is_accepted_because_nothing_writes_it() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let wide = table.object(vec![a_slot("value", either, true)]);
+    let narrow = table.object(vec![a_slot("value", number, true)]);
+    let base = constructing_shape(&mut table, Vec::new(), wide);
+    let gives_number = table.function(Vec::new(), number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(narrow)),
+            ("Base", Answer::Known(base)),
+            ("double", Answer::Known(gives_number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_derived_class_narrowing_a_method_parameter_is_refused_where_tsc_accepts_it() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let takes_either = taking_one(&mut table, either);
+    let takes_number = taking_one(&mut table, number);
+    let wide = table.object(vec![a_method_slot("set", takes_either)]);
+    let narrow = table.object(vec![a_method_slot("set", takes_number)]);
+    let base = constructing_shape(&mut table, Vec::new(), wide);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(narrow)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsound-inheritance");
+}
+
+#[test]
+fn a_derived_class_widening_a_method_parameter_is_accepted() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let takes_either = taking_one(&mut table, either);
+    let takes_number = taking_one(&mut table, number);
+    let narrow = table.object(vec![a_method_slot("set", takes_number)]);
+    let wide = table.object(vec![a_method_slot("set", takes_either)]);
+    let base = constructing_shape(&mut table, Vec::new(), narrow);
+    let gives_number = table.function(Vec::new(), number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(wide)),
+            ("Base", Answer::Known(base)),
+            ("double", Answer::Known(gives_number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_derived_class_that_only_adds_members_fits_its_base() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let base_shape = table.object(vec![a_slot("value", number, false)]);
+    let derived_shape = table.object(vec![
+        a_slot("value", number, false),
+        a_slot("extra", text, false),
+    ]);
+    let base = constructing_shape(&mut table, Vec::new(), base_shape);
+    let gives_number = table.function(Vec::new(), number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(derived_shape)),
+            ("Base", Answer::Known(base)),
+            ("double", Answer::Known(gives_number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_derived_class_dropping_a_member_of_its_base_is_refused() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let base_shape = table.object(vec![a_slot("value", number, false)]);
+    let derived_shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), base_shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(derived_shape)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsound-inheritance");
+}
+
+#[test]
+fn an_unsound_inheritance_is_refused_at_the_name_of_the_derived_class() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let wide = table.object(vec![a_slot("value", either, false)]);
+    let narrow = table.object(vec![a_slot("value", number, false)]);
+    let base = constructing_shape(&mut table, Vec::new(), wide);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(narrow)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (1, 7));
+}
+
+#[test]
+fn refusing_an_unsound_inheritance_names_the_divergence_it_is_registered_under() {
+    assert!(savitar_types::is_registered(
+        "inherited-member-must-fit-the-base"
+    ));
+}
+
+#[test]
+fn an_array_of_a_narrower_element_is_refused_as_an_argument_for_a_wider_array() {
+    let source = "function call(dogs: Dog[]): number {\n  return helper(dogs);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let dog = table.object(vec![
+        a_slot("name", text, false),
+        a_slot("bark", number, false),
+    ]);
+    let animal = table.object(vec![a_slot("name", text, false)]);
+    let dogs = table.intern(TypeKind::Array(dog));
+    let animals = table.intern(TypeKind::Array(animal));
+    let helper = one_parameter(&mut table, animals);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("dogs", Answer::Known(dogs)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
+}
+
+#[test]
+fn an_array_of_a_narrower_element_is_taken_as_an_argument_for_a_readonly_array() {
+    let source = "function call(dogs: Dog[]): number {\n  return helper(dogs);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let dog = table.object(vec![
+        a_slot("name", text, false),
+        a_slot("bark", number, false),
+    ]);
+    let animal = table.object(vec![a_slot("name", text, false)]);
+    let dogs = table.intern(TypeKind::Array(dog));
+    let animals = table.intern(TypeKind::ReadonlyArray(animal));
+    let helper = one_parameter(&mut table, animals);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("dogs", Answer::Known(dogs)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_generic_base_is_refused_rather_than_related_to_its_uninstantiated_shape() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let held = table.fresh_type_parameter();
+    let base_shape = table.object(vec![a_slot("value", held, false)]);
+    let derived_shape = table.object(vec![a_slot("value", held, false)]);
+    let base = constructing_shape(&mut table, Vec::new(), base_shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(derived_shape)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class");
+    assert!(
+        report.diagnostics[0].message.contains("generic base"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }

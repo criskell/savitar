@@ -862,6 +862,28 @@ pub fn constructible_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<T
     }
 }
 
+pub fn shapes_of_what_is_constructed(
+    table: &TypeTable,
+    forms: &[TypeId],
+) -> Result<Vec<TypeId>, String> {
+    let mut shapes: Vec<TypeId> = Vec::new();
+    for &form in forms {
+        let TypeKind::Function { returns, .. } = table.kind(form) else {
+            return Err("a construct signature the provider gives no parameters for".to_string());
+        };
+        if !is_shaped(table, *returns) {
+            return Err(
+                "a construct signature whose instance has no declared shape, so what a derived class inherits is unknown"
+                    .to_string(),
+            );
+        }
+        if !shapes.contains(returns) {
+            shapes.push(*returns);
+        }
+    }
+    Ok(shapes)
+}
+
 pub fn fields_of_what_is_constructed(
     table: &TypeTable,
     forms: &[TypeId],

@@ -69,6 +69,30 @@ export class RetryingTransport extends Transport {
   }
 }
 
+export abstract class Encoder {
+  readonly contentType: string;
+
+  constructor(contentType: string) {
+    this.contentType = contentType;
+  }
+
+  header(): string {
+    return `content-type: ${this.contentType}`;
+  }
+}
+
+export class JsonEncoder extends Encoder {
+  declare readonly contentType: "application/json";
+
+  constructor() {
+    super("application/json");
+  }
+
+  framed(body: string): string {
+    return `${this.header()}\n\n${body}`;
+  }
+}
+
 export class RouteTable {
   private readonly mount: string;
   private hits: number;
