@@ -381,6 +381,7 @@ enum Written<'target, 'source> {
     Value(&'target Expression<'source>),
     Combined(BinaryOp, &'target Expression<'source>),
     Stepped(BinaryOp),
+    Held(ValueId),
 }
 
 const THIS: &str = "this";
@@ -1588,10 +1589,20 @@ impl Context<'_> {
             AssignmentTarget::ObjectAssignmentTarget(object) => {
                 self.write_object_pattern(table, function, object, source)
             }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.lower_field_write(table, function, member, Written::Held(source), member.span)
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => self.lower_element_write(
+                table,
+                function,
+                member,
+                Written::Held(source),
+                member.span,
+            ),
             other => Err(vec![refuse(
                 "unsupported-pattern",
                 other.span(),
-                "a pattern that writes anywhere but to a name is not lowered yet",
+                "a pattern target that is neither a name, a field nor an element is not lowered yet",
             )]),
         }
     }
@@ -1743,6 +1754,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, Some(held.declared))?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let standing = held.value_or_refuse(id.name.as_str(), id.span)?;
                 let value = self.lower_expression(table, function, expression)?;
@@ -1828,6 +1840,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, agreed)?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let held = self.read_field(table, function, object, &name, member)?;
                 let value = self.lower_expression(table, function, expression)?;
@@ -1865,6 +1878,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, Some(slot))?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let held = self.read_element(table, function, array, index, member)?;
                 let value = self.lower_expression(table, function, expression)?;

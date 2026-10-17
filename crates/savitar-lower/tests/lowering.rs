@@ -6146,17 +6146,163 @@ fn an_array_pattern_with_a_hole_reads_nothing_at_that_position() {
 }
 
 #[test]
-fn an_assignment_to_a_pattern_that_writes_to_a_field_is_refused() {
-    let source = "function take(point: Point): void {\n  [point.x] = [1];\n}\n";
+fn an_assignment_to_a_pattern_whose_target_is_a_field_lowers_to_a_field_write() {
+    let source = "function take(point: Point, pair: [number]): void {\n  [point.x] = pair;\n}\n";
     let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
     let point = point_shape(&mut table);
-    let provider = ByName::new(source, vec![("point", Answer::Known(point))]);
+    let pair = table.tuple(vec![number], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("point", Answer::Known(point)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let written = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::WriteField {
+                object,
+                name,
+                value,
+                ..
+            } => Some((*object, name.clone(), *value)),
+            _ => None,
+        })
+        .expect("the field write should be lowered");
+    assert_eq!(written.0, function.parameters()[0]);
+    assert_eq!(written.1, "x");
+    assert_eq!(function.type_of(written.2), number);
+}
+
+#[test]
+fn an_assignment_to_a_pattern_whose_target_is_a_readonly_field_is_refused() {
+    let source = "function take(point: Point, pair: [number]): void {\n  [point.x] = pair;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let point = table.object(vec![Field {
+        name: "x".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly: true,
+    }]);
+    let pair = table.tuple(vec![number], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("point", Answer::Known(point)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
     let file = SourceFile::new("take.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0].message.contains("declared readonly"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_assignment_to_a_pattern_whose_target_is_an_element_lowers_to_an_element_write() {
+    let source =
+        "function take(slots: number[], pair: [number]): void {\n  [slots[0]] = pair;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let slots = table.intern(TypeKind::Array(number));
+    let pair = table.tuple(vec![number], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("slots", Answer::Known(slots)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let written = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::WriteElement { array, value, .. } => Some((*array, *value)),
+            _ => None,
+        })
+        .expect("the element write should be lowered");
+    assert_eq!(written.0, function.parameters()[0]);
+    assert_eq!(function.type_of(written.1), number);
+}
+
+#[test]
+fn an_assignment_to_an_object_pattern_whose_target_is_a_field_lowers_to_a_field_write() {
+    let source = "function take(point: Point, line: Line): void {\n  ({ x: point.x } = line);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let point = point_shape(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("point", Answer::Known(point)),
+            ("line", Answer::Known(point)),
+        ],
+    );
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let written = only_block(function)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::WriteField { name, value, .. } => Some((name.clone(), *value)),
+            _ => None,
+        })
+        .expect("the field write should be lowered");
+    assert_eq!(written.0, "x");
+    assert_eq!(function.type_of(written.1), number);
+}
+
+#[test]
+fn an_assignment_to_a_pattern_whose_target_is_a_field_that_does_not_fit_is_refused() {
+    let source = "function take(point: Point, pair: [string]): void {\n  [point.x] = pair;\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let point = point_shape(&mut table);
+    let pair = table.tuple(vec![text], false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("point", Answer::Known(point)),
+            ("pair", Answer::Known(pair)),
+        ],
+    );
+    let file = SourceFile::new("take.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-assignment");
 }
 
 fn route_shape(table: &mut TypeTable) -> savitar_types::TypeId {
