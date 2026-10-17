@@ -1,3 +1,4 @@
+mod entry;
 mod order;
 mod resolve;
 mod specifiers;
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::{Diagnostic, Span};
 
+pub use entry::{OnTheEntrySurface, WhyUncheckedCodeReachesTheExports};
 pub use order::Order;
 use resolve::SpecifierResolver;
 pub use resolve::{DeclaredBoundary, holds_declarations_only, tsconfig_beside};
@@ -61,6 +63,7 @@ pub struct ModuleGraph {
     by_path: BTreeMap<PathBuf, ModuleId>,
     findings: Vec<Finding>,
     unreadable: BTreeSet<ModuleId>,
+    entered_at: BTreeSet<ModuleId>,
 }
 
 impl ModuleGraph {
@@ -72,13 +75,15 @@ impl ModuleGraph {
             by_path: BTreeMap::new(),
             findings: Vec::new(),
             unreadable: BTreeSet::new(),
+            entered_at: BTreeSet::new(),
         };
         let mut queue: Vec<PathBuf> = Vec::new();
         let mut sorted: Vec<PathBuf> = entries.iter().map(|path| absolute(root, path)).collect();
         sorted.sort();
         sorted.dedup();
         for path in sorted {
-            if graph.reserve(&path).is_some() {
+            if let Some(entered) = graph.reserve(&path) {
+                graph.entered_at.insert(entered);
                 queue.push(path);
             }
         }
