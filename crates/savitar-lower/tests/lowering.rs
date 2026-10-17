@@ -4,7 +4,7 @@ use savitar_diagnostics::{SourceFile, Span};
 
 use savitar_ir::{BinaryOp, Constant, Rvalue, Statement, Terminator, verify};
 
-use savitar_lower::lower;
+use savitar_lower::{ModuleStanding, Ran, lower, lower_in_order};
 
 use savitar_typeinfo::{Answer, TypeProvider};
 
@@ -12030,5 +12030,214 @@ fn a_destructured_module_declaration_binds_every_name_it_names() {
     assert_eq!(
         module_bindings(initializer),
         vec!["host".to_string(), "port".to_string()]
+    );
+}
+
+#[test]
+fn an_initializer_reading_an_imported_name_is_refused_when_nothing_places_the_other_module() {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-import-unchecked");
+    assert!(report.initializer.is_none());
+    assert!(!report.publishes_its_names);
+}
+
+#[test]
+fn an_initializer_reading_an_imported_name_lowers_when_the_other_module_ran_and_published() {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+    let mut standing = ModuleStanding::alone();
+    standing.note("./settings.ts", Ran::BeforeAndPublished);
+
+    let report = lower_in_order(&file, &provider, &mut table, &standing);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert!(
+        reads_of(&initializer.function).iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./settings.ts" && name == "port"
+        )),
+        "{:?}",
+        reads_of(&initializer.function)
+    );
+    assert!(report.publishes_its_names);
+}
+
+#[test]
+fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_is_not_placed_before_it()
+ {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+    let mut standing = ModuleStanding::alone();
+    standing.note("./settings.ts", Ran::NotBefore);
+
+    let report = lower_in_order(&file, &provider, &mut table, &standing);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-import-order");
+    assert!(report.initializer.is_none());
+}
+
+#[test]
+fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_publishes_nothing() {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+    let mut standing = ModuleStanding::alone();
+    standing.note("./settings.ts", Ran::WithoutPublishing);
+
+    let report = lower_in_order(&file, &provider, &mut table, &standing);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-import-unpublished");
+    assert!(report.initializer.is_none());
+}
+
+#[test]
+fn the_refusal_of_an_unordered_imported_read_carries_the_span_of_the_name() {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (3, 22));
+}
+
+#[test]
+fn a_function_reading_an_imported_name_lowers_without_the_other_module_being_placed() {
+    let source =
+        "import { port } from \"./settings.ts\";\n\nfunction used(): number {\n  return port;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("used", returning(&mut table, number)),
+            ("port", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("server.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0]).iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./settings.ts" && name == "port"
+        )),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn a_module_whose_initializer_is_refused_publishes_no_names() {
+    let source =
+        "function readPort(): number {\n  return 8080;\n}\n\nexport const port = readPort();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("readPort", returning(&mut table, number))]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(!report.publishes_its_names);
+}
+
+#[test]
+fn a_module_whose_function_alone_is_refused_still_publishes_its_names() {
+    let source =
+        "export const port = 8080;\n\nfunction* counted(): Generator<number> {\n  yield 1;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-function");
+    assert!(report.publishes_its_names);
+}
+
+#[test]
+fn a_module_with_a_statement_it_cannot_lower_publishes_no_names() {
+    let source = "export const port = 8080;\n\nif (port > 0) {\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(!report.publishes_its_names);
+}
+
+#[test]
+fn a_closure_the_initializer_declares_reads_an_imported_name_at_the_call_and_not_at_the_declaration()
+ {
+    let source =
+        "import { port } from \"./settings.ts\";\n\nexport const later = (): number => port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("later", returning(&mut table, number)),
+            ("port", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("server.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert!(
+        !reads_of(&initializer.function)
+            .iter()
+            .any(|read| matches!(read, Rvalue::Imported { .. })),
+        "{:?}",
+        reads_of(&initializer.function)
+    );
+    let read_by_a_closure: Vec<Rvalue> = initializer.closures.iter().flat_map(reads_of).collect();
+    assert!(
+        read_by_a_closure.iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./settings.ts" && name == "port"
+        )),
+        "{read_by_a_closure:?}"
     );
 }

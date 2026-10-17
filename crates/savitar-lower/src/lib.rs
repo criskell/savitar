@@ -1,5 +1,6 @@
 mod assigned;
 mod names;
+mod standing;
 mod types;
 
 use std::collections::{BTreeSet, HashMap};
@@ -26,6 +27,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
 use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
+pub use standing::{ModuleStanding, Ran};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
 #[derive(Debug)]
@@ -33,6 +35,7 @@ pub struct LowerReport {
     pub functions: Vec<Function>,
     pub initializer: Option<ModuleInitializer>,
     pub diagnostics: Vec<Diagnostic>,
+    pub publishes_its_names: bool,
 }
 
 #[derive(Debug)]
@@ -470,6 +473,7 @@ struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
     module_names: &'a ModuleNames,
+    standing: &'a ModuleStanding,
     initialising_the_module: bool,
     returns: TypeId,
     scope: Scope,
@@ -493,8 +497,62 @@ fn refuse(rule: &'static str, span: oxc_span::Span, message: impl Into<String>) 
         .with_help("Savitar lowers only what it can type without guessing")
 }
 
+fn unordered_read(
+    standing: &ModuleStanding,
+    specifier: &str,
+    exported: &str,
+    span: oxc_span::Span,
+) -> Option<Diagnostic> {
+    let at = span_of(span);
+    match standing.of(specifier) {
+        Ran::BeforeAndPublished => None,
+        Ran::NotBefore => Some(
+            Diagnostic::unsupported(
+                "unsupported-import-order",
+                at,
+                format!(
+                    "`{exported}` comes from `{specifier}`, which the evaluation order does not place before this module"
+                ),
+            )
+            .with_help(
+                "the initializer of this module would read a name that nothing has bound yet",
+            ),
+        ),
+        Ran::WithoutPublishing => Some(
+            Diagnostic::unsupported(
+                "unsupported-import-unpublished",
+                at,
+                format!(
+                    "`{exported}` comes from `{specifier}`, whose module-level code Savitar refuses, so nothing binds the name"
+                ),
+            )
+            .with_help("the refusal in that module goes before this module can read what it exports"),
+        ),
+        Ran::Unchecked => Some(
+            Diagnostic::unsupported(
+                "unsupported-import-unchecked",
+                at,
+                format!(
+                    "`{exported}` comes from `{specifier}`, which this run does not lower, so nothing shows the name is bound when this initializer reads it"
+                ),
+            )
+            .with_help("pass that file to Savitar too, so the order it runs in is checked and not assumed"),
+        ),
+    }
+}
+
 #[must_use]
 pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTable) -> LowerReport {
+    lower_in_order(file, provider, table, &ModuleStanding::alone())
+}
+
+#[must_use]
+pub fn lower_in_order(
+    file: &SourceFile,
+    provider: &dyn TypeProvider,
+    table: &mut TypeTable,
+    standing: &ModuleStanding,
+) -> LowerReport {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(file.name()).unwrap_or_else(|_| SourceType::ts());
     let parsed = Parser::new(&allocator, file.text(), source_type).parse();
@@ -503,6 +561,7 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
             functions: Vec::new(),
             initializer: None,
             diagnostics: Vec::new(),
+            publishes_its_names: false,
         };
     }
 
@@ -513,8 +572,10 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
         file,
         provider,
         module_names: &module_names,
+        standing,
     };
     let mut initializes: Vec<&VariableDeclaration<'_>> = Vec::new();
+    let mut publishes_its_names = true;
 
     for statement in &parsed.program.body {
         match at_module_level(statement) {
@@ -529,6 +590,7 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
             AtModuleLevel::Initializes(declaration) => initializes.push(declaration),
             AtModuleLevel::CarriesNoCode => {}
             AtModuleLevel::NotLowered(form) => {
+                publishes_its_names = false;
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
             }
         }
@@ -539,6 +601,7 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
             None => None,
             Some(Ok(initializer)) => Some(initializer),
             Some(Err(problems)) => {
+                publishes_its_names = false;
                 diagnostics.extend(problems);
                 None
             }
@@ -549,6 +612,7 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
         functions,
         initializer,
         diagnostics,
+        publishes_its_names,
     }
 }
 
@@ -676,6 +740,7 @@ struct Surroundings<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
     module_names: &'a ModuleNames,
+    standing: &'a ModuleStanding,
 }
 
 fn lower_module_initializer(
@@ -709,6 +774,7 @@ fn build_module_initializer<'a>(
         file: surroundings.file,
         provider: surroundings.provider,
         module_names: surroundings.module_names,
+        standing: surroundings.standing,
         initialising_the_module: true,
         returns: void,
         scope: Scope::new(),
@@ -1144,6 +1210,7 @@ fn lower_function<'a>(
         file: surroundings.file,
         provider: surroundings.provider,
         module_names: surroundings.module_names,
+        standing: surroundings.standing,
         initialising_the_module: false,
         returns: table.intern(TypeKind::Unknown),
         scope: Scope::new(),
@@ -1573,6 +1640,7 @@ impl Context<'_> {
                 file: self.file,
                 provider: self.provider,
                 module_names: self.module_names,
+                standing: self.standing,
             },
             table,
             self.written_names,
@@ -4799,6 +4867,12 @@ impl Context<'_> {
                                     "`{exported}` comes from the package `{specifier}`, and nothing a package declares is checked by Savitar"
                                 ),
                             )]);
+                        }
+                        if self.initialising_the_module
+                            && let Some(problem) =
+                                unordered_read(self.standing, &specifier, &exported, id.span)
+                        {
+                            return Err(vec![problem]);
                         }
                         Rvalue::Imported {
                             specifier,
