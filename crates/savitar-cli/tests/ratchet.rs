@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use savitar_diagnostics::SourceFile;
 use savitar_ir::{Dominance, Function, Terminator};
 use savitar_lower::lower;
+use savitar_modules::{Carries, ModuleGraph, ModuleId, Target};
 use savitar_sound::{Coverage, check_types};
 use savitar_typeinfo_tsapi::TsApi;
 use savitar_types::TypeTable;
@@ -50,6 +51,17 @@ fn module_initializer_floor_path(corpus: &Path) -> PathBuf {
 
 fn dead_end_floor_path(corpus: &Path) -> PathBuf {
     corpus.join("unreachable-terminator-floor.txt")
+}
+
+fn module_order_floor_path(corpus: &Path) -> PathBuf {
+    corpus.join("module-order-floor.txt")
+}
+
+fn named(graph: &ModuleGraph, id: ModuleId) -> String {
+    graph.module(id).path.file_name().map_or_else(
+        || "an unnamed module".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 fn assert_ceiling(ceiling_file: &Path, counted: usize, listed: &[String]) {
@@ -307,6 +319,53 @@ fn the_number_of_module_initializers_lowered_never_falls() {
         measured.initializers,
         &measured.gaps,
     );
+}
+
+#[test]
+fn the_number_of_value_imports_the_evaluation_order_honours_never_changes() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let files = corpus_files(&corpus);
+    let graph = ModuleGraph::build(&corpus, &files);
+    let order = graph.evaluation_order();
+
+    let mut honoured: Vec<String> = Vec::new();
+    for (importer, module) in graph.modules() {
+        for import in &module.imports {
+            if import.carries != Carries::Values {
+                continue;
+            }
+            let Target::Module(imported) = import.target else {
+                continue;
+            };
+            let runs_at = order.position_of(importer).unwrap_or_else(|| {
+                panic!(
+                    "{} has no place in the evaluation order",
+                    named(&graph, importer)
+                )
+            });
+            let needed_at = order.position_of(imported).unwrap_or_else(|| {
+                panic!(
+                    "{} has no place in the evaluation order",
+                    named(&graph, imported)
+                )
+            });
+            assert!(
+                needed_at < runs_at,
+                "{} imports values from {}, and the evaluation order runs it first",
+                named(&graph, importer),
+                named(&graph, imported)
+            );
+            honoured.push(format!(
+                "{} runs after {}",
+                named(&graph, importer),
+                named(&graph, imported)
+            ));
+        }
+    }
+
+    honoured.sort();
+    assert_floor(&module_order_floor_path(&corpus), honoured.len(), &honoured);
 }
 
 #[test]
