@@ -3600,7 +3600,7 @@ fn a_case_with_no_statements_shares_the_body_of_the_next_one() {
 }
 
 #[test]
-fn a_case_that_runs_into_the_next_one_is_refused_rather_than_flattened() {
+fn a_case_that_runs_into_the_next_one_reaches_it_as_a_join() {
     let source = "function pick(kind: string, value: number): number {\n  switch (kind) {\n    case \"a\":\n      value = 1;\n    case \"b\":\n      return value;\n  }\n  return value;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -3608,6 +3608,7 @@ fn a_case_that_runs_into_the_next_one_is_refused_rather_than_flattened() {
     let provider = ByName::new(
         source,
         vec![
+            ("pick", returning(&mut table, number)),
             ("kind", Answer::Known(text)),
             ("value", Answer::Known(number)),
         ],
@@ -3616,14 +3617,89 @@ fn a_case_that_runs_into_the_next_one_is_refused_rather_than_flattened() {
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert_eq!(report.diagnostics[0].rule, "unsupported-statement");
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+
+    let carrying = parameterised(function);
+    assert_eq!(
+        carrying.len(),
+        1,
+        "only the case run into from the one before it carries a parameter"
+    );
+    let (second, parameters) = carrying[0];
+    assert_eq!(
+        parameters, 1,
+        "`value` arrives as a parameter, because the two paths into the case disagree on it"
+    );
     assert!(
-        report.diagnostics[0]
-            .message
-            .contains("runs into the next one"),
-        "{}",
-        report.diagnostics[0].message
+        matches!(
+            function.block(second).terminator,
+            Terminator::Return(Some(_))
+        ),
+        "the parameter lands on the body of the second case, which returns"
+    );
+    assert_eq!(
+        blocks_jumping_to(function, second),
+        vec![1, 1],
+        "the label of the second case and the fall through from the first both carry `value`"
+    );
+}
+
+#[test]
+fn a_default_run_into_from_the_case_before_it_narrows_nothing() {
+    let source = "function size(frame: Frame, fallback: number): number {\n  let chosen = fallback;\n  switch (frame.kind) {\n    case \"text\":\n      chosen = fallback + 1;\n    default:\n      return chosen;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("size", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("fallback", Answer::Known(number)),
+            ("kind", Answer::Known(shapes.tags)),
+        ],
+    );
+    let file = SourceFile::new("size.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert!(
+        !narrowed(function).contains(&shapes.binary),
+        "the default is reached by a path that matched `text` as well, so the negative sense of the labels decides nothing"
+    );
+}
+
+#[test]
+fn an_empty_case_that_runs_into_the_next_one_still_grows_no_parameter() {
+    let source = "function pick(kind: string, value: number): number {\n  switch (kind) {\n    case \"a\":\n    case \"b\":\n      return value;\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("pick", returning(&mut table, number)),
+            ("kind", Answer::Known(text)),
+            ("value", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("pick.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(
+        parameterised(function),
+        vec![],
+        "nothing ran in the empty case, so the one it runs into needs no parameter"
     );
 }
 

@@ -341,26 +341,22 @@ impl CaseEntry {
     }
 }
 
-fn case_entries(
-    statement: &oxc_ast::ast::SwitchStatement<'_>,
-    literals: &[Option<TypeKind>],
-) -> Vec<CaseEntry> {
-    let mut entries: Vec<CaseEntry> = Vec::with_capacity(literals.len());
-    for (position, case) in statement.cases.iter().enumerate() {
-        let reached = match (&case.test, &literals[position]) {
-            (None, _) => CaseEntry::Unmatched,
-            (Some(_), Some(literal)) => CaseEntry::Matched(vec![literal.clone()]),
-            (Some(_), None) => CaseEntry::Undecided,
-        };
-        let entry = match position.checked_sub(1) {
-            Some(earlier) if statement.cases[earlier].consequent.is_empty() => {
-                reached.fallen_into_from(&entries[earlier])
+fn retarget(function: &mut Function, from: BlockId, old: BlockId, new: BlockId) {
+    match &mut function.block_mut(from).terminator {
+        Terminator::Jump { target, .. } if *target == old => *target = new,
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
+            if *then_block == old {
+                *then_block = new;
+            } else if *else_block == old {
+                *else_block = new;
             }
-            _ => reached,
-        };
-        entries.push(entry);
+        }
+        _ => {}
     }
-    entries
 }
 
 enum Written<'target, 'source> {
@@ -2576,6 +2572,7 @@ impl Context<'_> {
 
         let mut label_types = Vec::with_capacity(statement.cases.len());
         let mut case_literals: Vec<Option<TypeKind>> = vec![None; statement.cases.len()];
+        let mut arrival: Vec<Option<BlockId>> = vec![None; statement.cases.len()];
         for (position, case) in statement.cases.iter().enumerate() {
             let Some(test) = &case.test else {
                 continue;
@@ -2592,6 +2589,7 @@ impl Context<'_> {
                 case.span,
             )?;
             let next = function.add_block(empty_block());
+            arrival[position] = Some(self.current);
             self.seal(
                 function,
                 Terminator::Branch {
@@ -2622,20 +2620,60 @@ impl Context<'_> {
             );
             if fallback.is_none() {
                 edges.push((unmatched, before.clone()));
+            } else if let Some(position) =
+                statement.cases.iter().position(|case| case.test.is_none())
+            {
+                arrival[position] = Some(unmatched);
             }
         }
 
         let subject = self.switch_subject(&statement.discriminant);
-        let entries = case_entries(statement, &case_literals);
         let decided: Vec<TypeKind> = case_literals.iter().flatten().cloned().collect();
 
         self.enclosing
             .push(Breakable::around(labels, Target::Switch(join)));
         let last = statement.cases.len().saturating_sub(1);
+        let mut entries: Vec<CaseEntry> = Vec::with_capacity(statement.cases.len());
+        let mut fell_through = false;
+        let mut carrying: Option<(BlockId, Scope)> = None;
         for (position, case) in statement.cases.iter().enumerate() {
+            let reached = match (&case.test, &case_literals[position]) {
+                (None, _) => CaseEntry::Unmatched,
+                (Some(_), Some(literal)) => CaseEntry::Matched(vec![literal.clone()]),
+                (Some(_), None) => CaseEntry::Undecided,
+            };
+            let fallen = std::mem::take(&mut fell_through);
+            let entry = match position.checked_sub(1) {
+                Some(earlier) if fallen => reached.fallen_into_from(&entries[earlier]),
+                _ => reached,
+            };
+            entries.push(entry);
+
+            self.scope = match carrying.take() {
+                Some(fell) => {
+                    let Some(tested) = arrival[position] else {
+                        return Err(vec![refuse(
+                            "malformed-ir",
+                            case.span,
+                            "a `case` run into from the one before it has no matching edge of its own",
+                        )]);
+                    };
+                    let stub = function.add_block(empty_block());
+                    retarget(function, tested, bodies[position], stub);
+                    let arriving = vec![(stub, before.clone()), fell];
+                    self.joined(
+                        table,
+                        function,
+                        bodies[position],
+                        &before,
+                        &arriving,
+                        case.span,
+                    )
+                }
+                None => before.clone(),
+            };
             self.current = bodies[position];
             self.statements.clear();
-            self.scope = before.clone();
             let standing = self.standing_declarations();
             self.narrow_in_case(
                 table,
@@ -2662,12 +2700,10 @@ impl Context<'_> {
                 edges.push((exit, std::mem::take(&mut self.scope)));
                 continue;
             }
+            let exit = self.current;
+            fell_through = true;
             if !case.consequent.is_empty() {
-                return Err(vec![refuse(
-                    "unsupported-statement",
-                    case.span,
-                    "a `case` that runs into the next one is not lowered yet; end it with `break` or `return`",
-                )]);
+                carrying = Some((exit, self.scope.clone()));
             }
             self.seal(
                 function,
