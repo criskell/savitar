@@ -4167,7 +4167,6 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::ConditionalExpression(_) => "a conditional expression",
         Expression::AwaitExpression(_) => "await",
         Expression::NewExpression(_) => "new",
-        Expression::ThisExpression(_) => "this",
         Expression::ArrowFunctionExpression(_) => "an arrow function",
         Expression::FunctionExpression(_) => "a function expression",
         Expression::AssignmentExpression(_) => "an assignment used as a value",
