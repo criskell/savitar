@@ -9753,3 +9753,33 @@ fn a_default_exported_arrow_function_stays_the_refusal_it_already_was() {
     assert!(report.functions.is_empty());
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 }
+
+#[test]
+fn a_rest_parameter_is_refused_rather_than_dropped() {
+    let source = "function many(...values: number[]): number {\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let numbers = table.intern(TypeKind::Array(number));
+    let rest = savitar_types::Parameter {
+        type_id: numbers,
+        rest: true,
+        optional: false,
+    };
+    let signature = Answer::Known(table.function(vec![rest], number));
+    let provider = ByName::new(
+        source,
+        vec![("many", signature), ("values", Answer::Known(numbers))],
+    );
+    let file = SourceFile::new("many.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("rest parameter"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}

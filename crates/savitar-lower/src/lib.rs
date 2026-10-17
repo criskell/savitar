@@ -650,6 +650,13 @@ fn lower_function(
             "a written `this` parameter is not lowered yet",
         )]);
     }
+    if let Some(rest) = declaration.params.rest.as_ref() {
+        return Err(vec![refuse(
+            "unsupported-pattern",
+            rest.span,
+            "a rest parameter is not lowered yet, and lowering the function without it would hide every argument it takes",
+        )]);
+    }
     if lowering.signature_at.is_none() && lowering.receiver.constructs().is_none() {
         return Err(vec![refuse(
             "unsupported-function",
