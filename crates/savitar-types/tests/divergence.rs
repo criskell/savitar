@@ -25,6 +25,7 @@ fn the_list_of_intentional_divergences_is_exactly_what_is_registered() {
             "unknown-where-tsc-answers-any",
             "readonly-counts-in-assignability",
             "mutable-position-is-invariant",
+            "inherited-member-must-fit-the-base",
         ],
         "a divergence from tsc that is not on this list is indistinguishable from a bug"
     );

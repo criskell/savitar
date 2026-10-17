@@ -25,6 +25,12 @@ pub const INTENTIONAL_DIVERGENCES: &[Divergence] = &[
         what_savitar_answers: "a mutable position is invariant, and only a `readonly` position is covariant",
         why_savitar_refuses_to_follow: "a covariant mutable position lets a write through the wider view store a value the narrower view promised could not be there",
     },
+    Divergence {
+        id: "inherited-member-must-fit-the-base",
+        what_tsc_answers: "a derived class may redeclare a member bivariantly, narrowing a field or a method parameter",
+        what_savitar_answers: "the instance shape of the derived class has to be assignable to the instance shape of its base",
+        why_savitar_refuses_to_follow: "a method of the base runs over an instance of the derived class, so a member the derived class narrowed is written through the wider shape the base declares",
+    },
 ];
 
 #[must_use]

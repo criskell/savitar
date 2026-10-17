@@ -1129,13 +1129,10 @@ fn lower_class(
             "a class with no name is not lowered yet, because its shape is asked for by name",
         )])];
     };
-    let base = match class.heritage.as_ref() {
+    let declared_base = match class.heritage.as_ref() {
         None => None,
         Some(heritage) => match &heritage.expression {
-            Expression::Identifier(named) => Some(BaseClass {
-                name: named.name.as_str(),
-                at: named.span,
-            }),
+            Expression::Identifier(named) => Some((named.name.as_str(), named.span)),
             other => {
                 return vec![Err(vec![refuse(
                     "unsupported-class",
@@ -1145,6 +1142,27 @@ fn lower_class(
             }
         },
     };
+    let constructible = match declared_base {
+        None => None,
+        Some((_, at)) => match base_construct_signatures(surroundings, table, at) {
+            Ok(forms) => Some(forms),
+            Err(refusals) => return vec![Err(refusals)],
+        },
+    };
+    let base = match (declared_base, constructible.as_ref()) {
+        (Some((name, at)), Some(forms)) => Some(BaseClass {
+            name,
+            at,
+            forms: forms.as_slice(),
+        }),
+        _ => None,
+    };
+    if let Some(declared) = base
+        && let Err(refusals) =
+            inherited_members_fit_the_base(surroundings, table, id.span, declared)
+    {
+        return vec![Err(refusals)];
+    }
     let mut outcomes = Vec::new();
     for element in &class.body.body {
         match element {
@@ -1245,6 +1263,77 @@ fn lower_method<'a>(
 struct BaseClass<'a> {
     name: &'a str,
     at: oxc_span::Span,
+    forms: &'a [TypeId],
+}
+
+fn base_construct_signatures(
+    surroundings: Surroundings<'_>,
+    table: &mut TypeTable,
+    at: oxc_span::Span,
+) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
+    let constructor = type_at_the_name(surroundings, table, at)?;
+    types::constructible_forms(table, constructor)
+        .map_err(|reason| vec![refuse("unsupported-class-member", at, reason)])
+}
+
+fn type_at_the_name(
+    surroundings: Surroundings<'_>,
+    table: &mut TypeTable,
+    span: oxc_span::Span,
+) -> Result<TypeId, Vec<Diagnostic>> {
+    let query = Span::new(span.end.saturating_sub(1), span.end);
+    match surroundings
+        .provider
+        .type_at(table, surroundings.file.name(), query)
+    {
+        Answer::Known(id) => Ok(id),
+        Answer::Unsupported(reason) => Err(vec![refuse("unsupported-type", span, reason)]),
+        Answer::OutOfScope => Err(vec![refuse(
+            "no-type-answer",
+            span,
+            "the provider has no type here",
+        )]),
+    }
+}
+
+fn inherited_members_fit_the_base(
+    surroundings: Surroundings<'_>,
+    table: &mut TypeTable,
+    class_at: oxc_span::Span,
+    base: BaseClass<'_>,
+) -> Result<(), Vec<Diagnostic>> {
+    let derived = type_at_the_name(surroundings, table, class_at)?;
+    if !types::is_shaped(table, derived) {
+        return Err(vec![refuse(
+            "unsupported-class",
+            class_at,
+            "the provider answers no shape at the name of this class, so what it inherits cannot be related to its base",
+        )]);
+    }
+    let inherited = types::shapes_of_what_is_constructed(table, base.forms)
+        .map_err(|reason| vec![refuse("unsupported-class-member", base.at, reason)])?;
+    for shape in inherited {
+        if !savitar_types::assignable(table, derived, shape) {
+            return Err(vec![refuse_unsound_inheritance(class_at, base.name)]);
+        }
+    }
+    Ok(())
+}
+
+fn refuse_unsound_inheritance(span: oxc_span::Span, base: &str) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsound-inheritance",
+        span_of(span),
+        format!(
+            "this class does not fit the shape of `{base}`, so a method of `{base}` running over \
+             an instance of this class could write a member this class declared narrower"
+        ),
+    )
+    .with_help(
+        "a mutable member a derived class redeclares has to be invariant, and a method it \
+         overrides has to take at least what the base takes; `savitar divergences` lists this as \
+         `inherited-member-must-fit-the-base`",
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1467,17 +1556,13 @@ fn lower_function<'a>(
             let mut inherited = Vec::new();
             let mut base = None;
             if let Some(declared_base) = lowering.receiver.base() {
-                let constructor = context.type_at(table, declared_base.at)?;
-                let forms = types::constructible_forms(table, constructor).map_err(|reason| {
-                    vec![refuse("unsupported-class-member", declared_base.at, reason)]
-                })?;
-                inherited =
-                    types::fields_of_what_is_constructed(table, &forms).map_err(|reason| {
+                inherited = types::fields_of_what_is_constructed(table, declared_base.forms)
+                    .map_err(|reason| {
                         vec![refuse("unsupported-class-member", declared_base.at, reason)]
                     })?;
                 base = Some(ConstructedBase {
                     name: declared_base.name.to_string(),
-                    forms,
+                    forms: declared_base.forms.to_vec(),
                     standing: false,
                 });
             }
