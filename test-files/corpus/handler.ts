@@ -30,6 +30,29 @@ export class Logger extends Middleware {
   }
 }
 
+export class RouteTable {
+  private readonly mount: string;
+  private hits: number;
+
+  constructor(mount: string) {
+    this.mount = mount;
+    this.hits = 0;
+  }
+
+  record(route: Route): string {
+    this.hits = this.hits + 1;
+    return `${this.mount}${route.path}`;
+  }
+
+  counted(): number {
+    return this.hits;
+  }
+
+  static rooted(): RouteTable {
+    return new RouteTable("/");
+  }
+}
+
 export function describe(outcome: Outcome): string {
   switch (outcome.kind) {
     case "ok":

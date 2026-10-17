@@ -410,6 +410,10 @@ pub fn is_union(table: &TypeTable, id: TypeId) -> bool {
     matches!(table.kind(id), TypeKind::Union(_))
 }
 
+pub fn is_shaped(table: &TypeTable, id: TypeId) -> bool {
+    matches!(table.kind(id), TypeKind::Object { .. })
+}
+
 pub fn field_result(table: &mut TypeTable, object: TypeId, name: &str) -> Result<TypeId, String> {
     if let TypeKind::Union(members) = table.kind(object).clone() {
         let mut held = Vec::with_capacity(members.len());
@@ -495,17 +499,26 @@ pub enum SlotRefusal {
     Declined(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writing {
+    Plainly,
+    WhileConstructing,
+}
+
 pub fn field_slots(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
+    writing: Writing,
 ) -> Result<Vec<TypeId>, SlotRefusal> {
     let TypeKind::Union(members) = table.kind(object).clone() else {
-        return field_slot(table, object, name).map(|slot| vec![slot]);
+        return field_slot(table, object, name, writing).map(|slot| vec![slot]);
     };
     let mut slots: Vec<TypeId> = Vec::with_capacity(members.len());
     for member in members {
-        for slot in field_slots(table, member, name).map_err(|refusal| in_a_member(&refusal))? {
+        for slot in
+            field_slots(table, member, name, writing).map_err(|refusal| in_a_member(&refusal))?
+        {
             if !slots.contains(&slot) {
                 slots.push(slot);
             }
@@ -529,6 +542,7 @@ pub fn field_slot(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
+    writing: Writing,
 ) -> Result<TypeId, SlotRefusal> {
     let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
         return Err(SlotRefusal::Shapeless(format!(
@@ -541,9 +555,9 @@ pub fn field_slot(
                 "`{name}` is a method, and writing over a method is not lowered yet"
             )));
         }
-        if field.readonly {
+        if field.readonly && writing == Writing::Plainly {
             return Err(SlotRefusal::Declined(format!(
-                "`{name}` is declared readonly and admits no write"
+                "`{name}` is declared readonly and admits no write outside the constructor of its class"
             )));
         }
         return Ok(field.type_id);

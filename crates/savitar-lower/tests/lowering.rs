@@ -9121,67 +9121,319 @@ fn a_for_with_no_test_still_runs_its_update_through_the_latch() {
     );
 }
 
+fn held_field(table: &mut TypeTable, readonly: bool) -> savitar_types::TypeId {
+    let number = table.intern(TypeKind::Number);
+    table.object(vec![Field {
+        name: "held".to_string(),
+        type_id: number,
+        optional: false,
+        method: false,
+        readonly,
+    }])
+}
+
 #[test]
-fn a_method_body_is_refused_with_its_position_rather_than_skipped() {
-    let source = "class Middleware {\n  describe(): string {\n    return \"here\";\n  }\n}\n";
+fn a_method_lowers_with_this_typed_by_the_shape_of_its_class() {
+    let source = "class Counter {\n  reading(): number {\n    return this.held;\n  }\n}\n";
     let mut table = TypeTable::new();
-    let provider = ByName::new(source, vec![]);
-    let file = SourceFile::new("middleware.ts", source);
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("reading", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    let function = &report.functions[0];
+    assert_eq!(function.name(), "Counter.reading");
+    assert_eq!(
+        function.parameters().len(),
+        1,
+        "the receiver is the only parameter"
+    );
+    assert_eq!(function.type_of(function.parameters()[0]), shape);
+    assert_eq!(verify(function), vec![]);
+    let entry = function.entry().expect("the method should have a block");
+    let Terminator::Return(Some(returned)) = function.block(entry).terminator else {
+        panic!("expected a return");
+    };
+    assert_eq!(table.kind(function.type_of(returned)), &TypeKind::Number);
+}
+
+#[test]
+fn a_constructor_lowers_and_writes_the_field_its_class_declares() {
+    let source =
+        "class Counter {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    let function = &report.functions[0];
+    assert_eq!(function.name(), "Counter.constructor");
+    assert_eq!(
+        function.parameters().len(),
+        2,
+        "the receiver comes before the written parameters"
+    );
+    assert_eq!(verify(function), vec![]);
+    let entry = function
+        .entry()
+        .expect("the constructor should have a block");
+    let written = function
+        .block(entry)
+        .statements
+        .iter()
+        .filter(
+            |statement| matches!(statement, Statement::WriteField { name, .. } if name == "held"),
+        )
+        .count();
+    assert_eq!(written, 1);
+    assert!(matches!(
+        function.block(entry).terminator,
+        Terminator::Return(None)
+    ));
+}
+
+#[test]
+fn writing_a_readonly_field_inside_the_constructor_of_its_class_is_allowed() {
+    let source =
+        "class Counter {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn writing_a_readonly_field_from_a_method_that_is_not_the_constructor_is_still_refused() {
+    let source =
+        "class Counter {\n  reset(start: number): void {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let nothing = table.intern(TypeKind::Void);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("reset", returning(&mut table, nothing)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics.len(), 1);
-    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
     assert!(
-        report.diagnostics[0]
-            .message
-            .contains("`Middleware.describe`"),
+        report.diagnostics[0].message.contains("readonly"),
         "{}",
         report.diagnostics[0].message
     );
-    let at = file.line_col(report.diagnostics[0].span.start);
-    assert_eq!((at.line, at.column), (2, 3));
 }
 
 #[test]
-fn a_constructor_body_is_refused_with_its_position_rather_than_skipped() {
-    let source =
-        "class Logger {\n  constructor(prefix: string) {\n    this.prefix = prefix;\n  }\n}\n";
+fn a_method_reached_through_this_is_called_because_the_shape_declares_it() {
+    let source = "class Middleware {\n  describe(): string {\n    return this.named();\n  }\n}\n";
     let mut table = TypeTable::new();
-    let provider = ByName::new(source, vec![]);
+    let text = table.intern(TypeKind::String);
+    let naming = table.function(Vec::new(), text);
+    let shape = table.object(vec![Field {
+        name: "named".to_string(),
+        type_id: naming,
+        optional: false,
+        method: true,
+        readonly: false,
+    }]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Middleware", Answer::Known(shape)),
+            ("describe", returning(&mut table, text)),
+        ],
+    );
+    let file = SourceFile::new("middleware.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(function.name(), "Middleware.describe");
+    let entry = function.entry().expect("the method should have a block");
+    assert!(
+        function
+            .block(entry)
+            .statements
+            .iter()
+            .any(|statement| matches!(
+                statement,
+                Statement::Assign {
+                    value: Rvalue::Call { .. },
+                    ..
+                }
+            )),
+        "the method call through `this` should lower to a call"
+    );
+}
+
+#[test]
+fn this_in_a_static_method_is_refused_because_nothing_binds_it() {
+    let source = "class Counter {\n  static reset(): number {\n    return this.held;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("reset", returning(&mut table, number))]);
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("`this` is not bound"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn super_in_a_constructor_is_refused_by_name_rather_than_guessed() {
+    let source = "class Logger extends Middleware {\n  constructor() {\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let provider = ByName::new(source, vec![("Logger", Answer::Known(shape))]);
     let file = SourceFile::new("logger.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics.len(), 1);
-    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
     assert!(
-        report.diagnostics[0]
-            .message
-            .contains("`Logger.constructor`"),
+        report.diagnostics[0].message.contains("`super`"),
         "{}",
         report.diagnostics[0].message
     );
     let at = file.line_col(report.diagnostics[0].span.start);
-    assert_eq!((at.line, at.column), (2, 3));
+    assert_eq!((at.line, at.column), (3, 5));
 }
 
 #[test]
-fn an_exported_class_is_reached_through_its_export() {
-    let source = "export class Counter {\n  increment(): number {\n    return 1;\n  }\n}\n";
+fn a_parameter_property_is_refused_because_it_declares_a_field_as_well() {
+    let source = "class Counter {\n  constructor(private readonly held: number) {}\n}\n";
     let mut table = TypeTable::new();
-    let provider = ByName::new(source, vec![]);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(source, vec![("Counter", Answer::Known(shape))]);
     let file = SourceFile::new("counter.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
+    assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
+    assert!(
+        report.diagnostics[0].message.contains("parameter property"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_destructuring_parameter_of_a_constructor_is_refused_because_no_position_answers_it() {
+    let source =
+        "class Counter {\n  constructor({ start }: Spot) {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = held_field(&mut table, false);
+    let provider = ByName::new(source, vec![("Counter", Answer::Known(shape))]);
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-pattern");
     assert!(
         report.diagnostics[0]
             .message
-            .contains("`Counter.increment`"),
+            .contains("construct signature"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_written_this_parameter_is_refused_rather_than_ignored() {
+    let source = "function run(this: Counter, by: number): number {\n  return by;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("run.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-function");
+    assert!(
+        report.diagnostics[0].message.contains("`this` parameter"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_class_whose_name_answers_no_shape_refuses_its_methods_instead_of_guessing() {
+    let source = "class Counter {\n  reading(): number {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(number)),
+            ("reading", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("no shape"),
         "{}",
         report.diagnostics[0].message
     );
@@ -9202,16 +9454,29 @@ fn an_abstract_method_signature_is_no_body_to_lower() {
 
 #[test]
 fn an_overload_signature_in_a_class_is_no_body_to_lower() {
-    let source = "class Reader {\n  read(at: number): string;\n  read(at: string): string;\n  read(at: unknown): string {\n    return \"x\";\n  }\n}\n";
+    let source = "class Reader {\n  read(at: string): string;\n  read(at: string): string;\n  read(at: string): string {\n    return at;\n  }\n}\n";
     let mut table = TypeTable::new();
-    let provider = ByName::new(source, vec![]);
+    let text = table.intern(TypeKind::String);
+    let shape = table.object(Vec::new());
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Reader", Answer::Known(shape)),
+            ("read", returning(&mut table, text)),
+            ("at", Answer::Known(text)),
+        ],
+    );
     let file = SourceFile::new("reader.ts", source);
 
     let report = lower(&file, &provider, &mut table);
 
-    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
-    let at = file.line_col(report.diagnostics[0].span.start);
-    assert_eq!((at.line, at.column), (4, 3));
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(
+        report.functions.len(),
+        1,
+        "only the member that carries a body is lowered"
+    );
+    assert_eq!(report.functions[0].name(), "Reader.read");
 }
 
 #[test]

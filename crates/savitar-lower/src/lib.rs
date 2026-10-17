@@ -366,6 +366,8 @@ enum Written<'target, 'source> {
     Stepped(BinaryOp),
 }
 
+const THIS: &str = "this";
+
 struct Context<'a> {
     file: &'a SourceFile,
     provider: &'a dyn TypeProvider,
@@ -375,6 +377,7 @@ struct Context<'a> {
     current: BlockId,
     enclosing: Vec<Breakable>,
     shadowed: Vec<Key>,
+    constructing: Option<ValueId>,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -458,20 +461,25 @@ fn lower_declared(
                 .id
                 .as_ref()
                 .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
-            vec![lower_function(
-                file,
-                provider,
-                table,
-                &name,
+            let lowering = Lowering {
+                name,
+                signature_at: declaration.id.as_ref().map(|id| id.span),
+                receiver: Receiver::Detached,
                 declaration,
                 body,
-            )]
+            };
+            vec![lower_function(file, provider, table, &lowering)]
         }
-        Declared::Class(class) => lower_class(class),
+        Declared::Class(class) => lower_class(file, provider, table, class),
     }
 }
 
-fn lower_class(class: &Class<'_>) -> Vec<Outcome> {
+fn lower_class(
+    file: &SourceFile,
+    provider: &dyn TypeProvider,
+    table: &mut TypeTable,
+    class: &Class<'_>,
+) -> Vec<Outcome> {
     let Some(id) = class.id.as_ref() else {
         return vec![Err(vec![refuse(
             "unsupported-class",
@@ -483,7 +491,9 @@ fn lower_class(class: &Class<'_>) -> Vec<Outcome> {
     for element in &class.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
-                if let Some(outcome) = lower_method(id.name.as_str(), method) {
+                if let Some(outcome) =
+                    lower_method(file, provider, table, id.name.as_str(), id.span, method)
+                {
                     outcomes.push(outcome);
                 }
             }
@@ -512,10 +522,17 @@ fn lower_class(class: &Class<'_>) -> Vec<Outcome> {
     outcomes
 }
 
-fn lower_method(class: &str, method: &MethodDefinition<'_>) -> Option<Outcome> {
-    method.value.body.as_ref()?;
+fn lower_method(
+    file: &SourceFile,
+    provider: &dyn TypeProvider,
+    table: &mut TypeTable,
+    class: &str,
+    class_at: oxc_span::Span,
+    method: &MethodDefinition<'_>,
+) -> Option<Outcome> {
+    let body = method.value.body.as_ref()?;
     let member = match &method.key {
-        PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+        PropertyKey::StaticIdentifier(id) => id,
         _ => {
             return Some(Err(vec![refuse(
                 "unsupported-class-member",
@@ -524,16 +541,58 @@ fn lower_method(class: &str, method: &MethodDefinition<'_>) -> Option<Outcome> {
             )]));
         }
     };
-    let what = match method.kind {
-        MethodDefinitionKind::Constructor => "a constructor body",
-        MethodDefinitionKind::Method => "a method body",
-        MethodDefinitionKind::Get | MethodDefinitionKind::Set => "an accessor body",
+    if matches!(
+        method.kind,
+        MethodDefinitionKind::Get | MethodDefinitionKind::Set
+    ) {
+        return Some(Err(vec![refuse(
+            "unsupported-class-member",
+            method.span,
+            "an accessor body is not lowered yet",
+        )]));
+    }
+    let name = format!("{class}.{}", member.name);
+    let constructing = method.kind == MethodDefinitionKind::Constructor;
+    let lowering = Lowering {
+        name,
+        signature_at: (!constructing).then_some(member.span),
+        receiver: match (constructing, method.r#static) {
+            (true, _) => Receiver::UnderConstruction(class_at),
+            (false, true) => Receiver::Detached,
+            (false, false) => Receiver::Instance(class_at),
+        },
+        declaration: &method.value,
+        body,
     };
-    Some(Err(vec![refuse(
-        "unsupported-class-member",
-        method.span,
-        format!("{what} is not lowered yet: `{class}.{member}`"),
-    )]))
+    Some(lower_function(file, provider, table, &lowering))
+}
+
+#[derive(Clone, Copy)]
+enum Receiver {
+    Detached,
+    Instance(oxc_span::Span),
+    UnderConstruction(oxc_span::Span),
+}
+
+impl Receiver {
+    const fn shape_at(self) -> Option<oxc_span::Span> {
+        match self {
+            Self::Detached => None,
+            Self::Instance(at) | Self::UnderConstruction(at) => Some(at),
+        }
+    }
+
+    const fn constructs(self) -> bool {
+        matches!(self, Self::UnderConstruction(_))
+    }
+}
+
+struct Lowering<'a> {
+    name: String,
+    signature_at: Option<oxc_span::Span>,
+    receiver: Receiver,
+    declaration: &'a oxc_ast::ast::Function<'a>,
+    body: &'a FunctionBody<'a>,
 }
 
 fn empty_block() -> Block {
@@ -548,10 +607,10 @@ fn lower_function(
     file: &SourceFile,
     provider: &dyn TypeProvider,
     table: &mut TypeTable,
-    name: &str,
-    declaration: &oxc_ast::ast::Function<'_>,
-    body: &FunctionBody<'_>,
+    lowering: &Lowering<'_>,
 ) -> Result<Function, Vec<Diagnostic>> {
+    let declaration = lowering.declaration;
+    let body = lowering.body;
     if declaration.generator {
         return Err(vec![refuse(
             "unsupported-function",
@@ -559,15 +618,22 @@ fn lower_function(
             "a generator function is not lowered yet",
         )]);
     }
-    let Some(id) = declaration.id.as_ref() else {
+    if declaration.this_param.is_some() {
+        return Err(vec![refuse(
+            "unsupported-function",
+            declaration.span,
+            "a written `this` parameter is not lowered yet",
+        )]);
+    }
+    if lowering.signature_at.is_none() && !lowering.receiver.constructs() {
         return Err(vec![refuse(
             "unsupported-function",
             declaration.span,
             "a function with no name is not lowered yet, because its signature is asked for by name",
         )]);
-    };
+    }
 
-    let mut function = Function::new(name);
+    let mut function = Function::new(&lowering.name);
     let entry = function.add_block(empty_block());
     let mut context = Context {
         file,
@@ -578,11 +644,34 @@ fn lower_function(
         current: entry,
         enclosing: Vec::new(),
         shadowed: Vec::new(),
+        constructing: None,
     };
 
-    let signature = context.type_at(table, id.span)?;
-    let declared = types::declared_return(table, signature)
-        .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?;
+    if let Some(class_at) = lowering.receiver.shape_at() {
+        let shape = context.type_at(table, class_at)?;
+        if !types::is_shaped(table, shape) {
+            return Err(vec![refuse(
+                "unsupported-class-member",
+                declaration.span,
+                "the provider answers no shape at the name of this class, so `this` has no type",
+            )]);
+        }
+        let held = function.declare_parameter(shape);
+        context.declare(THIS, Binding::written(held, shape));
+        if lowering.receiver.constructs() {
+            context.constructing = Some(held);
+        }
+    }
+
+    let signature = match lowering.signature_at {
+        Some(at) => Some(context.type_at(table, at)?),
+        None => None,
+    };
+    let declared = match signature {
+        Some(signature) => types::declared_return(table, signature)
+            .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?,
+        None => table.intern(TypeKind::Void),
+    };
     context.returns = if declaration.r#async {
         types::awaited(table, declared)
             .map_err(|reason| vec![refuse("unsupported-function", declaration.span, reason)])?
@@ -592,11 +681,27 @@ fn lower_function(
 
     let mut entering = Vec::new();
     for (position, parameter) in declaration.params.items.iter().enumerate() {
+        if parameter.accessibility.is_some() || parameter.readonly || parameter.r#override {
+            return Err(vec![refuse(
+                "unsupported-pattern",
+                parameter.span,
+                "a parameter property declares a field as well, and that is not lowered yet",
+            )]);
+        }
         let default = parameter.initializer.as_deref();
         let declared = match &parameter.pattern {
             BindingPattern::BindingIdentifier(id) => context.type_at(table, id.span)?,
-            _ => types::declared_parameter(table, signature, position, default.is_some())
-                .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?,
+            _ => {
+                let Some(signature) = signature else {
+                    return Err(vec![refuse(
+                        "unsupported-pattern",
+                        parameter.span,
+                        "a destructuring parameter of a constructor is not lowered yet, because no position answers the construct signature",
+                    )]);
+                };
+                types::declared_parameter(table, signature, position, default.is_some())
+                    .map_err(|reason| vec![refuse("unsupported-pattern", parameter.span, reason)])?
+            }
         };
         let Some(fallback) = default else {
             let value = function.declare_parameter(declared);
@@ -1146,7 +1251,12 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let object = self.lower_expression(table, function, &member.object)?;
         let name = member.property.name.to_string();
-        let slots = self.field_slots(table, function.type_of(object), &name, member)?;
+        let writing = if self.constructing == Some(object) {
+            types::Writing::WhileConstructing
+        } else {
+            types::Writing::Plainly
+        };
+        let slots = self.field_slots(table, function.type_of(object), &name, member, writing)?;
         let agreed = match slots.as_slice() {
             [slot] => Some(*slot),
             _ => None,
@@ -1219,8 +1329,9 @@ impl Context<'_> {
         object: TypeId,
         name: &str,
         member: &oxc_ast::ast::StaticMemberExpression<'_>,
+        writing: types::Writing,
     ) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
-        let shapeless = match types::field_slots(table, object, name) {
+        let shapeless = match types::field_slots(table, object, name, writing) {
             Ok(slots) => return Ok(slots),
             Err(types::SlotRefusal::Declined(reason)) => {
                 return Err(vec![refuse("unsupported-write", member.span, reason)]);
@@ -3712,6 +3823,16 @@ impl Context<'_> {
                 }
                 let ty = self.type_at(table, id.span)?;
                 Ok(self.assign(function, ty, Rvalue::Global(id.name.to_string()), id.span))
+            }
+            Expression::ThisExpression(this) => {
+                let Some(held) = self.scope.get(THIS) else {
+                    return Err(vec![refuse(
+                        "unsupported-expression",
+                        this.span,
+                        "`this` is not bound here, because the shape it would take is not known",
+                    )]);
+                };
+                held.value_or_refuse(THIS, this.span)
             }
             Expression::ParenthesizedExpression(inner) => {
                 self.lower_expression_expecting(table, function, &inner.expression, expected)
