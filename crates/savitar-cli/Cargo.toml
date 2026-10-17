@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 savitar-diagnostics.workspace = true
+savitar-ir.workspace = true
 savitar-lower.workspace = true
 savitar-sound.workspace = true
 savitar-typeinfo.workspace = true

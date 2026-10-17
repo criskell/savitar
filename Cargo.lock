@@ -806,6 +806,7 @@ name = "savitar-cli"
 version = "0.0.1"
 dependencies = [
  "savitar-diagnostics",
+ "savitar-ir",
  "savitar-lower",
  "savitar-sound",
  "savitar-typeinfo",

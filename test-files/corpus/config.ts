@@ -12,6 +12,10 @@ export function withDefaults(host: string, port: number): ServerConfig {
   return { host, port, tls: false };
 }
 
+export function defaults(): ServerConfig {
+  return withDefaults(defaultHost, defaultPort);
+}
+
 export function address(config: ServerConfig): string {
   const scheme = config.tls ? "https" : "http";
   return `${scheme}://${config.host}:${config.port}`;
