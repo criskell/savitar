@@ -39,6 +39,31 @@ fn lowering_floor_path(corpus: &Path) -> PathBuf {
     corpus.join("lowering-floor.txt")
 }
 
+fn lowering_gap_ceiling_path(corpus: &Path) -> PathBuf {
+    corpus.join("lowering-gap-ceiling.txt")
+}
+
+fn assert_ceiling(ceiling_file: &Path, measured: &Measured, counted: usize) {
+    let ceiling: usize = std::fs::read_to_string(ceiling_file)
+        .expect("the ceiling should be recorded")
+        .trim()
+        .parse()
+        .expect("the ceiling should be a whole number");
+
+    assert!(
+        counted <= ceiling,
+        "the gaps rose from {ceiling} to {counted}; they are:\n{}",
+        measured.gaps.join("\n")
+    );
+
+    if counted < ceiling {
+        panic!(
+            "the gaps fell from {ceiling} to {counted}.\nLower it: echo {counted} > {}",
+            ceiling_file.display()
+        );
+    }
+}
+
 struct Measured {
     coverage: Coverage,
     gaps: Vec<String>,
@@ -174,6 +199,11 @@ fn the_number_of_functions_lowered_never_falls() {
         &lowering_floor_path(&corpus),
         &measured,
         measured.coverage.known,
+    );
+    assert_ceiling(
+        &lowering_gap_ceiling_path(&corpus),
+        &measured,
+        measured.gaps.len(),
     );
 }
 
