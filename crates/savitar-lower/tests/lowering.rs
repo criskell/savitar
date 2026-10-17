@@ -1037,7 +1037,7 @@ fn a_new_expression_takes_the_form_that_fits_and_the_type_it_builds() {
         }],
         counter,
     );
-    let constructor = table.constructor(vec![form]);
+    let constructor = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(
         source,
         vec![
@@ -1110,7 +1110,7 @@ fn a_written_type_argument_stands_for_the_type_parameter_the_form_declares() {
         readonly: false,
     }]);
     let form = table.generic_function(vec![held], Vec::new(), boxed_held);
-    let constructor = table.constructor(vec![form]);
+    let constructor = constructor_with_no_statics(&mut table, vec![form]);
     let boxed_number = table.object(vec![Field {
         name: "held".to_string(),
         type_id: number,
@@ -11405,6 +11405,14 @@ fn passing_undefined_where_the_parameter_is_required_is_still_refused() {
     assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
 }
 
+fn constructor_with_no_statics(
+    table: &mut TypeTable,
+    forms: Vec<savitar_types::TypeId>,
+) -> savitar_types::TypeId {
+    let statics = savitar_types::StaticSide::Shaped(table.object(Vec::new()));
+    table.constructor(forms, statics)
+}
+
 fn constructing_shape(
     table: &mut TypeTable,
     parameters: Vec<savitar_types::TypeId>,
@@ -11419,7 +11427,7 @@ fn constructing_shape(
         })
         .collect();
     let form = table.function(taken, instance);
-    table.constructor(vec![form])
+    constructor_with_no_statics(table, vec![form])
 }
 
 #[test]
@@ -12756,7 +12764,7 @@ fn the_initializer_reading_a_class_declared_before_it_lowers() {
         indexes: Vec::new(),
     });
     let form = table.function(Vec::new(), empty);
-    let constructs = table.constructor(vec![form]);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(source, vec![("Window", Answer::Known(constructs))]);
     let file = SourceFile::new("module.ts", source);
 
@@ -12784,7 +12792,7 @@ fn a_function_body_reads_a_class_the_module_declares_after_it() {
         indexes: Vec::new(),
     });
     let form = table.function(Vec::new(), empty);
-    let constructs = table.constructor(vec![form]);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(
         source,
         vec![

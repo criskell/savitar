@@ -75,7 +75,7 @@ pub fn may_be_undefined(table: &TypeTable, id: TypeId) -> bool {
         | TypeKind::Object { .. }
         | TypeKind::Function { .. }
         | TypeKind::Overloaded(_)
-        | TypeKind::Constructor(_) => false,
+        | TypeKind::Constructor { .. } => false,
         TypeKind::Union(members) => members
             .iter()
             .any(|&member| may_be_undefined(table, member)),
@@ -284,7 +284,7 @@ fn typeof_word(table: &TypeTable, id: TypeId) -> Option<&'static str> {
         | TypeKind::Promise(_)
         | TypeKind::Tuple { .. }
         | TypeKind::Object { .. } => Some("object"),
-        TypeKind::Function { .. } | TypeKind::Overloaded(_) | TypeKind::Constructor(_) => {
+        TypeKind::Function { .. } | TypeKind::Overloaded(_) | TypeKind::Constructor { .. } => {
             Some("function")
         }
         _ => None,
@@ -375,7 +375,7 @@ fn holds_fields(table: &TypeTable, id: TypeId) -> bool {
         | TypeKind::Promise(_)
         | TypeKind::Function { .. }
         | TypeKind::Overloaded(_)
-        | TypeKind::Constructor(_) => true,
+        | TypeKind::Constructor { .. } => true,
         TypeKind::Union(members) => members.iter().all(|&member| holds_fields(table, member)),
         _ => false,
     }
@@ -857,7 +857,7 @@ fn alike(table: &TypeTable, left: TypeId, right: TypeId) -> bool {
 
 pub fn constructible_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<TypeId>, String> {
     match table.kind(signature) {
-        TypeKind::Constructor(forms) => Ok(forms.clone()),
+        TypeKind::Constructor { forms, .. } => Ok(forms.clone()),
         _ => Err("this value declares no way to construct it".to_string()),
     }
 }

@@ -42,6 +42,30 @@ pub struct IndexSignature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum StaticSide {
+    Shaped(TypeId),
+    NotModelled(String),
+}
+
+impl StaticSide {
+    #[must_use]
+    pub const fn shaped(&self) -> Option<TypeId> {
+        match self {
+            Self::Shaped(id) => Some(*id),
+            Self::NotModelled(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn why_it_is_not_modelled(&self) -> Option<&str> {
+        match self {
+            Self::Shaped(_) => None,
+            Self::NotModelled(reason) => Some(reason),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeKind {
     Never,
     Null,
@@ -74,7 +98,10 @@ pub enum TypeKind {
         returns: TypeId,
     },
     Overloaded(Vec<TypeId>),
-    Constructor(Vec<TypeId>),
+    Constructor {
+        forms: Vec<TypeId>,
+        statics: StaticSide,
+    },
     Union(Vec<TypeId>),
     Nominal(NominalId),
     TypeParameter(u32),
@@ -254,8 +281,19 @@ impl TypeTable {
         self.intern(TypeKind::Overloaded(forms))
     }
 
-    pub fn constructor(&mut self, forms: Vec<TypeId>) -> TypeId {
-        self.intern(TypeKind::Constructor(without_repeats(forms)))
+    pub fn constructor(&mut self, forms: Vec<TypeId>, statics: StaticSide) -> TypeId {
+        self.intern(TypeKind::Constructor {
+            forms: without_repeats(forms),
+            statics,
+        })
+    }
+
+    #[must_use]
+    pub fn static_side_of(&self, id: TypeId) -> Option<&StaticSide> {
+        match self.kind(id) {
+            TypeKind::Constructor { statics, .. } => Some(statics),
+            _ => None,
+        }
     }
 
     pub fn fresh_type_parameter(&mut self) -> TypeId {
@@ -1004,5 +1042,66 @@ mod tests {
 
         assert!(assignable(&table, wide, narrow));
         assert!(!assignable(&table, narrow, wide));
+    }
+
+    #[test]
+    fn a_constructible_shape_carries_the_static_members_beside_the_construct_signatures() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        let instance = table.object(Vec::new());
+        let form = table.function(Vec::new(), instance);
+        let tally = table.object(vec![Field {
+            name: "tally".to_string(),
+            type_id: number,
+            optional: false,
+            method: false,
+            readonly: false,
+        }]);
+        let constructible = table.constructor(vec![form], StaticSide::Shaped(tally));
+
+        assert_eq!(
+            table.static_side_of(constructible),
+            Some(&StaticSide::Shaped(tally))
+        );
+        let TypeKind::Constructor { forms, .. } = table.kind(constructible) else {
+            panic!("expected a constructible shape");
+        };
+        assert_eq!(forms, &vec![form]);
+    }
+
+    #[test]
+    fn a_constructible_shape_whose_static_member_is_not_modelled_still_says_what_it_constructs() {
+        let mut table = TypeTable::new();
+        let instance = table.object(Vec::new());
+        let form = table.function(Vec::new(), instance);
+        let constructible = table.constructor(
+            vec![form],
+            StaticSide::NotModelled("`held` is an enum".to_string()),
+        );
+
+        assert_eq!(
+            table
+                .static_side_of(constructible)
+                .and_then(StaticSide::why_it_is_not_modelled),
+            Some("`held` is an enum")
+        );
+        assert_eq!(
+            table
+                .static_side_of(constructible)
+                .and_then(StaticSide::shaped),
+            None
+        );
+        let TypeKind::Constructor { forms, .. } = table.kind(constructible) else {
+            panic!("expected a constructible shape");
+        };
+        assert_eq!(forms, &vec![form]);
+    }
+
+    #[test]
+    fn a_static_side_is_asked_for_only_of_a_constructible_shape() {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+
+        assert_eq!(table.static_side_of(number), None);
     }
 }
