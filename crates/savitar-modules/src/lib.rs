@@ -1,3 +1,4 @@
+mod declared;
 mod entry;
 mod order;
 mod resolve;
@@ -8,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::{Diagnostic, Span};
 
+pub use declared::{
+    TypesDeclaredBehindNoEdge, refusals_on_the_entry_surface, types_declared_behind_no_edge,
+};
 pub use entry::{OnTheEntrySurface, WhyUncheckedCodeReachesTheExports};
 pub use order::Order;
 use resolve::SpecifierResolver;
