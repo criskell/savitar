@@ -110,6 +110,17 @@ impl Scope {
         })
     }
 
+    fn innermost_entry(&self, name: &str) -> Option<(Key, Binding)> {
+        let &(depth, binding) = self.standing.get(name).and_then(|held| held.last())?;
+        Some((
+            Key {
+                name: name.to_string(),
+                depth,
+            },
+            binding,
+        ))
+    }
+
     fn at(&self, key: &Key) -> Option<Binding> {
         self.standing
             .get(&key.name)?
@@ -118,9 +129,17 @@ impl Scope {
             .map(|&(_, binding)| binding)
     }
 
-    fn held_at(&self, key: &Key) -> Binding {
-        self.at(key)
-            .expect("a declaration standing where a path starts stands on every path from there")
+    fn held_at(&self, key: &Key, span: oxc_span::Span) -> Result<Binding, Vec<Diagnostic>> {
+        self.at(key).ok_or_else(|| {
+            let name = &key.name;
+            vec![refuse(
+                "malformed-ir",
+                span,
+                format!(
+                    "`{name}` stands where this path starts and does not stand on every path from there"
+                ),
+            )]
+        })
     }
 
     fn put(&mut self, key: &Key, binding: Binding) {
@@ -134,10 +153,21 @@ impl Scope {
         }
     }
 
-    fn store(&mut self, name: &str, binding: Binding) {
-        if let Some(slot) = self.standing.get_mut(name).and_then(|held| held.last_mut()) {
-            slot.1 = binding;
-        }
+    fn store(
+        &mut self,
+        name: &str,
+        binding: Binding,
+        span: oxc_span::Span,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let Some(slot) = self.standing.get_mut(name).and_then(|held| held.last_mut()) else {
+            return Err(vec![refuse(
+                "malformed-ir",
+                span,
+                format!("`{name}` is written where no declaration of it stands"),
+            )]);
+        };
+        slot.1 = binding;
+        Ok(())
     }
 
     fn drop_one(&mut self, key: &Key) {
@@ -166,13 +196,23 @@ impl Scope {
     }
 
     fn entries(&self) -> Vec<(Key, Binding)> {
-        self.keys()
-            .into_iter()
-            .map(|key| {
-                let binding = self.held_at(&key);
-                (key, binding)
+        let mut entries: Vec<(Key, Binding)> = self
+            .standing
+            .iter()
+            .flat_map(|(name, held)| {
+                held.iter().map(move |&(depth, binding)| {
+                    (
+                        Key {
+                            name: name.clone(),
+                            depth,
+                        },
+                        binding,
+                    )
+                })
             })
-            .collect()
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
     }
 }
 
@@ -251,13 +291,19 @@ enum Repeating {
     ThroughLatch,
 }
 
+struct Carried {
+    key: Key,
+    entering: ValueId,
+    declared: TypeId,
+}
+
 struct Looping {
     header: BlockId,
     repeat: BlockId,
     exit: BlockId,
     leading: Vec<ValueId>,
     landing: Vec<ValueId>,
-    carried: Vec<Key>,
+    carried: Vec<Carried>,
     at_header: Scope,
 }
 
@@ -273,10 +319,20 @@ impl Jumped {
     }
 }
 
-fn carried_value(binding: Binding) -> ValueId {
-    binding
-        .value
-        .expect("a carried name holds a value on every edge back")
+fn carried_value(
+    scope: &Scope,
+    carried: &Carried,
+    span: oxc_span::Span,
+) -> Result<ValueId, Vec<Diagnostic>> {
+    let binding = scope.held_at(&carried.key, span)?;
+    binding.value.ok_or_else(|| {
+        let name = &carried.key.name;
+        vec![refuse(
+            "malformed-ir",
+            span,
+            format!("`{name}` carries a header parameter and holds no value on this edge back"),
+        )]
+    })
 }
 
 fn every_change_is_carried(
@@ -288,7 +344,8 @@ fn every_change_is_carried(
         let Some(held) = looping.at_header.at(&key) else {
             continue;
         };
-        if held.value != binding.value && !looping.carried.contains(&key) {
+        if held.value != binding.value && !looping.carried.iter().any(|carried| carried.key == key)
+        {
             let name = &key.name;
             return Err(vec![refuse(
                 "malformed-ir",
@@ -1606,8 +1663,7 @@ impl Context<'_> {
         let held = self.bound(name, at)?;
         let stored = self.kept(table, function, value, held.declared, name, span)?;
         self.scope
-            .store(name, Binding::written(stored, held.declared));
-        Ok(())
+            .store(name, Binding::written(stored, held.declared), span)
     }
 
     fn kept(
@@ -2051,17 +2107,17 @@ impl Context<'_> {
         body: &AstStatement<'_>,
         stepping: &[&Expression<'_>],
         span: oxc_span::Span,
-    ) -> Result<Vec<Key>, Vec<Diagnostic>> {
+    ) -> Result<Vec<Carried>, Vec<Diagnostic>> {
         let mut found = assigned::assigned_names(std::slice::from_ref(body));
         for expression in stepping {
             found.extend(assigned::assigned_names_in(expression));
         }
         let mut carried = Vec::new();
         for name in found {
-            let Some(binding) = self.scope.get(&name) else {
+            let Some((key, binding)) = self.scope.innermost_entry(&name) else {
                 continue;
             };
-            if binding.value.is_none() {
+            let Some(entering) = binding.value else {
                 return Err(vec![refuse(
                     "unsupported-statement",
                     span,
@@ -2069,12 +2125,12 @@ impl Context<'_> {
                         "`{name}` is written in this loop and was never written before it, so the header has no value to carry in"
                     ),
                 )]);
-            }
-            carried.push(
-                self.scope
-                    .innermost(&name)
-                    .expect("the name was just read out of this scope"),
-            );
+            };
+            carried.push(Carried {
+                key,
+                entering,
+                declared: binding.declared,
+            });
         }
         Ok(carried)
     }
@@ -2083,7 +2139,7 @@ impl Context<'_> {
         &mut self,
         table: &mut TypeTable,
         function: &mut Function,
-        carried: Vec<Key>,
+        carried: Vec<Carried>,
         entering: &[ValueId],
         repeating: Repeating,
         span: oxc_span::Span,
@@ -2095,13 +2151,9 @@ impl Context<'_> {
             parameters.push(function.fresh_value(function.type_of(*value)));
             arguments.push(*value);
         }
-        for key in &carried {
-            let incoming = self.scope.held_at(key);
-            let entering = incoming
-                .value
-                .expect("a carried name was proved written before the loop");
-            parameters.push(function.fresh_value(incoming.declared));
-            arguments.push(self.coerced(function, table, entering, incoming.declared, span));
+        for held in &carried {
+            parameters.push(function.fresh_value(held.declared));
+            arguments.push(self.coerced(function, table, held.entering, held.declared, span));
         }
         function.block_mut(header).parameters = parameters.clone();
 
@@ -2131,9 +2183,9 @@ impl Context<'_> {
         );
         self.current = header;
         self.statements.clear();
-        for (key, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
-            let declared = self.scope.held_at(key).declared;
-            self.scope.put(key, Binding::written(*parameter, declared));
+        for (held, parameter) in carried.iter().zip(parameters.iter().skip(entering.len())) {
+            self.scope
+                .put(&held.key, Binding::written(*parameter, held.declared));
         }
         Looping {
             header,
@@ -2218,10 +2270,9 @@ impl Context<'_> {
         for (site, scope) in &edges {
             every_change_is_carried(looping, scope, span)?;
             let mut arguments = looping.leading.clone();
-            for key in &looping.carried {
-                let binding = scope.held_at(key);
-                let leaving = carried_value(binding);
-                arguments.push(self.appended(function, *site, leaving, binding.declared, span));
+            for held in &looping.carried {
+                let leaving = carried_value(scope, held, span)?;
+                arguments.push(self.appended(function, *site, leaving, held.declared, span));
             }
             function.block_mut(*site).terminator = Terminator::Jump {
                 target: looping.repeat,
@@ -2235,13 +2286,13 @@ impl Context<'_> {
         self.current = looping.repeat;
         self.statements.clear();
         self.scope = looping.at_header.clone();
-        for (key, parameter) in looping
+        for (held, parameter) in looping
             .carried
             .iter()
             .zip(looping.landing.iter().skip(looping.leading.len()))
         {
-            let declared = looping.at_header.held_at(key).declared;
-            self.scope.put(key, Binding::written(*parameter, declared));
+            self.scope
+                .put(&held.key, Binding::written(*parameter, held.declared));
         }
     }
 
@@ -2253,12 +2304,12 @@ impl Context<'_> {
         leaving: Option<(BlockId, Scope)>,
         breaks: Vec<(BlockId, Scope)>,
         span: oxc_span::Span,
-    ) -> Flow {
+    ) -> Result<Flow, Vec<Diagnostic>> {
         let mut edges: Vec<(BlockId, Scope)> = leaving.into_iter().collect();
         edges.extend(breaks);
         if edges.is_empty() {
             self.scope = looping.at_header.clone();
-            return Flow::Returned;
+            return Ok(Flow::Returned);
         }
         self.scope = self.joined(
             table,
@@ -2267,10 +2318,10 @@ impl Context<'_> {
             &looping.at_header,
             &edges,
             span,
-        );
+        )?;
         self.current = looping.exit;
         self.statements.clear();
-        Flow::Continues
+        Ok(Flow::Continues)
     }
 
     fn lower_for_of(
@@ -2412,15 +2463,9 @@ impl Context<'_> {
                 statement.span,
             );
             let mut back = vec![stepped];
-            for key in &looping.carried {
-                let binding = self.scope.held_at(key);
-                back.push(self.coerced(
-                    function,
-                    table,
-                    carried_value(binding),
-                    binding.declared,
-                    statement.span,
-                ));
+            for held in &looping.carried {
+                let leaving = carried_value(&self.scope, held, statement.span)?;
+                back.push(self.coerced(function, table, leaving, held.declared, statement.span));
             }
             self.seal(
                 function,
@@ -2438,7 +2483,7 @@ impl Context<'_> {
             Some(leaving),
             jumped.breaks,
             statement.span,
-        );
+        )?;
         self.leave_declarations(standing);
         Ok(flow)
     }
@@ -2476,15 +2521,9 @@ impl Context<'_> {
             let condition = self.lower_expression(table, function, &statement.test)?;
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
-            for key in &looping.carried {
-                let binding = self.scope.held_at(key);
-                back.push(self.coerced(
-                    function,
-                    table,
-                    carried_value(binding),
-                    binding.declared,
-                    statement.span,
-                ));
+            for held in &looping.carried {
+                let leaving = carried_value(&self.scope, held, statement.span)?;
+                back.push(self.coerced(function, table, leaving, held.declared, statement.span));
             }
             let block = function.add_block(empty_block());
             self.seal(
@@ -2500,14 +2539,14 @@ impl Context<'_> {
             leaving = Some(self.leaving_edge(function, &looping, block));
         }
 
-        Ok(self.close_loop(
+        self.close_loop(
             table,
             function,
             &looping,
             leaving,
             jumped.breaks,
             statement.span,
-        ))
+        )
     }
 
     fn lower_for_init(
@@ -2604,15 +2643,9 @@ impl Context<'_> {
             }
             every_change_is_carried(&looping, &self.scope, statement.span)?;
             let mut back = Vec::with_capacity(looping.carried.len());
-            for key in &looping.carried {
-                let binding = self.scope.held_at(key);
-                back.push(self.coerced(
-                    function,
-                    table,
-                    carried_value(binding),
-                    binding.declared,
-                    statement.span,
-                ));
+            for held in &looping.carried {
+                let leaving = carried_value(&self.scope, held, statement.span)?;
+                back.push(self.coerced(function, table, leaving, held.declared, statement.span));
             }
             self.seal(
                 function,
@@ -2630,7 +2663,7 @@ impl Context<'_> {
             leaving,
             jumped.breaks,
             statement.span,
-        );
+        )?;
         self.leave_declarations(standing);
         Ok(flow)
     }
@@ -2677,14 +2710,14 @@ impl Context<'_> {
             jumped.continues,
             statement.span,
         )?;
-        Ok(self.close_loop(
+        self.close_loop(
             table,
             function,
             &looping,
             Some(leaving),
             jumped.breaks,
             statement.span,
-        ))
+        )
     }
 
     fn tested_fact(&self, test: &Expression<'_>) -> Option<Tested> {
@@ -2803,7 +2836,7 @@ impl Context<'_> {
         let Some(tested) = tested else {
             return;
         };
-        let Some(binding) = self.scope.get(&tested.name) else {
+        let Some((narrowing, binding)) = self.scope.innermost_entry(&tested.name) else {
             return;
         };
         let Some(standing) = binding.value else {
@@ -2859,8 +2892,8 @@ impl Context<'_> {
         }
         let value = self.assign(function, narrowed, Rvalue::Narrow(standing), span);
         let by_a_field = binding.narrowed_by_a_field || tested.fact.is_about_a_field();
-        self.scope.store(
-            &tested.name,
+        self.scope.put(
+            &narrowing,
             Binding::narrowed(value, binding.declared, by_a_field),
         );
     }
@@ -2998,12 +3031,14 @@ impl Context<'_> {
         let mut merged = before.clone();
 
         if then_flow.continues() && else_flow.continues() {
-            for key in before.keys() {
-                let declared = before.held_at(&key).declared;
-                let narrowed_by_a_field = then_scope.held_at(&key).narrowed_by_a_field
-                    || else_scope.held_at(&key).narrowed_by_a_field;
-                let from_then = then_scope.held_at(&key).value;
-                let from_else = else_scope.held_at(&key).value;
+            for (key, held) in before.entries() {
+                let declared = held.declared;
+                let in_then = then_scope.held_at(&key, statement.span)?;
+                let in_else = else_scope.held_at(&key, statement.span)?;
+                let narrowed_by_a_field =
+                    in_then.narrowed_by_a_field || in_else.narrowed_by_a_field;
+                let from_then = in_then.value;
+                let from_else = in_else.value;
                 if from_then == from_else {
                     merged.put(
                         &key,
@@ -3130,7 +3165,7 @@ impl Context<'_> {
             self.scope = before;
             return Ok(flow);
         }
-        self.scope = self.joined(table, function, join, &before, &edges, span);
+        self.scope = self.joined(table, function, join, &before, &edges, span)?;
         self.current = join;
         self.statements.clear();
         Ok(Flow::Continues)
@@ -3345,7 +3380,7 @@ impl Context<'_> {
                         &before,
                         &arriving,
                         case.span,
-                    )
+                    )?
                 }
                 None => before.clone(),
             };
@@ -3401,7 +3436,7 @@ impl Context<'_> {
             return Ok(Flow::Returned);
         }
 
-        self.scope = self.joined(table, function, join, &before, &edges, statement.span);
+        self.scope = self.joined(table, function, join, &before, &edges, statement.span)?;
         self.current = join;
         self.statements.clear();
         Ok(Flow::Continues)
@@ -3415,20 +3450,22 @@ impl Context<'_> {
         shape: &Scope,
         edges: &[(BlockId, Scope)],
         span: oxc_span::Span,
-    ) -> Scope {
+    ) -> Result<Scope, Vec<Diagnostic>> {
         let mut parameters = Vec::new();
         let mut passed: Vec<Vec<ValueId>> = vec![Vec::new(); edges.len()];
         let mut merged = shape.clone();
-        for key in shape.keys() {
-            let declared = shape.held_at(&key).declared;
-            let narrowed_by_a_field = edges
+        for (key, held) in shape.entries() {
+            let declared = held.declared;
+            let on_edges = edges
                 .iter()
-                .any(|(_, scope)| scope.held_at(&key).narrowed_by_a_field);
-            let first = edges[0].1.held_at(&key).value;
-            if edges
-                .iter()
-                .all(|(_, scope)| scope.held_at(&key).value == first)
-            {
+                .map(|(_, scope)| scope.held_at(&key, span))
+                .collect::<Result<Vec<Binding>, Vec<Diagnostic>>>()?;
+            let Some(leading) = on_edges.first() else {
+                break;
+            };
+            let narrowed_by_a_field = on_edges.iter().any(|edge| edge.narrowed_by_a_field);
+            let first = leading.value;
+            if on_edges.iter().all(|edge| edge.value == first) {
                 merged.put(
                     &key,
                     Binding {
@@ -3439,9 +3476,9 @@ impl Context<'_> {
                 );
                 continue;
             }
-            let Some(standing) = edges
+            let Some(standing) = on_edges
                 .iter()
-                .map(|(_, scope)| scope.held_at(&key).value)
+                .map(|edge| edge.value)
                 .collect::<Option<Vec<ValueId>>>()
             else {
                 merged.put(&key, Binding::awaiting_a_write(declared));
@@ -3471,7 +3508,7 @@ impl Context<'_> {
                 arguments,
             };
         }
-        merged
+        Ok(merged)
     }
 
     fn appended(
@@ -4662,5 +4699,234 @@ fn expression_kind(expression: &Expression<'_>) -> &'static str {
         Expression::Super(_) => "super",
         Expression::YieldExpression(_) => "yield",
         _ => "this expression",
+    }
+}
+
+#[cfg(test)]
+mod scope_refusals {
+    use super::{Binding, Carried, Key, Scope, carried_value};
+    use savitar_diagnostics::Severity;
+    use savitar_ir::Function;
+    use savitar_types::{TypeId, TypeKind, TypeTable};
+
+    struct Bench {
+        function: Function,
+        number: TypeId,
+    }
+
+    fn bench() -> Bench {
+        let mut table = TypeTable::new();
+        let number = table.intern(TypeKind::Number);
+        Bench {
+            function: Function::new("probe"),
+            number,
+        }
+    }
+
+    fn asked_at() -> oxc_span::Span {
+        oxc_span::Span::new(17, 23)
+    }
+
+    fn key(name: &str, depth: usize) -> Key {
+        Key {
+            name: name.to_string(),
+            depth,
+        }
+    }
+
+    #[test]
+    fn storing_a_name_no_declaration_stands_for_is_refused_with_a_span() {
+        let mut bench = bench();
+        let value = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+
+        let refusal = scope
+            .store("absent", Binding::written(value, bench.number), asked_at())
+            .expect_err("a write with no declaration standing must be refused");
+
+        assert_eq!(refusal.len(), 1);
+        assert_eq!(refusal[0].rule, "malformed-ir");
+        assert_eq!(refusal[0].severity, Severity::Unsupported);
+        assert_eq!(refusal[0].span.start, 17);
+        assert_eq!(refusal[0].span.end, 23);
+        assert!(refusal[0].message.contains("absent"));
+    }
+
+    #[test]
+    fn storing_a_name_a_declaration_stands_for_replaces_that_binding() {
+        let mut bench = bench();
+        let first = bench.function.fresh_value(bench.number);
+        let second = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+        scope.put(&key("count", 0), Binding::written(first, bench.number));
+
+        scope
+            .store("count", Binding::written(second, bench.number), asked_at())
+            .expect("a write to a standing declaration is kept");
+
+        assert_eq!(scope.get("count").and_then(|held| held.value), Some(second));
+        assert_eq!(scope.entries().len(), 1);
+    }
+
+    #[test]
+    fn storing_a_shadowed_name_replaces_only_the_innermost_declaration() {
+        let mut bench = bench();
+        let outer = bench.function.fresh_value(bench.number);
+        let inner = bench.function.fresh_value(bench.number);
+        let written = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+        scope.put(&key("count", 0), Binding::written(outer, bench.number));
+        scope.put(&key("count", 1), Binding::written(inner, bench.number));
+
+        scope
+            .store("count", Binding::written(written, bench.number), asked_at())
+            .expect("a write to a standing declaration is kept");
+
+        assert_eq!(
+            scope.at(&key("count", 0)).and_then(|held| held.value),
+            Some(outer)
+        );
+        assert_eq!(
+            scope.at(&key("count", 1)).and_then(|held| held.value),
+            Some(written)
+        );
+    }
+
+    #[test]
+    fn asking_what_a_key_holds_where_it_does_not_stand_is_refused_with_a_span() {
+        let scope = Scope::new();
+
+        let refusal = scope
+            .held_at(&key("gone", 2), asked_at())
+            .expect_err("a key that does not stand must be refused");
+
+        assert_eq!(refusal.len(), 1);
+        assert_eq!(refusal[0].rule, "malformed-ir");
+        assert_eq!(refusal[0].severity, Severity::Unsupported);
+        assert_eq!(refusal[0].span.start, 17);
+        assert_eq!(refusal[0].span.end, 23);
+        assert!(refusal[0].message.contains("gone"));
+    }
+
+    #[test]
+    fn asking_what_a_key_holds_at_a_depth_that_does_not_stand_is_refused() {
+        let mut bench = bench();
+        let value = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+        scope.put(&key("count", 0), Binding::written(value, bench.number));
+
+        scope
+            .held_at(&key("count", 1), asked_at())
+            .expect_err("the same name at another depth is another declaration");
+    }
+
+    #[test]
+    fn a_carried_name_that_holds_no_value_on_the_edge_back_is_refused_with_a_span() {
+        let mut bench = bench();
+        let entering = bench.function.fresh_value(bench.number);
+        let carried = Carried {
+            key: key("total", 0),
+            entering,
+            declared: bench.number,
+        };
+        let mut scope = Scope::new();
+        scope.put(&carried.key, Binding::awaiting_a_write(bench.number));
+
+        let refusal = carried_value(&scope, &carried, asked_at())
+            .expect_err("a carried name with no value must be refused");
+
+        assert_eq!(refusal.len(), 1);
+        assert_eq!(refusal[0].rule, "malformed-ir");
+        assert_eq!(refusal[0].severity, Severity::Unsupported);
+        assert_eq!(refusal[0].span.start, 17);
+        assert_eq!(refusal[0].span.end, 23);
+        assert!(refusal[0].message.contains("total"));
+    }
+
+    #[test]
+    fn a_carried_name_whose_declaration_left_the_edge_back_is_refused() {
+        let mut bench = bench();
+        let entering = bench.function.fresh_value(bench.number);
+        let carried = Carried {
+            key: key("total", 0),
+            entering,
+            declared: bench.number,
+        };
+
+        carried_value(&Scope::new(), &carried, asked_at())
+            .expect_err("a carried name that no longer stands must be refused");
+    }
+
+    #[test]
+    fn a_carried_name_that_holds_a_value_on_the_edge_back_answers_it() {
+        let mut bench = bench();
+        let entering = bench.function.fresh_value(bench.number);
+        let leaving = bench.function.fresh_value(bench.number);
+        let carried = Carried {
+            key: key("total", 0),
+            entering,
+            declared: bench.number,
+        };
+        let mut scope = Scope::new();
+        scope.put(&carried.key, Binding::written(leaving, bench.number));
+
+        let answered = carried_value(&scope, &carried, asked_at())
+            .expect("a carried name that holds a value answers it");
+
+        assert_eq!(answered, leaving);
+    }
+
+    #[test]
+    fn every_standing_declaration_has_an_entry_in_key_order() {
+        let mut bench = bench();
+        let value = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+        scope.put(&key("count", 1), Binding::written(value, bench.number));
+        scope.put(&key("count", 0), Binding::written(value, bench.number));
+        scope.put(&key("budget", 3), Binding::written(value, bench.number));
+
+        let entries = scope.entries();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(held, _)| held.clone())
+                .collect::<Vec<_>>(),
+            vec![key("budget", 3), key("count", 0), key("count", 1)]
+        );
+    }
+
+    #[test]
+    fn the_innermost_entry_names_the_declaration_a_put_goes_back_to() {
+        let mut bench = bench();
+        let outer = bench.function.fresh_value(bench.number);
+        let inner = bench.function.fresh_value(bench.number);
+        let narrowed = bench.function.fresh_value(bench.number);
+        let mut scope = Scope::new();
+        scope.put(&key("frame", 0), Binding::written(outer, bench.number));
+        scope.put(&key("frame", 4), Binding::written(inner, bench.number));
+
+        let (standing, held) = scope
+            .innermost_entry("frame")
+            .expect("a standing name answers its innermost declaration");
+        assert_eq!(standing, key("frame", 4));
+        assert_eq!(held.value, Some(inner));
+
+        scope.put(&standing, Binding::narrowed(narrowed, held.declared, true));
+
+        assert_eq!(scope.entries().len(), 2);
+        assert_eq!(
+            scope.at(&key("frame", 4)).and_then(|seen| seen.value),
+            Some(narrowed)
+        );
+        assert_eq!(
+            scope.at(&key("frame", 0)).and_then(|seen| seen.value),
+            Some(outer)
+        );
+    }
+
+    #[test]
+    fn a_name_no_declaration_stands_for_has_no_innermost_entry() {
+        assert!(Scope::new().innermost_entry("absent").is_none());
     }
 }
