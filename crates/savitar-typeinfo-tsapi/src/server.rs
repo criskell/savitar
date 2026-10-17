@@ -7,7 +7,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{Field, IndexSignature, Parameter, TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, IndexSignature, Parameter, StaticSide, TypeId, TypeKind, TypeTable};
 use serde_json::{Value, json};
 
 use crate::flags::{ObjectFlags, SignatureFlags, SymbolFlags, TypeFlags};
@@ -15,6 +15,15 @@ use crate::translate::{Classified, call_signature_kind, classify, optional_param
 
 const MAX_TYPE_DEPTH: u32 = 32;
 const MAX_DEFERRED_UNROLLING: u32 = 2;
+const THE_PROTOTYPE: &str = "prototype";
+
+fn why_a_shape_is_missing(answer: &Answer) -> String {
+    match answer {
+        Answer::Unsupported(reason) => reason.clone(),
+        Answer::OutOfScope => "the provider answered nothing here".to_string(),
+        Answer::Known(_) => "a shape that is known".to_string(),
+    }
+}
 
 #[derive(Debug)]
 pub enum TsApiError {
@@ -648,7 +657,8 @@ impl TsApi {
                     other => return other,
                 }
             }
-            return Answer::Known(table.constructor(forms));
+            let statics = self.static_side(table, type_id, depth, indexes);
+            return Answer::Known(table.constructor(forms, statics));
         }
 
         let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
@@ -683,10 +693,24 @@ impl TsApi {
             return Answer::Known(table.overloaded(forms));
         }
 
-        let mut fields = Vec::with_capacity(properties.len());
+        let fields = match self.intern_properties(table, properties, depth) {
+            Ok(fields) => fields,
+            Err(answer) => return answer,
+        };
+
+        Answer::Known(table.object_with_indexes(fields, indexes))
+    }
+
+    fn intern_properties<'a>(
+        &self,
+        table: &mut TypeTable,
+        properties: impl IntoIterator<Item = &'a Value>,
+        depth: u32,
+    ) -> Result<Vec<Field>, Answer> {
+        let mut fields = Vec::new();
         for property in properties {
             let Some(name) = property.get("name").and_then(Value::as_str) else {
-                return Answer::Unsupported("a property with no name".into());
+                return Err(Answer::Unsupported("a property with no name".into()));
             };
             let symbol_flags = property
                 .get("flags")
@@ -695,19 +719,23 @@ impl TsApi {
                 .unwrap_or_default();
             let method = symbol_flags.has(SymbolFlags::METHOD);
             if !method && !symbol_flags.has(SymbolFlags::PROPERTY) {
-                return Answer::Unsupported(format!("`{name}` is neither a property nor a method"));
+                return Err(Answer::Unsupported(format!(
+                    "`{name}` is neither a property nor a method"
+                )));
             }
 
             let Some(reference) = property.get("reference") else {
-                return Answer::Unsupported(format!("`{name}` carries no symbol reference"));
+                return Err(Answer::Unsupported(format!(
+                    "`{name}` carries no symbol reference"
+                )));
             };
             let field_type = match self.symbol_type(reference) {
                 Ok(field_type) => field_type,
-                Err(error) => return Answer::Unsupported(error.to_string()),
+                Err(error) => return Err(Answer::Unsupported(error.to_string())),
             };
             let readonly = match self.symbol_is_readonly(reference) {
                 Ok(readonly) => readonly,
-                Err(error) => return Answer::Unsupported(error.to_string()),
+                Err(error) => return Err(Answer::Unsupported(error.to_string())),
             };
 
             match self.intern_response(table, &field_type, depth + 1) {
@@ -718,11 +746,33 @@ impl TsApi {
                     method,
                     readonly,
                 }),
-                other => return refusal_reached_through_member(name, other),
+                other => return Err(refusal_reached_through_member(name, other)),
             }
         }
+        Ok(fields)
+    }
 
-        Answer::Known(table.object_with_indexes(fields, indexes))
+    fn static_side(
+        &self,
+        table: &mut TypeTable,
+        type_id: u32,
+        depth: u32,
+        indexes: Vec<IndexSignature>,
+    ) -> StaticSide {
+        let properties = match self.checker_call("getPropertiesOfType", "type", type_id) {
+            Ok(properties) => properties,
+            Err(error) => return StaticSide::NotModelled(error.to_string()),
+        };
+        let Some(properties) = properties.as_array() else {
+            return StaticSide::NotModelled("getPropertiesOfType returned no array".into());
+        };
+        let declared = properties
+            .iter()
+            .filter(|property| property.get("name").and_then(Value::as_str) != Some(THE_PROTOTYPE));
+        match self.intern_properties(table, declared, depth) {
+            Ok(fields) => StaticSide::Shaped(table.object_with_indexes(fields, indexes)),
+            Err(answer) => StaticSide::NotModelled(why_a_shape_is_missing(&answer)),
+        }
     }
 
     fn fixed_tuple_shape(&self, type_id: u32) -> Result<FixedTuple, Answer> {

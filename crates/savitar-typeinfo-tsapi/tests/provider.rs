@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use savitar_diagnostics::Span;
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_typeinfo_tsapi::TsApi;
-use savitar_types::{Field, IndexSignature, Parameter, TypeKind, TypeTable, assignable};
+use savitar_types::{
+    Field, IndexSignature, Parameter, StaticSide, TypeKind, TypeTable, assignable,
+};
 
 const SOURCE: &str = concat!(
     "const n = 1;\n",
@@ -1493,6 +1495,125 @@ fn a_position_in_a_file_the_project_excludes_reports_a_file_the_provider_cannot_
     assert!(
         reason.contains("source file not found"),
         "the provider names the file it cannot find; it said: {reason}"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+const STATIC_MEMBERS: &str = concat!(
+    "export class Base {\n",
+    "  static tally: string | number;\n",
+    "  static readonly label: string = \"b\";\n",
+    "  static put(incoming: string | number): void {\n",
+    "    Base.tally = incoming;\n",
+    "  }\n",
+    "}\n",
+    "export class Derived extends Base {}\n",
+);
+
+#[test]
+fn the_constructible_shape_at_a_base_name_carries_the_static_members_of_that_class() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[("a.ts", STATIC_MEMBERS)]);
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(STATIC_MEMBERS, "extends Base"), 0),
+    );
+    let Answer::Known(constructible) = answer else {
+        panic!("expected a known type at the base name, got {answer:?}");
+    };
+    let TypeKind::Constructor { forms, statics } = table.kind(constructible).clone() else {
+        panic!(
+            "expected a constructible shape, got {:?}",
+            table.kind(constructible)
+        );
+    };
+    assert_eq!(forms.len(), 1, "a class declares one way to construct it");
+
+    let StaticSide::Shaped(shape) = statics else {
+        panic!("expected the static side to be shaped, got {statics:?}");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(shape).clone() else {
+        panic!("expected an object shape, got {:?}", table.kind(shape));
+    };
+    let named: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(
+        named,
+        vec!["label", "put", "tally"],
+        "the static side holds what the class declares static"
+    );
+
+    let tally = fields
+        .iter()
+        .find(|field| field.name == "tally")
+        .expect("the static field is in the shape");
+    assert!(!tally.readonly);
+    assert!(!tally.method);
+    let TypeKind::Union(_) = table.kind(tally.type_id) else {
+        panic!(
+            "`tally` should arrive as the declared union, got {:?}",
+            table.kind(tally.type_id)
+        );
+    };
+
+    let label = fields
+        .iter()
+        .find(|field| field.name == "label")
+        .expect("the static readonly field is in the shape");
+    assert!(label.readonly, "`static readonly` arrives readonly");
+
+    let put = fields
+        .iter()
+        .find(|field| field.name == "put")
+        .expect("the static method is in the shape");
+    assert!(put.method, "a static method arrives as a method");
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+#[test]
+fn the_prototype_the_checker_synthesises_is_left_out_of_the_static_side() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[("a.ts", STATIC_MEMBERS)]);
+    let file = project.join("a.ts");
+    let api = TsApi::start(&binary, &project, &[file.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = file.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(STATIC_MEMBERS, "extends Base"), 0),
+    );
+    let Answer::Known(constructible) = answer else {
+        panic!("expected a known type at the base name, got {answer:?}");
+    };
+    let Some(StaticSide::Shaped(shape)) = table.static_side_of(constructible).cloned() else {
+        panic!("expected the static side to be shaped");
+    };
+    let TypeKind::Object { fields, .. } = table.kind(shape).clone() else {
+        panic!("expected an object shape, got {:?}", table.kind(shape));
+    };
+    assert!(
+        !fields.iter().any(|field| field.name == "prototype"),
+        "`prototype` holds the instance shape, which the instance rule already relates, and a \
+         mutable `prototype` would demand invariance between instance shapes"
     );
 
     std::fs::remove_dir_all(&project).ok();

@@ -25,7 +25,7 @@ use savitar_ir::{
     verify,
 };
 use savitar_typeinfo::{Answer, TypeProvider};
-use savitar_types::{Field, TypeId, TypeKind, TypeTable};
+use savitar_types::{Field, StaticSide, TypeId, TypeKind, TypeTable};
 
 use names::{ModuleName, ModuleNames, WhatTheFileHolds, is_a_package_specifier, names_bound_by};
 pub use standing::{ModuleStanding, Ran, Standing, TwoModulesForOneSpecifier};
@@ -1200,6 +1200,7 @@ fn lower_declared(
                 .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
             let lowering = Lowering {
                 name,
+                constructs: None,
                 signature: declaration
                     .id
                     .as_ref()
@@ -1251,23 +1252,28 @@ fn lower_class(
     let constructible = match declared_base {
         None => None,
         Some((_, at)) => match base_construct_signatures(surroundings, table, at) {
-            Ok(forms) => Some(forms),
+            Ok(constructible) => Some(constructible),
             Err(refusals) => return vec![Err(refusals)],
         },
     };
     let base = match (declared_base, constructible.as_ref()) {
-        (Some((name, at)), Some(forms)) => Some(BaseClass {
+        (Some((name, at)), Some(constructible)) => Some(BaseClass {
             name,
             at,
-            forms: forms.as_slice(),
+            forms: constructible.forms.as_slice(),
+            statics: &constructible.statics,
         }),
         _ => None,
     };
-    if let Some(declared) = base
-        && let Err(refusals) =
+    if let Some(declared) = base {
+        if let Err(refusals) =
             inherited_members_fit_the_base(surroundings, table, id.span, declared)
-    {
-        return vec![Err(refusals)];
+        {
+            return vec![Err(refusals)];
+        }
+        if let Err(refusals) = static_members_fit_the_base(surroundings, table, class, declared) {
+            return vec![Err(refusals)];
+        }
     }
     let mut outcomes = Vec::new();
     for element in &class.body.body {
@@ -1342,6 +1348,7 @@ fn lower_method<'a>(
     let constructing = method.kind == MethodDefinitionKind::Constructor;
     let lowering = Lowering {
         name,
+        constructs: constructing.then(|| class.to_string()),
         signature: if constructing {
             Signature::NoPositionAnswersOne
         } else {
@@ -1370,16 +1377,27 @@ struct BaseClass<'a> {
     name: &'a str,
     at: oxc_span::Span,
     forms: &'a [TypeId],
+    statics: &'a StaticSide,
+}
+
+struct Constructible {
+    forms: Vec<TypeId>,
+    statics: StaticSide,
 }
 
 fn base_construct_signatures(
     surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     at: oxc_span::Span,
-) -> Result<Vec<TypeId>, Vec<Diagnostic>> {
+) -> Result<Constructible, Vec<Diagnostic>> {
     let constructor = type_at_the_name(surroundings, table, at)?;
-    types::constructible_forms(table, constructor)
-        .map_err(|reason| vec![refuse("unsupported-class-member", at, reason)])
+    let forms = types::constructible_forms(table, constructor)
+        .map_err(|reason| vec![refuse("unsupported-class-member", at, reason)])?;
+    let statics = table
+        .static_side_of(constructor)
+        .cloned()
+        .unwrap_or_else(|| StaticSide::NotModelled("this value is not constructible".to_string()));
+    Ok(Constructible { forms, statics })
 }
 
 fn type_at_the_name(
@@ -1435,6 +1453,164 @@ fn inherited_members_fit_the_base(
         }
     }
     Ok(())
+}
+
+struct DeclaredStatic<'a> {
+    name: &'a str,
+    at: oxc_span::Span,
+    optional: bool,
+    method: bool,
+    readonly: bool,
+}
+
+fn statics_declared_by<'a>(
+    class: &'a Class<'_>,
+) -> Result<Vec<DeclaredStatic<'a>>, Vec<Diagnostic>> {
+    let mut declared = Vec::new();
+    for element in &class.body.body {
+        let (key, span, optional, method, readonly) = match element {
+            ClassElement::PropertyDefinition(property) if property.r#static => (
+                &property.key,
+                property.span,
+                property.optional,
+                false,
+                property.readonly,
+            ),
+            ClassElement::MethodDefinition(method)
+                if method.r#static && method.kind == MethodDefinitionKind::Method =>
+            {
+                (&method.key, method.span, method.optional, true, false)
+            }
+            _ => continue,
+        };
+        let PropertyKey::StaticIdentifier(key) = key else {
+            return Err(vec![refuse(
+                "unsupported-class-member",
+                span,
+                "a computed or private static member name is not lowered yet, and without the \
+                 name there is nothing to relate to the static side of the base",
+            )]);
+        };
+        declared.push(DeclaredStatic {
+            name: key.name.as_str(),
+            at: key.span,
+            optional,
+            method,
+            readonly,
+        });
+    }
+    Ok(declared)
+}
+
+fn static_members_fit_the_base(
+    surroundings: Surroundings<'_>,
+    table: &mut TypeTable,
+    class: &Class<'_>,
+    base: BaseClass<'_>,
+) -> Result<(), Vec<Diagnostic>> {
+    let declared = statics_declared_by(class)?;
+    if declared.is_empty() {
+        return Ok(());
+    }
+
+    let inherited = match base.statics {
+        StaticSide::Shaped(shape) => *shape,
+        StaticSide::NotModelled(reason) => {
+            return Err(vec![refuse(
+                "unsupported-class",
+                base.at,
+                format!(
+                    "`{}` declares static members Savitar does not model, so what this class \
+                     redeclares static cannot be related to them: {reason}",
+                    base.name
+                ),
+            )]);
+        }
+    };
+    let TypeKind::Object { fields, .. } = table.kind(inherited).clone() else {
+        return Err(vec![refuse(
+            "unsupported-class",
+            base.at,
+            format!(
+                "the static side of `{}` is not a shape, so what this class redeclares static \
+                 cannot be related to it",
+                base.name
+            ),
+        )]);
+    };
+
+    let mut redeclared: Vec<(oxc_span::Span, Field, Field)> = Vec::new();
+    for member in &declared {
+        let Some(inherited_field) = fields.iter().find(|field| field.name == member.name) else {
+            continue;
+        };
+        let type_id = type_at_the_name(surroundings, table, member.at)?;
+        redeclared.push((
+            member.at,
+            Field {
+                name: member.name.to_string(),
+                type_id,
+                optional: member.optional,
+                method: member.method,
+                readonly: member.readonly,
+            },
+            inherited_field.clone(),
+        ));
+    }
+    if redeclared.is_empty() {
+        return Ok(());
+    }
+
+    let offered = table.object(
+        redeclared
+            .iter()
+            .map(|(_, offered, _)| offered.clone())
+            .collect(),
+    );
+    let promised = table.object(
+        redeclared
+            .iter()
+            .map(|(_, _, promised)| promised.clone())
+            .collect(),
+    );
+    if savitar_types::assignable(table, offered, promised) {
+        return Ok(());
+    }
+    if let Some((at, offered, _)) = redeclared.iter().find(|(_, offered, promised)| {
+        savitar_types::mentions_a_type_parameter(table, offered.type_id)
+            || savitar_types::mentions_a_type_parameter(table, promised.type_id)
+    }) {
+        return Err(vec![refuse(
+            "unsupported-class-member",
+            *at,
+            format!(
+                "`{}` is a static member whose type mentions a type parameter, and Savitar \
+                 cannot relate it to the one `{}` declares",
+                offered.name, base.name
+            ),
+        )]);
+    }
+    Err(vec![refuse_a_narrowed_static(
+        class.id.as_ref().map_or(class.span, |id| id.span),
+        base.name,
+    )])
+}
+
+fn refuse_a_narrowed_static(span: oxc_span::Span, base: &str) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsound-inheritance",
+        span_of(span),
+        format!(
+            "a static member this class redeclares does not fit the one `{base}` declares, so a \
+             static method of `{base}` could write through the wider view a value this class \
+             promised could not be there"
+        ),
+    )
+    .with_help(
+        "a mutable static member a derived class redeclares has to be invariant, and a static \
+         method it overrides has to take at least what the base takes; `savitar divergences` \
+         lists this as `inherited-member-must-fit-the-base`",
+    )
 }
 
 fn refuse_unsound_inheritance(span: oxc_span::Span, base: &str) -> Diagnostic {
@@ -1565,6 +1741,7 @@ impl Body<'_> {
 
 struct Lowering<'a> {
     name: String,
+    constructs: Option<String>,
     signature: Signature,
     receiver: Receiver<'a>,
     code: Code<'a>,
@@ -1637,6 +1814,9 @@ fn lower_function<'a>(
     }
 
     let mut function = Function::new(&lowering.name);
+    if let Some(class) = lowering.constructs.as_deref() {
+        function.constructs(class);
+    }
     let entry = function.add_block(empty_block(at));
     let mut context = Context {
         file: surroundings.file,
@@ -2059,6 +2239,7 @@ impl Context<'_> {
         }
         let lowering = Lowering {
             name: name.clone(),
+            constructs: None,
             signature: Signature::Declared(signature),
             receiver: Receiver::Detached,
             code,

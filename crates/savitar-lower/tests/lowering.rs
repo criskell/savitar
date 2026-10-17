@@ -1037,7 +1037,7 @@ fn a_new_expression_takes_the_form_that_fits_and_the_type_it_builds() {
         }],
         counter,
     );
-    let constructor = table.constructor(vec![form]);
+    let constructor = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(
         source,
         vec![
@@ -1110,7 +1110,7 @@ fn a_written_type_argument_stands_for_the_type_parameter_the_form_declares() {
         readonly: false,
     }]);
     let form = table.generic_function(vec![held], Vec::new(), boxed_held);
-    let constructor = table.constructor(vec![form]);
+    let constructor = constructor_with_no_statics(&mut table, vec![form]);
     let boxed_number = table.object(vec![Field {
         name: "held".to_string(),
         type_id: number,
@@ -11405,6 +11405,14 @@ fn passing_undefined_where_the_parameter_is_required_is_still_refused() {
     assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
 }
 
+fn constructor_with_no_statics(
+    table: &mut TypeTable,
+    forms: Vec<savitar_types::TypeId>,
+) -> savitar_types::TypeId {
+    let statics = savitar_types::StaticSide::Shaped(table.object(Vec::new()));
+    table.constructor(forms, statics)
+}
+
 fn constructing_shape(
     table: &mut TypeTable,
     parameters: Vec<savitar_types::TypeId>,
@@ -11419,7 +11427,7 @@ fn constructing_shape(
         })
         .collect();
     let form = table.function(taken, instance);
-    table.constructor(vec![form])
+    constructor_with_no_statics(table, vec![form])
 }
 
 #[test]
@@ -12756,7 +12764,7 @@ fn the_initializer_reading_a_class_declared_before_it_lowers() {
         indexes: Vec::new(),
     });
     let form = table.function(Vec::new(), empty);
-    let constructs = table.constructor(vec![form]);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(source, vec![("Window", Answer::Known(constructs))]);
     let file = SourceFile::new("module.ts", source);
 
@@ -12784,7 +12792,7 @@ fn a_function_body_reads_a_class_the_module_declares_after_it() {
         indexes: Vec::new(),
     });
     let form = table.function(Vec::new(), empty);
-    let constructs = table.constructor(vec![form]);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
     let provider = ByName::new(
         source,
         vec![
@@ -13293,6 +13301,377 @@ fn a_generic_base_is_refused_rather_than_related_to_its_uninstantiated_shape() {
     assert_eq!(report.diagnostics[0].rule, "unsupported-class");
     assert!(
         report.diagnostics[0].message.contains("generic base"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+fn constructing_shape_with_statics(
+    table: &mut TypeTable,
+    instance: savitar_types::TypeId,
+    statics: savitar_types::TypeId,
+) -> savitar_types::TypeId {
+    let form = table.function(Vec::new(), instance);
+    table.constructor(vec![form], savitar_types::StaticSide::Shaped(statics))
+}
+
+fn constructing_shape_with_no_static_side(
+    table: &mut TypeTable,
+    instance: savitar_types::TypeId,
+    reason: &str,
+) -> savitar_types::TypeId {
+    let form = table.function(Vec::new(), instance);
+    table.constructor(
+        vec![form],
+        savitar_types::StaticSide::NotModelled(reason.to_string()),
+    )
+}
+
+const A_DERIVED_STATIC_FIELD: &str =
+    "class Derived extends Base {\n  static declare tally: number;\n}\n";
+
+#[test]
+fn a_derived_class_narrowing_a_mutable_static_field_is_refused_where_tsc_accepts_it() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_slot("tally", either, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_FIELD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_FIELD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsound-inheritance");
+    assert!(
+        report.diagnostics[0].message.contains("static member"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_derived_class_redeclaring_a_static_field_at_the_same_width_is_accepted() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_slot("tally", either, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_FIELD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_FIELD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_derived_class_narrowing_a_readonly_static_field_is_accepted_because_nothing_writes_it() {
+    let source = "class Derived extends Base {\n  static declare readonly tally: number;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let frozen_statics = table.object(vec![a_slot("tally", either, true)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, frozen_statics);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+const A_DERIVED_STATIC_METHOD: &str =
+    "class Derived extends Base {\n  static put(incoming: number): void {}\n}\n";
+
+#[test]
+fn a_derived_class_narrowing_a_static_method_parameter_is_refused_where_tsc_accepts_it() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let takes_either = taking_one(&mut table, either);
+    let takes_number = taking_one(&mut table, number);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_method_slot("put", takes_either)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_METHOD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("put", Answer::Known(takes_number)),
+            ("incoming", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_METHOD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsound-inheritance");
+}
+
+#[test]
+fn a_derived_class_widening_a_static_method_parameter_is_accepted() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let takes_either = taking_one(&mut table, either);
+    let takes_number = taking_one(&mut table, number);
+    let nothing = table.object(Vec::new());
+    let narrow_statics = table.object(vec![a_method_slot("put", takes_number)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, narrow_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_METHOD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("put", Answer::Known(takes_either)),
+            ("incoming", Answer::Known(either)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_METHOD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_derived_class_that_only_adds_a_static_member_is_accepted() {
+    let source =
+        "class Derived extends Base {\n  static describe(): string {\n    return \"x\";\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_slot("tally", either, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let gives_text = table.function(Vec::new(), text);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("describe", Answer::Known(gives_text)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_static_member_whose_type_mentions_a_type_parameter_refuses_without_claiming_the_class_is_unsound()
+ {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let held = table.fresh_type_parameter();
+    let nothing = table.object(Vec::new());
+    let open_statics = table.object(vec![a_slot("tally", held, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, open_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_FIELD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_FIELD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("type parameter"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_base_whose_static_side_is_not_modelled_refuses_by_naming_what_is_missing() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let nothing = table.object(Vec::new());
+    let base = constructing_shape_with_no_static_side(&mut table, nothing, "`held` is an enum");
+    let provider = ByName::new(
+        A_DERIVED_STATIC_FIELD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_FIELD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class");
+    assert!(
+        report.diagnostics[0].message.contains("`held` is an enum"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_derived_class_declaring_a_static_the_base_never_declared_is_not_related_to_anything() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let nothing = table.object(Vec::new());
+    let other_statics = table.object(vec![a_slot("seen", number, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, other_statics);
+    let provider = ByName::new(
+        A_DERIVED_STATIC_FIELD,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", A_DERIVED_STATIC_FIELD);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+const CONSTRUCTED_WHILE_THE_MODULE_INITIALISES: &str = "class Config {\n  private held: number;\n\n  constructor(port: number) {\n    this.held = port;\n  }\n}\n\nconst shared = new Config(8080);\n";
+
+#[test]
+fn constructing_a_class_while_the_module_initialises_is_decided_by_the_graph() {
+    let source = CONSTRUCTED_WHILE_THE_MODULE_INITIALISES;
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let instance = table.object(vec![a_slot("held", number, false)]);
+    let form = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: false,
+        }],
+        instance,
+    );
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("class Config", Answer::Known(instance)),
+            ("new Config", Answer::Known(constructs)),
+            ("port", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let constructor = report
+        .functions
+        .iter()
+        .find(|function| function.name() == "Config.constructor")
+        .expect("the constructor should lower");
+    assert_eq!(
+        constructor.the_class_it_constructs(),
+        Some("Config"),
+        "the name a construction resolves to has to reach the body that runs"
+    );
+}
+
+#[test]
+fn a_constructor_reading_a_module_name_is_refused_when_the_module_initialiser_constructs_it() {
+    let source = "class Config {\n  private held: number;\n\n  constructor() {\n    this.held = fallback;\n  }\n}\n\nconst shared = new Config();\n\nconst fallback = 8080;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let instance = table.object(vec![a_slot("held", number, false)]);
+    let form = table.function(Vec::new(), instance);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("class Config", Answer::Known(instance)),
+            ("new Config", Answer::Known(constructs)),
+            ("fallback", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(
+        report.diagnostics[0].message.contains("`fallback`"),
+        "the refusal names the module name the constructor reads, not a target it cannot resolve: {}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_computed_static_member_name_in_a_derived_class_is_refused_rather_than_skipped() {
+    let source = "class Derived extends Base {\n  static declare [\"tally\"]: number;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_slot("tally", either, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("computed"),
         "{}",
         report.diagnostics[0].message
     );
