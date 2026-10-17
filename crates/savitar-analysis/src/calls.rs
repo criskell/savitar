@@ -19,6 +19,7 @@ pub enum Opaque {
     AValueThatDefinesItself,
     AValueNothingInThisBodyDefines,
     ABodyThisRunDoesNotHold(String),
+    TheConstructorOfTheBaseClass(String),
 }
 
 impl fmt::Display for Opaque {
@@ -44,6 +45,12 @@ impl fmt::Display for Opaque {
             }
             Self::ABodyThisRunDoesNotHold(name) => {
                 write!(formatter, "`{name}`, whose body this run does not hold")
+            }
+            Self::TheConstructorOfTheBaseClass(name) => {
+                write!(
+                    formatter,
+                    "the constructor of the base class `{name}`, which the graph does not reach by name"
+                )
             }
         }
     }
@@ -215,16 +222,25 @@ pub fn calls_in(function: &Function) -> Vec<CallSite> {
     let mut found = Vec::new();
     for (_, block) in function.blocks() {
         for statement in &block.statements {
-            let Statement::Assign { value, span, .. } = statement else {
-                continue;
-            };
-            let (Rvalue::Call { callee, .. } | Rvalue::New { callee, .. }) = value else {
-                continue;
-            };
-            found.push(CallSite {
-                callee: callee_of(function, &defined, *callee),
-                at: *span,
-            });
+            match statement {
+                Statement::Assign {
+                    value: Rvalue::Call { callee, .. } | Rvalue::New { callee, .. },
+                    span,
+                    ..
+                } => found.push(CallSite {
+                    callee: callee_of(function, &defined, *callee),
+                    at: *span,
+                }),
+                Statement::ConstructBase {
+                    base_class, span, ..
+                } => found.push(CallSite {
+                    callee: Callee::NotAName(Opaque::TheConstructorOfTheBaseClass(
+                        base_class.clone(),
+                    )),
+                    at: *span,
+                }),
+                _ => {}
+            }
         }
     }
     found

@@ -66,6 +66,41 @@ impl Builder {
     }
 }
 
+#[test]
+fn constructing_the_base_class_is_a_call_the_graph_does_not_know() {
+    let mut table = TypeTable::new();
+    let mut inherits = Builder::named("Derived.constructor", &mut table);
+    let receiver = inherits.function.declare_parameter(inherits.any);
+    let span = at(inherits.next_span);
+    inherits.statements.push(Statement::ConstructBase {
+        base_class: "Transport".to_string(),
+        object: receiver,
+        arguments: Vec::new(),
+        span,
+    });
+    let inherits = inherits.done();
+
+    let sites = savitar_analysis::calls_in(&inherits);
+    assert_eq!(
+        sites.len(),
+        1,
+        "`super()` runs a body, so it is a call site and not a statement the graph may skip"
+    );
+    assert_eq!(
+        sites[0].callee,
+        Callee::NotAName(Opaque::TheConstructorOfTheBaseClass(
+            "Transport".to_string()
+        ))
+    );
+
+    let graph = CallGraph::over([&inherits]);
+    assert!(
+        !graph
+            .what_a_call_reaches(&sites[0])
+            .proves_no_module_name_is_touched()
+    );
+}
+
 fn a_leaf_that_only_computes(table: &mut TypeTable) -> Function {
     let mut leaf = Builder::named("leaf", table);
     leaf.assign(Rvalue::Constant(Constant::Number(8_u64)));
