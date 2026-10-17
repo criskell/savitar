@@ -3269,7 +3269,7 @@ fn unreachable_terminators(function: &savitar_ir::Function) -> usize {
     function
         .blocks()
         .filter(|(id, block)| {
-            dominance.reachable(*id) && block.terminator == Terminator::Unreachable
+            dominance.reachable(*id) && matches!(block.terminator, Terminator::Unreachable(_))
         })
         .count()
 }
@@ -3412,6 +3412,19 @@ fn a_switch_whose_labels_cover_the_union_leaves_no_unmatched_path() {
         unreachable_terminators(function),
         1,
         "the path no case matched is marked unreachable instead of joining"
+    );
+    let at = function
+        .blocks()
+        .find_map(|(_, block)| match block.terminator {
+            Terminator::Unreachable(at) => Some(at),
+            _ => None,
+        })
+        .expect("the exhaustive switch should leave an unreachable terminator");
+    let where_it_is = file.line_col(at.start);
+    assert_eq!(
+        (where_it_is.line, where_it_is.column),
+        (2, 3),
+        "the unreachable terminator carries the line and column of the switch that made it"
     );
 }
 

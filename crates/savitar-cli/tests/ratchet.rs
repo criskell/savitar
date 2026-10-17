@@ -184,18 +184,22 @@ fn assert_floor(floor_file: &Path, counted: usize, listed: &[String]) {
     }
 }
 
-fn dead_ends_of(file: &str, function: &Function) -> Vec<String> {
+fn dead_ends_of(file: &SourceFile, function: &Function) -> Vec<String> {
     let dominance = Dominance::of(function);
     function
         .blocks()
-        .filter(|(id, block)| {
-            matches!(block.terminator, Terminator::Unreachable) && dominance.reachable(*id)
+        .filter_map(|(id, block)| match block.terminator {
+            Terminator::Unreachable(at) if dominance.reachable(id) => Some(at),
+            _ => None,
         })
-        .map(|(id, _)| {
+        .map(|at| {
+            let where_it_is = file.line_col(at.start);
             format!(
-                "{file}: `{}` block {} is reached and ends unreachable",
-                function.name(),
-                id.index()
+                "{}:{}:{} a path into `{}` is reached and ends unreachable",
+                file.name(),
+                where_it_is.line,
+                where_it_is.column,
+                function.name()
             )
         })
         .collect()
@@ -231,7 +235,7 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         coverage.known += report.functions.len();
         coverage.unsupported += report.diagnostics.len();
         for function in &report.functions {
-            dead_ends.extend(dead_ends_of(file.name(), function));
+            dead_ends.extend(dead_ends_of(&file, function));
         }
         if let Some(initializer) = report.initializer.as_ref() {
             initializers += 1;
@@ -241,9 +245,9 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
                 "the module initializer of {} should be valid code",
                 file.name()
             );
-            dead_ends.extend(dead_ends_of(file.name(), &initializer.function));
+            dead_ends.extend(dead_ends_of(&file, &initializer.function));
             for closure in &initializer.closures {
-                dead_ends.extend(dead_ends_of(file.name(), closure));
+                dead_ends.extend(dead_ends_of(&file, closure));
             }
         }
         for diagnostic in &report.diagnostics {

@@ -911,7 +911,7 @@ fn build_module_initializer<'a>(
     binds: &[Binds<'_>],
 ) -> Result<ModuleInitializer, Vec<Diagnostic>> {
     let mut function = Function::new(format!("{}@module", surroundings.file.name()));
-    let entry = function.add_block(empty_block());
+    let entry = function.add_block(empty_block(where_the_module_starts_binding(hoisted, binds)));
     let void = table.intern(TypeKind::Void);
     let mut context = Context {
         file: surroundings.file,
@@ -1317,11 +1317,11 @@ fn outcomes_of(lowered: Result<Lowered, Vec<Diagnostic>>) -> Vec<Outcome> {
     }
 }
 
-fn empty_block() -> Block {
+fn empty_block(at: oxc_span::Span) -> Block {
     Block {
         parameters: Vec::new(),
         statements: Vec::new(),
-        terminator: Terminator::Unreachable,
+        terminator: Terminator::Unreachable(span_of(at)),
     }
 }
 
@@ -1367,7 +1367,7 @@ fn lower_function<'a>(
     }
 
     let mut function = Function::new(&lowering.name);
-    let entry = function.add_block(empty_block());
+    let entry = function.add_block(empty_block(at));
     let mut context = Context {
         file: surroundings.file,
         provider: surroundings.provider,
@@ -2820,7 +2820,7 @@ impl Context<'_> {
         repeating: Repeating,
         span: oxc_span::Span,
     ) -> Looping {
-        let header = function.add_block(empty_block());
+        let header = function.add_block(empty_block(span));
         let mut parameters = Vec::with_capacity(entering.len() + carried.len());
         let mut arguments = Vec::with_capacity(entering.len() + carried.len());
         for value in entering {
@@ -2840,7 +2840,7 @@ impl Context<'_> {
         let (repeat, landing) = match repeating {
             Repeating::AtHeader => (header, parameters.clone()),
             Repeating::ThroughLatch => {
-                let latch = function.add_block(empty_block());
+                let latch = function.add_block(empty_block(span));
                 let landing = held
                     .into_iter()
                     .map(|ty| function.fresh_value(ty))
@@ -2848,7 +2848,7 @@ impl Context<'_> {
                 (latch, landing)
             }
         };
-        let exit = function.add_block(empty_block());
+        let exit = function.add_block(empty_block(span));
 
         self.seal(
             function,
@@ -3082,8 +3082,8 @@ impl Context<'_> {
             statement.span,
         );
 
-        let body = function.add_block(empty_block());
-        let leaving = function.add_block(empty_block());
+        let body = function.add_block(empty_block(statement.span));
+        let leaving = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3201,7 +3201,7 @@ impl Context<'_> {
                 let leaving = carried_value(&self.scope, held, statement.span)?;
                 back.push(self.coerced(function, table, leaving, held.declared, statement.span));
             }
-            let block = function.add_block(empty_block());
+            let block = function.add_block(empty_block(statement.span));
             self.seal(
                 function,
                 Terminator::Branch {
@@ -3283,8 +3283,8 @@ impl Context<'_> {
         let leaving = match &statement.test {
             Some(test) => {
                 let condition = self.lower_expression(table, function, test)?;
-                let body = function.add_block(empty_block());
-                let leaving = function.add_block(empty_block());
+                let body = function.add_block(empty_block(statement.span));
+                let leaving = function.add_block(empty_block(statement.span));
                 self.seal(
                     function,
                     Terminator::Branch {
@@ -3362,8 +3362,8 @@ impl Context<'_> {
         );
 
         let condition = self.lower_expression(table, function, &statement.test)?;
-        let body = function.add_block(empty_block());
-        let leaving = function.add_block(empty_block());
+        let body = function.add_block(empty_block(statement.span));
+        let leaving = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3645,8 +3645,8 @@ impl Context<'_> {
         let tested = self.tested_fact(&statement.test);
         let before = self.scope.clone();
 
-        let then_entry = function.add_block(empty_block());
-        let else_entry = function.add_block(empty_block());
+        let then_entry = function.add_block(empty_block(statement.span));
+        let else_entry = function.add_block(empty_block(statement.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -3658,7 +3658,7 @@ impl Context<'_> {
             },
         );
 
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(statement.span));
 
         self.current = then_entry;
         self.statements.clear();
@@ -3817,7 +3817,7 @@ impl Context<'_> {
     ) -> Result<Flow, Vec<Diagnostic>> {
         let span = statement_span(body);
         let before = self.scope.clone();
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(span));
         self.enclosing
             .push(Breakable::around(labels, Target::Labelled(join)));
         let flow = self.lower_statement(table, function, body)?;
@@ -3946,11 +3946,11 @@ impl Context<'_> {
         let discriminant = self.lower_expression(table, function, &statement.discriminant)?;
         let before = self.scope.clone();
 
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(statement.span));
         let bodies: Vec<BlockId> = statement
             .cases
             .iter()
-            .map(|_| function.add_block(empty_block()))
+            .map(|_| function.add_block(empty_block(statement.span)))
             .collect();
         let fallback = statement
             .cases
@@ -3976,7 +3976,7 @@ impl Context<'_> {
                 label,
                 case.span,
             )?;
-            let next = function.add_block(empty_block());
+            let next = function.add_block(empty_block(statement.span));
             arrival[position] = Some(self.current);
             self.seal(
                 function,
@@ -3997,7 +3997,7 @@ impl Context<'_> {
         let exhaustive = fallback.is_none()
             && types::exhausted(table, function.type_of(discriminant), &label_types);
         if exhaustive {
-            self.seal(function, Terminator::Unreachable);
+            self.seal(function, Terminator::Unreachable(span_of(statement.span)));
         } else {
             self.seal(
                 function,
@@ -4046,7 +4046,7 @@ impl Context<'_> {
                             "a `case` run into from the one before it has no matching edge of its own",
                         )]);
                     };
-                    let stub = function.add_block(empty_block());
+                    let stub = function.add_block(empty_block(statement.span));
                     retarget(function, tested, bodies[position], stub);
                     let arriving = vec![(stub, before.clone()), fell];
                     self.joined(
@@ -4317,9 +4317,9 @@ impl Context<'_> {
         let condition = self.lower_expression(table, function, &conditional.test)?;
         let tested = self.tested_fact(&conditional.test);
         let before = self.scope.clone();
-        let then_entry = function.add_block(empty_block());
-        let else_entry = function.add_block(empty_block());
-        let join = function.add_block(empty_block());
+        let then_entry = function.add_block(empty_block(conditional.span));
+        let else_entry = function.add_block(empty_block(conditional.span));
+        let join = function.add_block(empty_block(conditional.span));
         self.seal(
             function,
             Terminator::Branch {
@@ -4477,9 +4477,9 @@ impl Context<'_> {
             left
         };
 
-        let right_entry = function.add_block(empty_block());
-        let carry_entry = function.add_block(empty_block());
-        let join = function.add_block(empty_block());
+        let right_entry = function.add_block(empty_block(logical.span));
+        let carry_entry = function.add_block(empty_block(logical.span));
+        let join = function.add_block(empty_block(logical.span));
         let right_on_then = logical.operator != LogicalOperator::Or;
         let (then_block, else_block) = if right_on_then {
             (right_entry, carry_entry)
@@ -4551,7 +4551,7 @@ impl Context<'_> {
                     },
                 );
             }
-            None => self.seal(function, Terminator::Unreachable),
+            None => self.seal(function, Terminator::Unreachable(span_of(logical.span))),
         }
 
         let parameter = function.fresh_value(merged);
@@ -4686,8 +4686,8 @@ impl Context<'_> {
         };
 
         let missing = self.tests_undefined(table, function, read, span);
-        let fallback_entry = function.add_block(empty_block());
-        let kept_entry = function.add_block(empty_block());
+        let fallback_entry = function.add_block(empty_block(span));
+        let kept_entry = function.add_block(empty_block(span));
         self.seal(
             function,
             Terminator::Branch {
@@ -4698,7 +4698,7 @@ impl Context<'_> {
                 else_arguments: Vec::new(),
             },
         );
-        let join = function.add_block(empty_block());
+        let join = function.add_block(empty_block(span));
 
         let before = self.scope.clone();
         self.current = fallback_entry;

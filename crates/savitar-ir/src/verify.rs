@@ -152,7 +152,7 @@ fn jump_mismatch(function: &Function, from: BlockId, block: &Block) -> Option<Ma
             (*then_block, then_arguments.as_slice()),
             (*else_block, else_arguments.as_slice()),
         ],
-        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+        Terminator::Return(_) | Terminator::Unreachable(_) => Vec::new(),
     };
 
     for (to, arguments) in edges {
@@ -240,6 +240,6 @@ fn terminator_uses(terminator: &Terminator) -> Vec<ValueId> {
             used
         }
         Terminator::Return(value) => value.iter().copied().collect(),
-        Terminator::Unreachable => Vec::new(),
+        Terminator::Unreachable(_) => Vec::new(),
     }
 }
