@@ -96,3 +96,102 @@ fn every_export_specifier_is_a_type(declaration: &oxc_ast::ast::ExportFromDeclar
             .iter()
             .all(|specifier| specifier.export_kind == ImportOrExportKind::Type)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use crate::Carries;
+
+    use super::specifiers_of;
+
+    fn what_one_line_carries(text: &str) -> Carries {
+        let found = specifiers_of(Path::new("module.ts"), text);
+        assert_eq!(found.len(), 1, "the line should hold one specifier");
+        found[0].carries
+    }
+
+    #[test]
+    fn an_import_of_values_carries_values() {
+        assert_eq!(
+            what_one_line_carries("import { a, b } from \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn an_import_whose_every_name_is_a_type_carries_types_only() {
+        assert_eq!(
+            what_one_line_carries("import { type A, type B } from \"./c.ts\";\n"),
+            Carries::TypesOnly
+        );
+    }
+
+    #[test]
+    fn a_whole_import_of_types_carries_types_only() {
+        assert_eq!(
+            what_one_line_carries("import type { A } from \"./c.ts\";\n"),
+            Carries::TypesOnly
+        );
+    }
+
+    #[test]
+    fn an_import_mixing_a_type_and_a_value_carries_values() {
+        assert_eq!(
+            what_one_line_carries("import { type A, b } from \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn an_import_mixing_a_value_and_a_type_carries_values_whichever_comes_first() {
+        assert_eq!(
+            what_one_line_carries("import { a, type B } from \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn an_import_mixing_a_type_with_a_default_carries_values() {
+        assert_eq!(
+            what_one_line_carries("import a, { type B } from \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn an_import_with_no_specifier_carries_values_because_running_the_module_is_the_point() {
+        assert_eq!(
+            what_one_line_carries("import \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn a_re_export_mixing_a_type_and_a_value_carries_values() {
+        assert_eq!(
+            what_one_line_carries("export { type A, b } from \"./c.ts\";\n"),
+            Carries::Values
+        );
+    }
+
+    #[test]
+    fn a_re_export_whose_every_name_is_a_type_carries_types_only() {
+        assert_eq!(
+            what_one_line_carries("export { type A, type B } from \"./c.ts\";\n"),
+            Carries::TypesOnly
+        );
+    }
+
+    #[test]
+    fn a_re_export_of_everything_carries_values_unless_it_is_written_as_types() {
+        assert_eq!(
+            what_one_line_carries("export * from \"./c.ts\";\n"),
+            Carries::Values
+        );
+        assert_eq!(
+            what_one_line_carries("export type * from \"./c.ts\";\n"),
+            Carries::TypesOnly
+        );
+    }
+}

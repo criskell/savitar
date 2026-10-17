@@ -12285,6 +12285,35 @@ fn a_module_whose_initializer_is_refused_publishes_not_even_the_function_it_decl
 }
 
 #[test]
+fn an_import_mixing_a_type_and_a_value_still_reads_the_value_as_an_imported_name() {
+    let source = "import { type Shape, port } from \"./config.ts\";\n\nfunction used(): number {\n  return port;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("used", returning(&mut table, number)),
+            ("port", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("server.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0]).iter().any(|read| matches!(
+            read,
+            Rvalue::Imported { specifier, name }
+                if specifier == "./config.ts" && name == "port"
+        )),
+        "a mixed import is an import of values, so the value name is imported and not global; \
+         the reads were {:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
 fn a_re_export_is_refused_because_it_forwards_a_name_the_module_never_binds() {
     let report = walked("export { port } from \"./settings.ts\";\n");
 
