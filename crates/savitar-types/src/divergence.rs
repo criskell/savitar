@@ -27,9 +27,9 @@ pub const INTENTIONAL_DIVERGENCES: &[Divergence] = &[
     },
     Divergence {
         id: "inherited-member-must-fit-the-base",
-        what_tsc_answers: "a derived class may redeclare a member bivariantly, narrowing a field or a method parameter",
-        what_savitar_answers: "the instance shape of the derived class has to be assignable to the instance shape of its base",
-        why_savitar_refuses_to_follow: "a method of the base runs over an instance of the derived class, so a member the derived class narrowed is written through the wider shape the base declares",
+        what_tsc_answers: "a derived class may redeclare a member bivariantly, on the instance side and on the static side, narrowing a field or a method parameter",
+        what_savitar_answers: "the instance shape of the derived class has to be assignable to the instance shape of its base, and every static member the derived class redeclares has to be assignable to the one its base declares",
+        why_savitar_refuses_to_follow: "a method of the base runs over an instance of the derived class and a static method of the base runs over the class object the derived class shares, so a member the derived class narrowed is written through the wider shape the base declares",
     },
 ];
 

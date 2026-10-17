@@ -116,6 +116,26 @@ export class RouteTable {
   }
 }
 
+export abstract class Audit {
+  static readonly channel: string;
+
+  static stamped(at: number): number {
+    return at;
+  }
+}
+
+export class RouteAudit extends Audit {
+  static declare readonly channel: "route";
+
+  static override stamped(at: number): number {
+    return at + 1;
+  }
+
+  static tableFor(mount: string): RouteTable {
+    return new RouteTable(mount);
+  }
+}
+
 export function describe(outcome: Outcome): string {
   switch (outcome.kind) {
     case "ok":
