@@ -13073,3 +13073,60 @@ fn refusing_an_unsound_inheritance_names_the_divergence_it_is_registered_under()
         "inherited-member-must-fit-the-base"
     ));
 }
+
+#[test]
+fn an_array_of_a_narrower_element_is_refused_as_an_argument_for_a_wider_array() {
+    let source = "function call(dogs: Dog[]): number {\n  return helper(dogs);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let dog = table.object(vec![
+        a_slot("name", text, false),
+        a_slot("bark", number, false),
+    ]);
+    let animal = table.object(vec![a_slot("name", text, false)]);
+    let dogs = table.intern(TypeKind::Array(dog));
+    let animals = table.intern(TypeKind::Array(animal));
+    let helper = one_parameter(&mut table, animals);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("dogs", Answer::Known(dogs)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
+}
+
+#[test]
+fn an_array_of_a_narrower_element_is_taken_as_an_argument_for_a_readonly_array() {
+    let source = "function call(dogs: Dog[]): number {\n  return helper(dogs);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let dog = table.object(vec![
+        a_slot("name", text, false),
+        a_slot("bark", number, false),
+    ]);
+    let animal = table.object(vec![a_slot("name", text, false)]);
+    let dogs = table.intern(TypeKind::Array(dog));
+    let animals = table.intern(TypeKind::ReadonlyArray(animal));
+    let helper = one_parameter(&mut table, animals);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("dogs", Answer::Known(dogs)),
+            ("helper", Answer::Known(helper)),
+        ],
+    );
+    let file = SourceFile::new("call.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
