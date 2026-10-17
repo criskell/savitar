@@ -12282,6 +12282,26 @@ fn a_module_publishes_no_name_that_a_statement_it_cannot_lower_writes_to() {
 }
 
 #[test]
+fn a_module_publishes_no_name_that_a_refused_var_declaration_declares_again() {
+    let source = "export function chosen(): number {\n  return 1;\n}\n\nvar chosen = 2;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("chosen", returning(&mut table, number))]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.published.is_empty(),
+        "a refused `var` declaration can rebind the hoisted name, so the name is not \
+         published; the published names were {:?}",
+        report.published
+    );
+}
+
+#[test]
 fn a_module_whose_initializer_is_refused_publishes_not_even_the_function_it_declares() {
     let source =
         "export function chosen(): number {\n  return 1;\n}\n\nexport const port = chosen();\n";

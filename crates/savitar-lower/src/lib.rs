@@ -611,9 +611,7 @@ pub fn lower_in_order(
                 if refused_before.is_none() {
                     refused_before = Some(binds.len());
                 }
-                rebound_by_refused_code.extend(assigned::names_written_through_closures(
-                    std::slice::from_ref(statement),
-                ));
+                rebound_by_refused_code.extend(names_a_refused_statement_could_rebind(statement));
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
             }
         }
@@ -642,6 +640,24 @@ pub fn lower_in_order(
         diagnostics,
         published,
     }
+}
+
+fn names_a_refused_statement_could_rebind(statement: &AstStatement<'_>) -> BTreeSet<String> {
+    let mut found = assigned::names_written_through_closures(std::slice::from_ref(statement));
+    let declares = match statement {
+        AstStatement::VariableDeclaration(declaration) => Some(&**declaration),
+        AstStatement::ExportDeclaration(export) => match &export.declaration {
+            Declaration::VariableDeclaration(declaration) => Some(&**declaration),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(declaration) = declares {
+        for declarator in &declaration.declarations {
+            found.extend(names_bound_by(&declarator.id));
+        }
+    }
+    found
 }
 
 fn names_the_module_publishes(
