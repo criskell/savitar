@@ -395,3 +395,48 @@ fn making_a_closure_over_a_value_that_is_not_defined_is_caught() {
         vec![Malformation::ValueNeverDefined(missing)]
     );
 }
+
+#[test]
+fn base_construction_uses_its_receiver_and_its_arguments() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("Heir.constructor");
+
+    let receiver = function.declare_parameter(number);
+    let given = function.declare_parameter(number);
+    function.add_block(block(
+        vec![Statement::ConstructBase {
+            base_class: "Base".to_string(),
+            object: receiver,
+            arguments: vec![given],
+            span: nowhere(),
+        }],
+        Terminator::Return(None),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}
+
+#[test]
+fn base_construction_with_an_argument_never_defined_is_caught() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("Heir.constructor");
+
+    let receiver = function.declare_parameter(number);
+    let stray = function.fresh_value(number);
+    function.add_block(block(
+        vec![Statement::ConstructBase {
+            base_class: "Base".to_string(),
+            object: receiver,
+            arguments: vec![stray],
+            span: nowhere(),
+        }],
+        Terminator::Return(None),
+    ));
+
+    assert_eq!(
+        verify(&function),
+        vec![Malformation::ValueNeverDefined(stray)]
+    );
+}

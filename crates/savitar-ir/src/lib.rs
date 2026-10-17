@@ -145,6 +145,12 @@ pub enum Statement {
         value: ValueId,
         span: Span,
     },
+    ConstructBase {
+        base_class: String,
+        object: ValueId,
+        arguments: Vec<ValueId>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
