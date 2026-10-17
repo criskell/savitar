@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -113,43 +113,64 @@ fn lower_one(
     ))
 }
 
-fn lower_in_evaluation_order(
+struct LoweredGraph {
+    asked_about: Vec<Option<LowerReport>>,
+    modules_lowered: usize,
+}
+
+fn every_module_in_evaluation_order(graph: &ModuleGraph, order: &Order) -> Vec<ModuleId> {
+    let mut walked = order.evaluated.clone();
+    walked.extend(
+        graph
+            .modules()
+            .map(|(id, _)| id)
+            .filter(|&id| !order.holds(id)),
+    );
+    walked
+}
+
+fn lower_the_whole_graph(
     paths: &[String],
     absolute: &[PathBuf],
     graph: &ModuleGraph,
     order: &Order,
     provider: &dyn TypeProvider,
     table: &mut TypeTable,
-) -> Vec<Option<LowerReport>> {
-    let mut reports: Vec<Option<LowerReport>> = paths.iter().map(|_| None).collect();
+) -> LoweredGraph {
     let of_index: Vec<Option<ModuleId>> = absolute.iter().map(|path| graph.id_of(path)).collect();
     let mut lowered: BTreeSet<ModuleId> = BTreeSet::new();
     let mut published: BTreeSet<ModuleId> = BTreeSet::new();
+    let mut held: BTreeMap<ModuleId, LowerReport> = BTreeMap::new();
 
-    let mut visit: Vec<usize> = (0..paths.len()).collect();
-    visit.sort_by_key(|&index| {
-        of_index[index]
-            .and_then(|id| order.position_of(id))
-            .unwrap_or(usize::MAX)
-    });
-
-    for index in visit {
-        let standing = match of_index[index] {
-            Some(id) => standing_of(graph, order, id, &lowered, &published),
-            None => ModuleStanding::alone(),
-        };
-        let Some(report) = lower_one(&paths[index], provider, table, &standing) else {
+    for id in every_module_in_evaluation_order(graph, order) {
+        let standing = standing_of(graph, order, id, &lowered, &published);
+        let Some(path) = graph.module(id).path.to_str() else {
             continue;
         };
-        if let Some(id) = of_index[index] {
-            lowered.insert(id);
-            if report.publishes_its_names {
-                published.insert(id);
-            }
+        let Some(report) = lower_one(path, provider, table, &standing) else {
+            continue;
+        };
+        lowered.insert(id);
+        if report.publishes_its_names {
+            published.insert(id);
         }
-        reports[index] = Some(report);
+        held.insert(id, report);
     }
-    reports
+
+    let modules_lowered = held.len();
+    let asked_about = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| match of_index[index] {
+            Some(id) => held.remove(&id),
+            None => lower_one(path, provider, table, &ModuleStanding::alone()),
+        })
+        .collect();
+
+    LoweredGraph {
+        asked_about,
+        modules_lowered,
+    }
 }
 
 fn main() -> ExitCode {
@@ -228,7 +249,15 @@ fn main() -> ExitCode {
         );
     }
 
-    let reports = lower_in_evaluation_order(&paths, &absolute, &graph, &order, &api, &mut table);
+    let walked = lower_the_whole_graph(&paths, &absolute, &graph, &order, &api, &mut table);
+    let reports = walked.asked_about;
+    if report_lowering {
+        println!(
+            "savitar: {} module(s) of the graph lowered to check the {} file(s) asked about",
+            walked.modules_lowered,
+            paths.len()
+        );
+    }
 
     for (index, path) in paths.iter().enumerate() {
         let text = match std::fs::read_to_string(path) {

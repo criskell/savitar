@@ -137,29 +137,121 @@ fn the_order_the_arguments_are_given_in_does_not_change_the_verdict() {
 }
 
 #[test]
-fn an_initializer_reading_a_module_this_run_does_not_lower_is_refused() {
+fn asking_only_about_the_dependent_lowers_the_dependency_too_and_is_sound() {
     let Some(bench) = bench() else {
         eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
         return;
     };
-    let root = project("order-unchecked", &a_published_pair());
+    let root = project("order-only-dependent", &a_published_pair());
+    assert!(the_type_checker_accepts(&bench, &root));
 
     let output = check_project(&bench, &root, &["server.ts"]);
     let printed = stdout_of(&output);
 
     assert!(
-        printed.contains("unsupported-import-unchecked"),
-        "a module Savitar did not lower publishes nothing; the output was:\n{printed}"
+        printed.contains("2 module(s) of the graph lowered to check the 1 file(s) asked about"),
+        "the dependency must be lowered even though nobody asked about it; the output was:\n{printed}"
     );
     assert!(
-        printed.contains("server.ts:3:28"),
-        "the refusal must carry file, line and column; the output was:\n{printed}"
+        printed.contains("1 file(s) sound"),
+        "an impeccable dependency must not cost the dependent a refusal; the output was:\n{printed}"
     );
     assert!(
-        printed.contains("no module initializer"),
-        "the refused initializer must not be lowered; the output was:\n{printed}"
+        printed.contains("one module initializer"),
+        "the initializer of the file asked about must be lowered; the output was:\n{printed}"
+    );
+    assert!(
+        !printed.contains("unsupported-import-unchecked"),
+        "nothing is unchecked once the whole graph is lowered; the output was:\n{printed}"
+    );
+    assert!(output.status.success());
+}
+
+#[test]
+fn asking_only_about_the_dependent_still_reports_only_the_file_asked_about() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let root = project("order-only-dependent-report", &a_published_pair());
+
+    let output = check_project(&bench, &root, &["server.ts"]);
+    let printed = stdout_of(&output);
+
+    assert_eq!(
+        printed.matches("one module initializer").count(),
+        1,
+        "lowering the graph must not turn one question into two answers; the output was:\n{printed}"
+    );
+    assert_eq!(
+        printed.matches("bindings typed").count(),
+        1,
+        "type coverage is reported for the file asked about; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn asking_only_about_the_dependent_is_refused_when_the_dependency_cannot_be_read() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let root = project(
+        "order-unreadable-dependency",
+        &[(
+            "server.ts",
+            "import { host, port } from \"./settings.ts\";\n\nexport const endpoint = `${host}:${port}`;\n",
+        )],
+    );
+    std::fs::create_dir_all(root.join("settings.ts"))
+        .expect("a directory standing where the module should be");
+
+    let output = check_project(&bench, &root, &["server.ts"]);
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-import-unchecked")
+            || printed.contains("unsupported-import-order")
+            || printed.contains("unreadable-module"),
+        "a dependency nothing could lower must not be assumed to have published; the output was:\n{printed}"
     );
     assert!(!output.status.success());
+}
+
+#[test]
+fn the_order_of_the_arguments_decides_the_order_of_the_printing() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let root = project(
+        "order-printing",
+        &[
+            (
+                "settings.ts",
+                "export const port = 8080;\n\nexport function* counted(): Generator<number> {\n  yield 1;\n}\n",
+            ),
+            (
+                "server.ts",
+                "import { port } from \"./settings.ts\";\n\nexport const endpoint = `host:${port}`;\n\nexport function* ticks(): Generator<number> {\n  yield port;\n}\n",
+            ),
+        ],
+    );
+    assert!(the_type_checker_accepts(&bench, &root));
+
+    let output = check_project(&bench, &root, &["server.ts", "settings.ts"]);
+    let printed = stdout_of(&output);
+    let server_at = printed
+        .find("server.ts")
+        .expect("the file asked about first should be printed");
+    let settings_at = printed
+        .find("settings.ts")
+        .expect("the file asked about second should be printed");
+
+    assert!(
+        server_at < settings_at,
+        "printing follows the arguments even though the lowering follows the evaluation order; the output was:\n{printed}"
+    );
 }
 
 #[test]
