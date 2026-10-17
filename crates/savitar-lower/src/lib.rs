@@ -475,6 +475,7 @@ struct Context<'a> {
     module_names: &'a ModuleNames,
     standing: &'a ModuleStanding,
     initialising_the_module: bool,
+    declarations_bound_so_far: BTreeSet<String>,
     returns: TypeId,
     scope: Scope,
     statements: Vec<Statement>,
@@ -574,12 +575,14 @@ pub fn lower_in_order(
         module_names: &module_names,
         standing,
     };
-    let mut initializes: Vec<&VariableDeclaration<'_>> = Vec::new();
+    let mut hoisted: Vec<Hoisted> = Vec::new();
+    let mut binds: Vec<Binds<'_>> = Vec::new();
     let mut publishes_its_names = true;
 
     for statement in &parsed.program.body {
         match at_module_level(statement) {
             AtModuleLevel::Lowered(declared) => {
+                note_what_a_declaration_binds(declared, &mut hoisted, &mut binds);
                 for outcome in lower_declared(surroundings, table, declared) {
                     match outcome {
                         Ok(function) => functions.push(function),
@@ -587,7 +590,7 @@ pub fn lower_in_order(
                     }
                 }
             }
-            AtModuleLevel::Initializes(declaration) => initializes.push(declaration),
+            AtModuleLevel::Initializes(declaration) => binds.push(Binds::Variables(declaration)),
             AtModuleLevel::CarriesNoCode => {}
             AtModuleLevel::NotLowered(form) => {
                 publishes_its_names = false;
@@ -597,7 +600,8 @@ pub fn lower_in_order(
     }
 
     let initializer =
-        match lower_module_initializer(surroundings, table, &parsed.program.body, &initializes) {
+        match lower_module_initializer(surroundings, table, &parsed.program.body, &hoisted, &binds)
+        {
             None => None,
             Some(Ok(initializer)) => Some(initializer),
             Some(Err(problems)) => {
@@ -620,6 +624,45 @@ pub fn lower_in_order(
 enum Declared<'a> {
     Standalone(&'a oxc_ast::ast::Function<'a>),
     Class(&'a Class<'a>),
+}
+
+struct Hoisted {
+    name: String,
+    at: oxc_span::Span,
+}
+
+enum Binds<'a> {
+    Variables(&'a VariableDeclaration<'a>),
+    AClass { name: String, at: oxc_span::Span },
+}
+
+fn note_what_a_declaration_binds<'a>(
+    declared: Declared<'a>,
+    hoisted: &mut Vec<Hoisted>,
+    binds: &mut Vec<Binds<'a>>,
+) {
+    match declared {
+        Declared::Standalone(declaration) => {
+            if let Some(id) = declaration.id.as_ref()
+                && declaration.body.is_some()
+            {
+                hoisted.push(Hoisted {
+                    name: id.name.to_string(),
+                    at: id.span,
+                });
+            }
+        }
+        Declared::Class(class) => {
+            if let Some(id) = class.id.as_ref()
+                && !class.declare
+            {
+                binds.push(Binds::AClass {
+                    name: id.name.to_string(),
+                    at: id.span,
+                });
+            }
+        }
+    }
 }
 
 enum AtModuleLevel<'a> {
@@ -747,9 +790,10 @@ fn lower_module_initializer(
     surroundings: Surroundings<'_>,
     table: &mut TypeTable,
     body: &[AstStatement<'_>],
-    initializes: &[&VariableDeclaration<'_>],
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
 ) -> Option<Result<ModuleInitializer, Vec<Diagnostic>>> {
-    if initializes.is_empty() {
+    if hoisted.is_empty() && binds.is_empty() {
         return None;
     }
     let written = assigned::names_written_through_closures(body);
@@ -757,15 +801,28 @@ fn lower_module_initializer(
         surroundings,
         table,
         &written,
-        initializes,
+        hoisted,
+        binds,
     ))
+}
+
+fn where_the_module_starts_binding(hoisted: &[Hoisted], binds: &[Binds<'_>]) -> oxc_span::Span {
+    let from_a_declaration = hoisted.first().map(|one| one.at);
+    let from_the_body = binds.first().map(|one| match one {
+        Binds::Variables(declaration) => declaration.span,
+        Binds::AClass { at, .. } => *at,
+    });
+    from_a_declaration
+        .or(from_the_body)
+        .unwrap_or_else(|| oxc_span::Span::new(0, 0))
 }
 
 fn build_module_initializer<'a>(
     surroundings: Surroundings<'a>,
     table: &mut TypeTable,
     written_names: &'a BTreeSet<String>,
-    initializes: &[&VariableDeclaration<'_>],
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
 ) -> Result<ModuleInitializer, Vec<Diagnostic>> {
     let mut function = Function::new(format!("{}@module", surroundings.file.name()));
     let entry = function.add_block(empty_block());
@@ -776,6 +833,7 @@ fn build_module_initializer<'a>(
         module_names: surroundings.module_names,
         standing: surroundings.standing,
         initialising_the_module: true,
+        declarations_bound_so_far: BTreeSet::new(),
         returns: void,
         scope: Scope::new(),
         statements: Vec::new(),
@@ -789,25 +847,43 @@ fn build_module_initializer<'a>(
         closures: 0,
     };
 
-    for declaration in initializes {
-        let widening = declaration.kind != VariableDeclarationKind::Const;
-        for declarator in &declaration.declarations {
-            if declarator.init.is_none() {
-                return Err(vec![refuse(
-                    "unsupported-module-statement",
-                    declarator.span,
-                    "a module-level declaration with no initialiser is not lowered yet, because the module initializer would leave the name unbound",
-                )]);
-            }
-            context.lower_declarator(table, &mut function, declarator, widening)?;
-            for name in names_bound_by(&declarator.id) {
-                let held = context.bound(&name, declarator.id.span())?;
-                let value = held.value_or_refuse(&name, declarator.span)?;
-                context.statements.push(Statement::BindModule {
-                    name,
-                    value,
-                    span: span_of(declarator.span),
+    for one in hoisted {
+        context.statements.push(Statement::BindDeclared {
+            name: one.name.clone(),
+            span: span_of(one.at),
+        });
+    }
+
+    for binding in binds {
+        match binding {
+            Binds::AClass { name, at } => {
+                context.statements.push(Statement::BindDeclared {
+                    name: name.clone(),
+                    span: span_of(*at),
                 });
+                context.declarations_bound_so_far.insert(name.clone());
+            }
+            Binds::Variables(declaration) => {
+                let widening = declaration.kind != VariableDeclarationKind::Const;
+                for declarator in &declaration.declarations {
+                    if declarator.init.is_none() {
+                        return Err(vec![refuse(
+                            "unsupported-module-statement",
+                            declarator.span,
+                            "a module-level declaration with no initialiser is not lowered yet, because the module initializer would leave the name unbound",
+                        )]);
+                    }
+                    context.lower_declarator(table, &mut function, declarator, widening)?;
+                    for name in names_bound_by(&declarator.id) {
+                        let held = context.bound(&name, declarator.id.span())?;
+                        let value = held.value_or_refuse(&name, declarator.span)?;
+                        context.statements.push(Statement::BindModule {
+                            name,
+                            value,
+                            span: span_of(declarator.span),
+                        });
+                    }
+                }
             }
         }
     }
@@ -828,7 +904,7 @@ fn build_module_initializer<'a>(
     if !malformations.is_empty() {
         return Err(vec![refuse(
             "malformed-ir",
-            initializes[0].span,
+            where_the_module_starts_binding(hoisted, binds),
             format!("lowering produced invalid code: {malformations:?}"),
         )]);
     }
@@ -1212,6 +1288,7 @@ fn lower_function<'a>(
         module_names: surroundings.module_names,
         standing: surroundings.standing,
         initialising_the_module: false,
+        declarations_bound_so_far: BTreeSet::new(),
         returns: table.intern(TypeKind::Unknown),
         scope: Scope::new(),
         statements: Vec::new(),
@@ -4091,7 +4168,9 @@ impl Context<'_> {
         if let Some(held) = self.module_names.get(name) {
             let what = match held {
                 ModuleName::BoundByTheInitializer => "bound by the initializer of this module",
-                ModuleName::Declared => "declared at the top of this module",
+                ModuleName::AHoistedFunction
+                | ModuleName::AClassBoundWhereDeclared
+                | ModuleName::DeclaredWithNoCodeBehindIt => "declared at the top of this module",
                 ModuleName::Imported { .. } | ModuleName::AWholeModule { .. } => {
                     "imported from another module"
                 }
@@ -4843,9 +4922,34 @@ impl Context<'_> {
                             ),
                         )]);
                     }
-                    Some(ModuleName::BoundByTheInitializer | ModuleName::Declared) => {
-                        Rvalue::ModuleBinding(id.name.to_string())
+                    Some(ModuleName::AClassBoundWhereDeclared)
+                        if self.initialising_the_module
+                            && !self.declarations_bound_so_far.contains(id.name.as_str()) =>
+                    {
+                        return Err(vec![refuse(
+                            "unsupported-reference",
+                            id.span,
+                            format!(
+                                "`{}` names a class this module declares further down, and a class binds where it is declared and not before",
+                                id.name
+                            ),
+                        )]);
                     }
+                    Some(ModuleName::DeclaredWithNoCodeBehindIt) => {
+                        return Err(vec![refuse(
+                            "unsupported-ambient-name",
+                            id.span,
+                            format!(
+                                "`{}` is declared without code behind it, so nothing this module emits binds the name",
+                                id.name
+                            ),
+                        )]);
+                    }
+                    Some(
+                        ModuleName::BoundByTheInitializer
+                        | ModuleName::AHoistedFunction
+                        | ModuleName::AClassBoundWhereDeclared,
+                    ) => Rvalue::ModuleBinding(id.name.to_string()),
                     Some(ModuleName::AWholeModule { specifier }) => {
                         return Err(vec![refuse(
                             "unsupported-import",

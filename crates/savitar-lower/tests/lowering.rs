@@ -12241,3 +12241,238 @@ fn a_closure_the_initializer_declares_reads_an_imported_name_at_the_call_and_not
         "{read_by_a_closure:?}"
     );
 }
+
+fn every_binding(initializer: &savitar_lower::ModuleInitializer) -> Vec<String> {
+    initializer
+        .function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::BindModule { name, .. } | Statement::BindDeclared { name, .. } => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn declared_bindings(initializer: &savitar_lower::ModuleInitializer) -> Vec<String> {
+    initializer
+        .function
+        .blocks()
+        .flat_map(|(_, block)| block.statements.iter())
+        .filter_map(|statement| match statement {
+            Statement::BindDeclared { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_module_function_declaration_binds_its_name_in_the_initializer() {
+    let report = walked("export function handle(): void {\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("a declaration alone should give the module an initializer");
+    assert_eq!(verify(&initializer.function), vec![]);
+    assert_eq!(declared_bindings(initializer), vec!["handle".to_string()]);
+}
+
+#[test]
+fn a_module_class_declaration_binds_its_name_in_the_initializer() {
+    let report = walked("export class Window {\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("a class alone should give the module an initializer");
+    assert_eq!(declared_bindings(initializer), vec!["Window".to_string()]);
+}
+
+#[test]
+fn a_function_declaration_binds_before_every_variable_because_it_hoists() {
+    let report = walked("const limit = 8;\n\nfunction raise(): void {\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(
+        every_binding(initializer),
+        vec!["raise".to_string(), "limit".to_string()]
+    );
+}
+
+#[test]
+fn a_class_declaration_binds_where_it_is_declared_and_not_before() {
+    let report = walked("const limit = 8;\n\nclass Window {\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(
+        every_binding(initializer),
+        vec!["limit".to_string(), "Window".to_string()]
+    );
+}
+
+#[test]
+fn the_initializer_reads_a_function_declared_after_it_because_a_function_hoists() {
+    let source = "const chosen = pick;\n\nfunction pick(): void {\n}\n";
+    let mut table = TypeTable::new();
+    let void = table.intern(TypeKind::Void);
+    let provider = ByName::new(source, vec![("pick", returning(&mut table, void))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert!(
+        reads_of(&initializer.function)
+            .iter()
+            .any(|read| matches!(read, Rvalue::ModuleBinding(name) if name == "pick")),
+        "{:?}",
+        reads_of(&initializer.function)
+    );
+}
+
+#[test]
+fn the_initializer_reading_a_class_declared_after_it_is_refused_because_a_class_does_not_hoist() {
+    let report = walked("const made = Window;\n\nclass Window {\n}\n");
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-reference");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("a class binds where it is declared and not before"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = report.diagnostics[0].span;
+    assert_eq!(
+        SourceFile::new("module.ts", "const made = Window;\n\nclass Window {\n}\n")
+            .line_col(at.start)
+            .line,
+        1
+    );
+}
+
+#[test]
+fn the_initializer_reading_a_class_declared_before_it_lowers() {
+    let source = "class Window {\n}\n\nconst made = Window;\n";
+    let mut table = TypeTable::new();
+    let empty = table.intern(TypeKind::Object {
+        fields: Vec::new(),
+        indexes: Vec::new(),
+    });
+    let form = table.function(Vec::new(), empty);
+    let constructs = table.constructor(vec![form]);
+    let provider = ByName::new(source, vec![("Window", Answer::Known(constructs))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(verify(&initializer.function), vec![]);
+    assert_eq!(
+        every_binding(initializer),
+        vec!["Window".to_string(), "made".to_string()]
+    );
+}
+
+#[test]
+fn a_function_body_reads_a_class_the_module_declares_after_it() {
+    let source =
+        "export function make(): Window {\n  return new Window();\n}\n\nexport class Window {\n}\n";
+    let mut table = TypeTable::new();
+    let empty = table.intern(TypeKind::Object {
+        fields: Vec::new(),
+        indexes: Vec::new(),
+    });
+    let form = table.function(Vec::new(), empty);
+    let constructs = table.constructor(vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("make", returning(&mut table, empty)),
+            ("Window", Answer::Known(constructs)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(
+        reads_of(&report.functions[0])
+            .iter()
+            .any(|read| matches!(read, Rvalue::ModuleBinding(name) if name == "Window")),
+        "{:?}",
+        reads_of(&report.functions[0])
+    );
+}
+
+#[test]
+fn reading_a_name_declared_with_no_code_behind_it_is_refused_by_name() {
+    let source = "declare function clock(): number;\n\nconst now = clock;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("clock", returning(&mut table, number))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.initializer.is_none());
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-ambient-name");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("declared without code behind it"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_overload_signature_does_not_stop_the_implementation_from_binding_the_name() {
+    let source = "function pick(): void;\nfunction pick(): void {\n}\n\nconst chosen = pick;\n";
+    let mut table = TypeTable::new();
+    let void = table.intern(TypeKind::Void);
+    let provider = ByName::new(source, vec![("pick", returning(&mut table, void))]);
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let initializer = report
+        .initializer
+        .as_ref()
+        .expect("the module should have an initializer");
+    assert_eq!(declared_bindings(initializer), vec!["pick".to_string()]);
+}
+
+#[test]
+fn an_interface_alone_still_binds_no_name_and_needs_no_initializer() {
+    let report = walked("export interface Shape {\n  size: number;\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(report.initializer.is_none());
+}

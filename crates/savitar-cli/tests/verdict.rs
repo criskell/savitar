@@ -281,13 +281,31 @@ fn a_module_initializer_is_reported_only_when_ir_is_asked_for() {
         "test-files/graph",
         "shared.ts",
     ));
-    let plain = stdout_of(&check(&bench.root, &bench.provider, &["--ir"], "lowers.ts"));
+    let plain = stdout_of(&check(
+        &bench.root,
+        &bench.provider,
+        &["--ir"],
+        "declares.ts",
+    ));
     assert!(
         shared.contains("one module initializer"),
         "a module with top-level code has an initializer; the output was:\n{shared}"
     );
     assert!(
         plain.contains("no module initializer"),
-        "a module with no top-level code has none; the output was:\n{plain}"
+        "a module that binds no name has none; the output was:\n{plain}"
+    );
+}
+
+#[test]
+fn a_module_whose_only_top_level_code_is_a_declaration_still_has_an_initializer() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let printed = stdout_of(&check(&bench.root, &bench.provider, &["--ir"], "lowers.ts"));
+    assert!(
+        printed.contains("one module initializer"),
+        "a function declaration binds a name, so something has to bind it; the output was:\n{printed}"
     );
 }
