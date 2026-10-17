@@ -42,6 +42,50 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+const STRICT_TSCONFIG: &str = r#"{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noImplicitOverride": true,
+    "target": "es2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "noEmit": true
+  },
+  "include": ["."]
+}
+"#;
+
+fn laid_out(name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("the project directory should be creatable");
+    std::fs::write(root.join("tsconfig.json"), STRICT_TSCONFIG)
+        .expect("the tsconfig should be writable");
+    for (path, text) in files {
+        let at = root.join(path);
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent).expect("the parent directory should be creatable");
+        }
+        std::fs::write(&at, text).expect("the file should be writable");
+    }
+    root.canonicalize()
+        .expect("the project root should resolve")
+}
+
+fn check_laid_out(project: &Path, provider: &Path, entry: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_savitar"))
+        .arg("check")
+        .arg(project.join(entry))
+        .env("SAVITAR_TYPE_PROVIDER", provider)
+        .current_dir(project)
+        .output()
+        .expect("the command line should run")
+}
+
 struct Bench {
     root: PathBuf,
     provider: PathBuf,
@@ -307,5 +351,135 @@ fn a_module_whose_only_top_level_code_is_a_declaration_still_has_an_initializer(
     assert!(
         printed.contains("one module initializer"),
         "a function declaration binds a name, so something has to bind it; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn a_handler_that_imports_a_real_installed_package_is_not_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let project = laid_out(
+        "declared-boundary-package",
+        &[
+            (
+                "package.json",
+                "{ \"name\": \"service\", \"version\": \"1.0.0\", \"private\": true, \"type\": \"module\", \"dependencies\": { \"shipping\": \"2.0.0\" } }\n",
+            ),
+            (
+                "node_modules/shipping/package.json",
+                "{ \"name\": \"shipping\", \"version\": \"2.0.0\", \"types\": \"index.d.ts\", \"main\": \"index.js\" }\n",
+            ),
+            (
+                "node_modules/shipping/index.d.ts",
+                "export declare function quote(weight: number): number;\n",
+            ),
+            (
+                "node_modules/shipping/index.js",
+                "export function quote(weight) {\n  return weight;\n}\n",
+            ),
+            (
+                "handler.ts",
+                "import { quote } from \"shipping\";\n\nexport function priceOf(weight: number): number {\n  return quote(weight);\n}\n",
+            ),
+        ],
+    );
+
+    let output = check_laid_out(&project, &bench.provider, "handler.ts");
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-declared-boundary"),
+        "the declared boundary must be refused by name; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("handler.ts:1:23"),
+        "the refusal must carry file, line and column; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("not sound"),
+        "nothing behind the boundary is checked, so the verdict cannot be sound; the output was:\n{printed}"
+    );
+    assert!(
+        !output.status.success(),
+        "a declared boundary rejects, so the run must fail; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn a_handler_that_imports_a_hand_written_declaration_file_is_not_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let project = laid_out(
+        "declared-boundary-shim",
+        &[
+            (
+                "package.json",
+                "{ \"name\": \"service\", \"version\": \"1.0.0\", \"private\": true, \"type\": \"module\" }\n",
+            ),
+            ("env.d.ts", "export declare function readPort(): number;\n"),
+            (
+                "handler.ts",
+                "import { readPort } from \"./env.js\";\n\nexport function portOf(): number {\n  return readPort();\n}\n",
+            ),
+        ],
+    );
+
+    let output = check_laid_out(&project, &bench.provider, "handler.ts");
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-declared-boundary"),
+        "a relative import that lands on a declaration file is the same boundary; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("env.d.ts"),
+        "the refusal must name the declaration file it resolved to; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("not sound"),
+        "the verdict cannot be sound; the output was:\n{printed}"
+    );
+    assert!(
+        !output.status.success(),
+        "a declared boundary rejects, so the run must fail; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn a_declaration_file_given_to_the_command_is_not_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let project = laid_out(
+        "declared-boundary-alone",
+        &[(
+            "surface.d.ts",
+            "export declare function go(n: number): number;\nexport declare class Holder {\n  size: number;\n}\n",
+        )],
+    );
+
+    let output = check_laid_out(&project, &bench.provider, "surface.d.ts");
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-ambient-declaration"),
+        "a file that is nothing but declarations proves nothing; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("surface.d.ts:1:1"),
+        "the refusal must carry file, line and column; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("not sound"),
+        "a file where nothing was proved cannot be announced as sound; the output was:\n{printed}"
+    );
+    assert!(
+        !output.status.success(),
+        "the run must fail; the output was:\n{printed}"
     );
 }
