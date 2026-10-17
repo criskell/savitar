@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration, Expression,
-    ForStatementInit, ForStatementLeft, FunctionBody, MethodDefinition, MethodDefinitionKind,
-    ObjectPropertyKind, PropertyKey, SimpleAssignmentTarget, Statement as AstStatement,
-    VariableDeclarator,
+    Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration,
+    ExportDefaultDeclarationKind, Expression, ForStatementInit, ForStatementLeft, FunctionBody,
+    MethodDefinition, MethodDefinitionKind, ObjectPropertyKind, PropertyKey,
+    SimpleAssignmentTarget, Statement as AstStatement, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -440,6 +440,13 @@ fn declared_at_module_level<'a>(statement: &'a AstStatement<'a>) -> Option<Decla
             Declaration::ClassDeclaration(class) => Some(Declared::Class(class)),
             _ => None,
         },
+        AstStatement::ExportDefaultDeclaration(export) => match &export.declaration {
+            ExportDefaultDeclarationKind::FunctionDeclaration(declaration) => {
+                Some(Declared::Standalone(declaration))
+            }
+            ExportDefaultDeclarationKind::ClassDeclaration(class) => Some(Declared::Class(class)),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -629,7 +636,7 @@ fn lower_function(
         return Err(vec![refuse(
             "unsupported-function",
             declaration.span,
-            "a function with no name is not lowered yet, because its signature is asked for by name",
+            "a function with no name is not lowered yet, because its signature is asked for by name and no position of it answers one",
         )]);
     }
 

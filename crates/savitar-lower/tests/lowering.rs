@@ -9575,4 +9575,86 @@ fn a_class_with_no_name_is_refused_because_its_shape_is_asked_for_by_name() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class");
+}
+
+#[test]
+fn a_default_exported_function_with_a_name_lowers_like_any_other() {
+    let source = "export default function handle(at: number): number {\n  return at;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("handle", returning(&mut table, number)),
+            ("at", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("handle.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    assert_eq!(report.functions[0].name(), "handle");
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn a_default_exported_function_with_no_name_is_refused_rather_than_skipped() {
+    let source = "export default function (at: number): number {\n  return at;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("at", Answer::Known(number))]);
+    let file = SourceFile::new("nameless.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-function");
+    assert!(
+        report.diagnostics[0].message.contains("no name"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (1, 16));
+}
+
+#[test]
+fn a_default_exported_class_with_a_name_has_its_members_reached() {
+    let source =
+        "export default class Counter {\n  reading(): number {\n    return this.held;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("reading", returning(&mut table, number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    assert_eq!(report.functions[0].name(), "Counter.reading");
+}
+
+#[test]
+fn a_default_exported_arrow_function_stays_the_refusal_it_already_was() {
+    let source = "export default (at: number): number => at;\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("arrow.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 }

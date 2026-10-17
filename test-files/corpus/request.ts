@@ -37,3 +37,10 @@ export function windowSize(total: number, limit: number = 50): number {
 export function backoff(attempt: number, base: number = 100): number {
   return base * attempt;
 }
+
+export default function handle(request: Request): Response {
+  if (isWrite(request)) {
+    return { status: 201, body: request.body };
+  }
+  return notFound(request.path);
+}
