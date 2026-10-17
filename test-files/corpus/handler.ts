@@ -30,6 +30,45 @@ export class Logger extends Middleware {
   }
 }
 
+export abstract class Transport {
+  protected readonly timeoutMillis: number;
+
+  constructor(timeoutMillis: number) {
+    this.timeoutMillis = timeoutMillis;
+  }
+
+  budget(): number {
+    return this.timeoutMillis;
+  }
+}
+
+export class HttpTransport extends Transport {
+  private readonly origin: string;
+
+  constructor(origin: string, timeoutMillis: number) {
+    super(timeoutMillis);
+    this.origin = origin;
+  }
+
+  target(path: string): string {
+    return `${this.origin}${path}`;
+  }
+}
+
+export class RetryingTransport extends Transport {
+  private attempts: number;
+
+  constructor(timeoutMillis: number, attempts: number) {
+    super(timeoutMillis);
+    this.attempts = attempts;
+  }
+
+  nextDelay(): number {
+    this.attempts = this.attempts + 1;
+    return this.budget() * this.attempts;
+  }
+}
+
 export class RouteTable {
   private readonly mount: string;
   private hits: number;

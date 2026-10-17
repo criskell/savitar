@@ -500,17 +500,16 @@ pub enum SlotRefusal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Writing {
+pub enum Writing<'a> {
     Plainly,
-    WhileConstructing,
-    WhileConstructingAnHeir,
+    WhileConstructing { inherited: &'a [String] },
 }
 
 pub fn field_slots(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
-    writing: Writing,
+    writing: Writing<'_>,
 ) -> Result<Vec<TypeId>, SlotRefusal> {
     let TypeKind::Union(members) = table.kind(object).clone() else {
         return field_slot(table, object, name, writing).map(|slot| vec![slot]);
@@ -543,9 +542,9 @@ pub fn field_slot(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
-    writing: Writing,
+    writing: Writing<'_>,
 ) -> Result<TypeId, SlotRefusal> {
-    let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
+    let TypeKind::Object { fields, indexes } = table.kind(object).clone() else {
         return Err(SlotRefusal::Shapeless(format!(
             "`{name}` is written on something with no declared shape"
         )));
@@ -558,24 +557,42 @@ pub fn field_slot(
         }
         if field.readonly {
             match writing {
-                Writing::WhileConstructing => {}
+                Writing::WhileConstructing { inherited } if !inherited.contains(&field.name) => {}
+                Writing::WhileConstructing { .. } => {
+                    return Err(SlotRefusal::Declined(format!(
+                        "`{name}` is declared readonly by a base class, and only the constructor of the class that declares it may write it"
+                    )));
+                }
                 Writing::Plainly => {
                     return Err(SlotRefusal::Declined(format!(
                         "`{name}` is declared readonly and admits no write outside the constructor of its class"
-                    )));
-                }
-                Writing::WhileConstructingAnHeir => {
-                    return Err(SlotRefusal::Declined(format!(
-                        "`{name}` is declared readonly, and the shape of a derived class does not say which class declares it"
                     )));
                 }
             }
         }
         return Ok(field.type_id);
     }
-    Err(SlotRefusal::Declined(format!(
-        "the shape declares no field `{name}`"
-    )))
+    index_slot(table, &indexes, name)
+}
+
+fn index_slot(
+    table: &mut TypeTable,
+    indexes: &[IndexSignature],
+    name: &str,
+) -> Result<TypeId, SlotRefusal> {
+    let key = table.intern(TypeKind::StringLiteral(name.to_string()));
+    let matched = indexes
+        .iter()
+        .find(|signature| signature.key == key || key_accepts(table, signature.key, key));
+    match matched {
+        Some(signature) if signature.readonly => Err(SlotRefusal::Declined(format!(
+            "`{name}` falls under a readonly index signature, which admits no write"
+        ))),
+        Some(signature) => Ok(signature.value),
+        None => Err(SlotRefusal::Declined(format!(
+            "the shape declares no field `{name}`"
+        ))),
+    }
 }
 
 pub fn element_slot(table: &mut TypeTable, array: TypeId, index: TypeId) -> Result<TypeId, String> {
@@ -845,6 +862,30 @@ pub fn constructible_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<T
     }
 }
 
+pub fn fields_of_what_is_constructed(
+    table: &TypeTable,
+    forms: &[TypeId],
+) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for &form in forms {
+        let TypeKind::Function { returns, .. } = table.kind(form) else {
+            return Err("a construct signature the provider gives no parameters for".to_string());
+        };
+        let TypeKind::Object { fields, .. } = table.kind(*returns) else {
+            return Err(
+                "a construct signature whose instance has no declared shape, so which fields it declares is unknown"
+                    .to_string(),
+            );
+        };
+        for field in fields {
+            if !names.contains(&field.name) {
+                names.push(field.name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
 pub fn fits_call_with(
     table: &mut TypeTable,
     form: TypeId,
@@ -901,14 +942,17 @@ pub fn fits_call_with(
 }
 
 pub fn argument_types(
-    table: &TypeTable,
+    table: &mut TypeTable,
     callee: TypeId,
     given: usize,
 ) -> Result<Vec<TypeId>, String> {
-    let TypeKind::Function { parameters, .. } = table.kind(callee) else {
+    let TypeKind::Function { parameters, .. } = table.kind(callee).clone() else {
         return Err("this value is not callable".to_string());
     };
-    let rest = parameters.last().filter(|parameter| parameter.rest);
+    let rest = parameters
+        .last()
+        .filter(|parameter| parameter.rest)
+        .cloned();
     let fixed = parameters.len() - usize::from(rest.is_some());
     if given < fixed {
         let left_out = parameters[given..fixed]
@@ -927,20 +971,27 @@ pub fn argument_types(
         return Ok(parameters
             .iter()
             .take(given)
-            .map(|parameter| parameter.type_id)
+            .map(|parameter| slot_of_parameter(table, parameter))
             .collect());
     };
-    let (TypeKind::Array(element) | TypeKind::ReadonlyArray(element)) = table.kind(rest.type_id)
+    let (TypeKind::Array(element) | TypeKind::ReadonlyArray(element)) = *table.kind(rest.type_id)
     else {
         return Err("a rest parameter whose type is not an array is not lowered yet".to_string());
     };
     let mut wanted: Vec<TypeId> = parameters
         .iter()
         .take(fixed)
-        .map(|parameter| parameter.type_id)
+        .map(|parameter| slot_of_parameter(table, parameter))
         .collect();
-    wanted.resize(given, *element);
+    wanted.resize(given, element);
     Ok(wanted)
+}
+
+fn slot_of_parameter(table: &mut TypeTable, parameter: &savitar_types::Parameter) -> TypeId {
+    if parameter.optional {
+        return table.optional(parameter.type_id);
+    }
+    parameter.type_id
 }
 
 pub fn widen(table: &mut TypeTable, id: TypeId) -> TypeId {

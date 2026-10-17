@@ -438,6 +438,7 @@ enum Written<'target, 'source> {
     Value(&'target Expression<'source>),
     Combined(BinaryOp, &'target Expression<'source>),
     Stepped(BinaryOp),
+    Held(ValueId),
 }
 
 const THIS: &str = "this";
@@ -465,7 +466,7 @@ struct Context<'a> {
     current: BlockId,
     enclosing: Vec<Breakable>,
     shadowed: Vec<Key>,
-    constructing: Option<(ValueId, types::Writing)>,
+    constructing: Option<Constructing>,
     written_names: &'a BTreeSet<String>,
     capturing: Option<Capturing<'a>>,
     nested: Vec<Function>,
@@ -680,6 +681,22 @@ fn lower_class(
             "a class with no name is not lowered yet, because its shape is asked for by name",
         )])];
     };
+    let base = match class.heritage.as_ref() {
+        None => None,
+        Some(heritage) => match &heritage.expression {
+            Expression::Identifier(named) => Some(BaseClass {
+                name: named.name.as_str(),
+                at: named.span,
+            }),
+            other => {
+                return vec![Err(vec![refuse(
+                    "unsupported-class",
+                    expression_span(other),
+                    "a base class that is not a name is not lowered yet, because the base construction is named in the code Savitar emits",
+                )])];
+            }
+        },
+    };
     let mut outcomes = Vec::new();
     for element in &class.body.body {
         match element {
@@ -690,7 +707,7 @@ fn lower_class(
                     table,
                     id.name.as_str(),
                     id.span,
-                    class.heritage.is_some(),
+                    base,
                     method,
                 ));
             }
@@ -719,14 +736,14 @@ fn lower_class(
     outcomes
 }
 
-fn lower_method(
+fn lower_method<'a>(
     file: &SourceFile,
     provider: &dyn TypeProvider,
     table: &mut TypeTable,
     class: &str,
     class_at: oxc_span::Span,
-    inherits: bool,
-    method: &MethodDefinition<'_>,
+    base: Option<BaseClass<'a>>,
+    method: &'a MethodDefinition<'a>,
 ) -> Vec<Outcome> {
     let Some(body) = method.value.body.as_ref() else {
         return Vec::new();
@@ -761,7 +778,7 @@ fn lower_method(
             Signature::AtTheName(member.span)
         },
         receiver: match (constructing, method.r#static) {
-            (true, _) => Receiver::UnderConstruction { class_at, inherits },
+            (true, _) => Receiver::UnderConstruction { class_at, base },
             (false, true) => Receiver::Detached,
             (false, false) => Receiver::Instance(class_at),
         },
@@ -775,16 +792,22 @@ fn lower_method(
 }
 
 #[derive(Clone, Copy)]
-enum Receiver {
+struct BaseClass<'a> {
+    name: &'a str,
+    at: oxc_span::Span,
+}
+
+#[derive(Clone, Copy)]
+enum Receiver<'a> {
     Detached,
     Instance(oxc_span::Span),
     UnderConstruction {
         class_at: oxc_span::Span,
-        inherits: bool,
+        base: Option<BaseClass<'a>>,
     },
 }
 
-impl Receiver {
+impl<'a> Receiver<'a> {
     const fn shape_at(self) -> Option<oxc_span::Span> {
         match self {
             Self::Detached => None,
@@ -792,17 +815,28 @@ impl Receiver {
         }
     }
 
-    const fn constructs(self) -> Option<types::Writing> {
+    const fn constructs(self) -> bool {
+        matches!(self, Self::UnderConstruction { .. })
+    }
+
+    const fn base(self) -> Option<BaseClass<'a>> {
         match self {
             Self::Detached | Self::Instance(_) => None,
-            Self::UnderConstruction { inherits: true, .. } => {
-                Some(types::Writing::WhileConstructingAnHeir)
-            }
-            Self::UnderConstruction {
-                inherits: false, ..
-            } => Some(types::Writing::WhileConstructing),
+            Self::UnderConstruction { base, .. } => base,
         }
     }
+}
+
+struct Constructing {
+    receiver: ValueId,
+    inherited: Vec<String>,
+    base: Option<ConstructedBase>,
+}
+
+struct ConstructedBase {
+    name: String,
+    forms: Vec<TypeId>,
+    standing: bool,
 }
 
 enum Signature {
@@ -876,7 +910,7 @@ impl Body<'_> {
 struct Lowering<'a> {
     name: String,
     signature: Signature,
-    receiver: Receiver,
+    receiver: Receiver<'a>,
     code: Code<'a>,
     body: Body<'a>,
 }
@@ -938,7 +972,7 @@ fn lower_function<'a>(
         )]);
     }
     if matches!(lowering.signature, Signature::NoPositionAnswersOne)
-        && lowering.receiver.constructs().is_none()
+        && !lowering.receiver.constructs()
     {
         return Err(vec![refuse(
             "unsupported-function",
@@ -976,10 +1010,30 @@ fn lower_function<'a>(
         }
         let held = function.declare_parameter(shape);
         context.declare(THIS, Binding::written(held, shape));
-        context.constructing = lowering
-            .receiver
-            .constructs()
-            .map(|writing| (held, writing));
+        if lowering.receiver.constructs() {
+            let mut inherited = Vec::new();
+            let mut base = None;
+            if let Some(declared_base) = lowering.receiver.base() {
+                let constructor = context.type_at(table, declared_base.at)?;
+                let forms = types::constructible_forms(table, constructor).map_err(|reason| {
+                    vec![refuse("unsupported-class-member", declared_base.at, reason)]
+                })?;
+                inherited =
+                    types::fields_of_what_is_constructed(table, &forms).map_err(|reason| {
+                        vec![refuse("unsupported-class-member", declared_base.at, reason)]
+                    })?;
+                base = Some(ConstructedBase {
+                    name: declared_base.name.to_string(),
+                    forms,
+                    standing: false,
+                });
+            }
+            context.constructing = Some(Constructing {
+                receiver: held,
+                inherited,
+                base,
+            });
+        }
     }
 
     let signature = match lowering.signature {
@@ -1048,6 +1102,23 @@ fn lower_function<'a>(
         context.bind_pattern(table, &mut function, pattern, value)?;
     }
 
+    if lowering.receiver.base().is_some() {
+        let begins_with_super = match body {
+            Body::Statements(statements) => statements
+                .statements
+                .first()
+                .is_some_and(statement_is_a_base_construction),
+            Body::OneExpression(_) => false,
+        };
+        if !begins_with_super {
+            return Err(vec![refuse(
+                "unsupported-class-member",
+                body.span(),
+                "the constructor of a derived class is lowered only when `super()` is its first statement, because Savitar cannot yet prove that an earlier statement reads no field the base constructor writes",
+            )]);
+        }
+    }
+
     let flow = match body {
         Body::Statements(statements) => {
             context.lower_statements(table, &mut function, &statements.statements)?
@@ -1083,6 +1154,25 @@ fn lower_function<'a>(
             .map(|capturing| capturing.taken)
             .unwrap_or_default(),
     })
+}
+
+fn statement_is_a_base_construction(statement: &AstStatement<'_>) -> bool {
+    let AstStatement::ExpressionStatement(held) = statement else {
+        return false;
+    };
+    base_construction_call(&held.expression).is_some()
+}
+
+fn base_construction_call<'a, 'source>(
+    expression: &'a Expression<'source>,
+) -> Option<&'a oxc_ast::ast::CallExpression<'source>> {
+    match expression {
+        Expression::CallExpression(call) => {
+            matches!(call.callee, Expression::Super(_)).then_some(&**call)
+        }
+        Expression::ParenthesizedExpression(inner) => base_construction_call(&inner.expression),
+        _ => None,
+    }
 }
 
 fn statement_span(statement: &AstStatement<'_>) -> oxc_span::Span {
@@ -1491,6 +1581,10 @@ impl Context<'_> {
             };
         }
 
+        if let Some(call) = base_construction_call(expression) {
+            return self.lower_base_construction(table, function, call);
+        }
+
         if let Expression::ParenthesizedExpression(inner) = expression {
             return self.lower_effect(table, function, &inner.expression);
         }
@@ -1542,6 +1636,85 @@ impl Context<'_> {
         }
     }
 
+    fn lower_base_construction(
+        &mut self,
+        table: &mut TypeTable,
+        function: &mut Function,
+        call: &oxc_ast::ast::CallExpression<'_>,
+    ) -> Result<(), Vec<Diagnostic>> {
+        let Some(constructing) = self.constructing.as_ref() else {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                "`super()` runs the base constructor, so it is lowered only inside a constructor",
+            )]);
+        };
+        let Some(base) = constructing.base.as_ref() else {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                "`super()` has no base class to construct here, because this class extends nothing",
+            )]);
+        };
+        if base.standing {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                "a constructor that calls `super()` more than once is not lowered yet",
+            )]);
+        }
+        let receiver = constructing.receiver;
+        let base_class = base.name.clone();
+        let forms = base.forms.clone();
+
+        let mut expressions = Vec::with_capacity(call.arguments.len());
+        for argument in &call.arguments {
+            let Some(expression) = argument.as_expression() else {
+                return Err(vec![refuse(
+                    "unsupported-expression",
+                    call.span,
+                    "an argument that is not an expression is not lowered yet",
+                )]);
+            };
+            expressions.push(expression);
+        }
+        let written = self.written_type_arguments(table, call.type_arguments.as_deref())?;
+
+        let mut values = Vec::with_capacity(expressions.len());
+        for expression in &expressions {
+            values.push(self.lower_expression(table, function, expression)?);
+        }
+        let held: Vec<TypeId> = values
+            .iter()
+            .map(|value| function.type_of(*value))
+            .collect();
+        let fitted = self.chosen_form(table, &forms, &held, &written, call.span)?;
+
+        let mut arguments = Vec::with_capacity(values.len());
+        for (position, value) in values.iter().enumerate() {
+            arguments.push(self.coerced(
+                function,
+                table,
+                *value,
+                fitted.slots[position],
+                expressions[position].span(),
+            ));
+        }
+        self.statements.push(Statement::ConstructBase {
+            base_class,
+            object: receiver,
+            arguments,
+            span: span_of(call.span),
+        });
+        if let Some(constructing) = self.constructing.as_mut()
+            && let Some(base) = constructing.base.as_mut()
+        {
+            base.standing = true;
+        }
+        self.forget_narrowing_a_call_could_falsify(function, call.span);
+        Ok(())
+    }
+
     fn write_pattern(
         &mut self,
         table: &mut TypeTable,
@@ -1559,10 +1732,20 @@ impl Context<'_> {
             AssignmentTarget::ObjectAssignmentTarget(object) => {
                 self.write_object_pattern(table, function, object, source)
             }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                self.lower_field_write(table, function, member, Written::Held(source), member.span)
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => self.lower_element_write(
+                table,
+                function,
+                member,
+                Written::Held(source),
+                member.span,
+            ),
             other => Err(vec![refuse(
                 "unsupported-pattern",
                 other.span(),
-                "a pattern that writes anywhere but to a name is not lowered yet",
+                "a pattern target that is neither a name, a field nor an element is not lowered yet",
             )]),
         }
     }
@@ -1714,6 +1897,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, Some(held.declared))?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let standing = held.value_or_refuse(id.name.as_str(), id.span)?;
                 let value = self.lower_expression(table, function, expression)?;
@@ -1781,8 +1965,12 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let object = self.lower_expression(table, function, &member.object)?;
         let name = member.property.name.to_string();
-        let writing = match self.constructing {
-            Some((receiver, writing)) if receiver == object => writing,
+        let writing = match self.constructing.as_ref() {
+            Some(constructing) if constructing.receiver == object => {
+                types::Writing::WhileConstructing {
+                    inherited: &constructing.inherited,
+                }
+            }
             _ => types::Writing::Plainly,
         };
         let slots = self.field_slots(table, function.type_of(object), &name, member, writing)?;
@@ -1794,6 +1982,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, agreed)?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let held = self.read_field(table, function, object, &name, member)?;
                 let value = self.lower_expression(table, function, expression)?;
@@ -1831,6 +2020,7 @@ impl Context<'_> {
             Written::Value(expression) => {
                 self.lower_expression_expecting(table, function, expression, Some(slot))?
             }
+            Written::Held(value) => value,
             Written::Combined(op, expression) => {
                 let held = self.read_element(table, function, array, index, member)?;
                 let value = self.lower_expression(table, function, expression)?;
@@ -2072,6 +2262,13 @@ impl Context<'_> {
         function: &mut Function,
         call: &oxc_ast::ast::CallExpression<'_>,
     ) -> Result<ValueId, Vec<Diagnostic>> {
+        if matches!(call.callee, Expression::Super(_)) {
+            return Err(vec![refuse(
+                "unsupported-call",
+                call.span,
+                "`super()` yields no value, so it is lowered only as a statement of its own",
+            )]);
+        }
         let callee = self.lower_expression(table, function, &call.callee)?;
         let signature = function.type_of(callee);
         let forms = types::callable_forms(table, signature)

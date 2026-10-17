@@ -149,3 +149,26 @@ export function allowBurst(limits: Limits, burst: number): number {
   limits.burst = burst;
   return limits.requests;
 }
+
+export interface Headers {
+  [name: string]: string;
+}
+
+export function stampHost(headers: Headers, host: string): Headers {
+  headers["host"] = host;
+  headers["via"] = "savitar";
+  return headers;
+}
+
+export function bumpTotal(counters: Record<string, number>, by: number): number {
+  const { total = 0 } = counters;
+  counters["total"] = total + by;
+  return total + by;
+}
+
+export type Counters = Record<"total" | "errors", number>;
+
+export function noteError(counters: Counters): number {
+  counters.errors = counters.errors + 1;
+  return counters.total + counters.errors;
+}

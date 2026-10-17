@@ -128,6 +128,26 @@ export function slowest(samples: readonly Sample[]): Sample {
   return { label: label, millis: millis };
 }
 
+export interface Window {
+  from: number;
+  to: number;
+}
+
+export function slide(window: Window, step: [number, number]): number {
+  [window.from, window.to] = step;
+  return window.to - window.from;
+}
+
+export function recentre(window: Window, moved: Window): number {
+  ({ from: window.from, to: window.to } = moved);
+  return window.to - window.from;
+}
+
+export function shiftFirst(slots: number[], step: [number]): number {
+  [slots[0]] = step;
+  return slots.length;
+}
+
 export function swapped(pair: [number, number]): [number, number] {
   let left = 0;
   let right = 0;

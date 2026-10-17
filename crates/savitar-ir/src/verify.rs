@@ -187,6 +187,13 @@ fn statement_uses(statement: &Statement) -> Vec<ValueId> {
             value,
             ..
         } => vec![*array, *index, *value],
+        Statement::ConstructBase {
+            object, arguments, ..
+        } => {
+            let mut used = vec![*object];
+            used.extend(arguments.iter().copied());
+            used
+        }
     }
 }
 

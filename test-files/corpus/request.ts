@@ -38,6 +38,19 @@ export function backoff(attempt: number, base: number = 100): number {
   return base * attempt;
 }
 
+export interface Tuning {
+  limit?: number;
+  base?: number;
+}
+
+export function windowFromTuning(total: number, tuning: Tuning): number {
+  return windowSize(total, tuning.limit);
+}
+
+export function backoffFromTuning(attempt: number, tuning: Tuning): number {
+  return backoff(attempt, tuning.base);
+}
+
 export default function handle(request: Request): Response {
   if (isWrite(request)) {
     return { status: 201, body: request.body };
