@@ -261,7 +261,10 @@ mod tests {
     }
 
     #[test]
-    fn any_from_a_declaration_becomes_unknown_so_it_must_be_narrowed() {
+    fn any_becoming_unknown_is_a_divergence_from_tsc_on_purpose() {
+        assert!(savitar_types::is_registered(
+            "unknown-where-tsc-answers-any"
+        ));
         assert_eq!(
             classify(TypeFlags::ANY),
             Classified::Primitive(TypeKind::Unknown)
