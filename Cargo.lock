@@ -808,6 +808,7 @@ dependencies = [
  "savitar-diagnostics",
  "savitar-ir",
  "savitar-lower",
+ "savitar-modules",
  "savitar-sound",
  "savitar-typeinfo",
  "savitar-typeinfo-tsapi",

@@ -14,7 +14,17 @@ fn provider_binary(root: &Path) -> Option<PathBuf> {
 }
 
 fn check(root: &Path, provider: &Path, flags: &[&str], fixture: &str) -> Output {
-    let file = root.join("test-files/cli").join(fixture);
+    check_in(root, provider, flags, "test-files/cli", fixture)
+}
+
+fn check_in(
+    root: &Path,
+    provider: &Path,
+    flags: &[&str],
+    directory: &str,
+    fixture: &str,
+) -> Output {
+    let file = root.join(directory).join(fixture);
     let mut command = Command::new(env!("CARGO_BIN_EXE_savitar"));
     command.arg("check");
     for flag in flags {
@@ -173,5 +183,111 @@ fn the_verdict_is_the_same_with_and_without_the_ir_flag() {
         stdout_of(&asked).contains("not sound"),
         "`--ir` must reach the same verdict; the output was:\n{}",
         stdout_of(&asked)
+    );
+}
+
+#[test]
+fn the_evaluation_order_is_printed_only_when_ir_is_asked_for() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let bare = stdout_of(&check_in(
+        &bench.root,
+        &bench.provider,
+        &[],
+        "test-files/graph",
+        "uses.ts",
+    ));
+    let asked = stdout_of(&check_in(
+        &bench.root,
+        &bench.provider,
+        &["--ir"],
+        "test-files/graph",
+        "uses.ts",
+    ));
+    assert!(
+        !bare.contains("evaluation order"),
+        "the bare run must not print the evaluation order; the output was:\n{bare}"
+    );
+    assert!(
+        asked.contains("2 of 2 module(s) have a place in the evaluation order"),
+        "`--ir` must print the evaluation order of the whole graph; the output was:\n{asked}"
+    );
+}
+
+#[test]
+fn a_file_that_reads_an_import_the_graph_resolves_is_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let output = check_in(
+        &bench.root,
+        &bench.provider,
+        &["--ir"],
+        "test-files/graph",
+        "uses.ts",
+    );
+    let printed = stdout_of(&output);
+    assert!(
+        printed.contains("1 file(s) sound"),
+        "the file must be announced as sound; the output was:\n{printed}"
+    );
+    assert!(
+        output.status.success(),
+        "a sound file must not fail the run; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn an_import_the_graph_cannot_resolve_is_printed_and_fails_the_run() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let output = check_in(
+        &bench.root,
+        &bench.provider,
+        &[],
+        "test-files/graph-gone",
+        "gone.ts",
+    );
+    let printed = stdout_of(&output);
+    assert!(
+        printed.contains("unresolved-import"),
+        "the unresolved import must be printed; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("gone.ts:1:25"),
+        "the unresolved import must carry file, line and column; the output was:\n{printed}"
+    );
+    assert!(
+        !output.status.success(),
+        "an unresolved import rejects, so the run must fail; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn a_module_initializer_is_reported_only_when_ir_is_asked_for() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let shared = stdout_of(&check_in(
+        &bench.root,
+        &bench.provider,
+        &["--ir"],
+        "test-files/graph",
+        "shared.ts",
+    ));
+    let plain = stdout_of(&check(&bench.root, &bench.provider, &["--ir"], "lowers.ts"));
+    assert!(
+        shared.contains("one module initializer"),
+        "a module with top-level code has an initializer; the output was:\n{shared}"
+    );
+    assert!(
+        plain.contains("no module initializer"),
+        "a module with no top-level code has none; the output was:\n{plain}"
     );
 }
