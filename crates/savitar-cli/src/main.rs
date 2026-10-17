@@ -15,7 +15,18 @@ fn usage() -> ExitCode {
     eprintln!("usage: savitar check [--types] [--ir] <file.ts>...");
     eprintln!("       savitar rules");
     eprintln!("       savitar config");
+    eprintln!("       savitar divergences");
     ExitCode::from(2)
+}
+
+fn list_divergences() -> ExitCode {
+    for divergence in savitar_types::INTENTIONAL_DIVERGENCES {
+        println!("{}", divergence.id);
+        println!("  tsc      {}", divergence.what_tsc_answers);
+        println!("  savitar  {}", divergence.what_savitar_answers);
+        println!("  because  {}", divergence.why_savitar_refuses_to_follow);
+    }
+    ExitCode::SUCCESS
 }
 
 fn list_rules() -> ExitCode {
@@ -196,6 +207,9 @@ fn main() -> ExitCode {
     }
     if command == "config" {
         return list_config();
+    }
+    if command == "divergences" {
+        return list_divergences();
     }
     if command != "check" {
         eprintln!("savitar: unknown command `{command}`");
