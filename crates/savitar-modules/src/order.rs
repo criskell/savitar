@@ -105,7 +105,7 @@ fn refusal_for(
         .filter(|import| import.carries == Carries::Values)
         .find(|import| match import.target {
             Target::Module(other) => left_out.contains(&other),
-            Target::Package | Target::Unresolved => false,
+            Target::DeclaredBoundary(_) | Target::Unresolved => false,
         })?;
     let specifier = &reaching.specifier;
     Some(Finding {
@@ -129,7 +129,7 @@ fn closes_a_cycle_at(graph: &ModuleGraph, id: ModuleId) -> Option<Span> {
         .filter(|import| import.carries == Carries::Values)
         .find(|import| match import.target {
             Target::Module(other) => reaches(graph, other, id),
-            Target::Package | Target::Unresolved => false,
+            Target::DeclaredBoundary(_) | Target::Unresolved => false,
         })
         .map(|import| import.span)
 }

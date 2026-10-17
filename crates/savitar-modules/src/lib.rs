@@ -9,7 +9,7 @@ use savitar_diagnostics::{Diagnostic, Span};
 
 pub use order::Order;
 use resolve::SpecifierResolver;
-pub use resolve::tsconfig_beside;
+pub use resolve::{DeclaredBoundary, holds_declarations_only, tsconfig_beside};
 use specifiers::specifiers_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -31,7 +31,7 @@ pub enum Carries {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
     Module(ModuleId),
-    Package,
+    DeclaredBoundary(DeclaredBoundary),
     Unresolved,
 }
 
@@ -104,7 +104,9 @@ impl ModuleGraph {
                             Target::Module(graph.by_path[&resolved])
                         }
                     }
-                    resolve::Resolved::InsidePackage => Target::Package,
+                    resolve::Resolved::BehindADeclaredBoundary(boundary) => {
+                        Target::DeclaredBoundary(boundary)
+                    }
                     resolve::Resolved::Nowhere => Target::Unresolved,
                 };
                 graph.note(id, &found, &target);
@@ -157,14 +159,19 @@ impl ModuleGraph {
         let specifier = &found.specifier;
         let diagnostic = match target {
             Target::Module(_) => return,
-            Target::Package => Diagnostic::unsupported(
-                "unsupported-package-import",
+            Target::DeclaredBoundary(boundary) => Diagnostic::unsupported(
+                "unsupported-declared-boundary",
                 found.span,
                 format!(
-                    "`{specifier}` resolves inside `node_modules`, and nothing a package declares is checked by Savitar"
+                    "`{specifier}` resolves to {}, which declares names with no checked code behind them",
+                    boundary.said()
                 ),
             )
-            .with_help("the package boundary is declared, not verified, so no order crosses it"),
+            .with_help(
+                "Savitar takes a boundary whole or not at all, never one value at a time, so it \
+                 takes one only where checked code stands behind every name it offers; nothing \
+                 behind this boundary enters the module graph, not even transitively",
+            ),
             Target::Unresolved => Diagnostic::error(
                 "unresolved-import",
                 found.span,
@@ -220,7 +227,7 @@ impl ModuleGraph {
             .filter(|import| import.carries == Carries::Values)
             .filter_map(|import| match import.target {
                 Target::Module(other) => Some(other),
-                Target::Package | Target::Unresolved => None,
+                Target::DeclaredBoundary(_) | Target::Unresolved => None,
             })
             .collect();
         needed.sort_unstable();
@@ -233,7 +240,12 @@ impl ModuleGraph {
             .imports
             .iter()
             .filter(|import| import.carries == Carries::Values)
-            .find(|import| matches!(import.target, Target::Package | Target::Unresolved))
+            .find(|import| {
+                matches!(
+                    import.target,
+                    Target::DeclaredBoundary(_) | Target::Unresolved
+                )
+            })
     }
 }
 

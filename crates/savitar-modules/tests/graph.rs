@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use savitar_modules::{Carries, ModuleGraph, Target};
+use savitar_modules::{Carries, DeclaredBoundary, ModuleGraph, Target};
 
 fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
     let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -374,12 +374,96 @@ fn an_import_of_a_package_is_a_declared_boundary_and_is_not_crawled() {
     assert_eq!(graph.module_count(), 1);
     assert_eq!(
         rules_of(graph.findings()),
-        vec!["unsupported-package-import"]
+        vec!["unsupported-declared-boundary"]
     );
     assert_eq!(
         graph.module(named(&graph, &root, "use.ts")).imports[0].target,
-        Target::Package
+        Target::DeclaredBoundary(DeclaredBoundary::APackage)
     );
+}
+
+#[test]
+fn a_relative_import_that_lands_on_a_declaration_file_is_a_declared_boundary_too() {
+    let root = project(
+        "relative-declaration-file",
+        &[
+            (
+                "surface.d.ts",
+                "export declare function go(n: number): number;\n",
+            ),
+            (
+                "use.ts",
+                "import { go } from \"./surface.js\";\nexport function run(n: number): number {\n  return go(n);\n}\n",
+            ),
+        ],
+    );
+
+    let graph = ModuleGraph::build(&root, &entries(&root, &["use.ts"]));
+
+    assert_eq!(graph.module_count(), 1);
+    assert_eq!(
+        rules_of(graph.findings()),
+        vec!["unsupported-declared-boundary"]
+    );
+    let Target::DeclaredBoundary(DeclaredBoundary::ADeclarationFile(path)) =
+        &graph.module(named(&graph, &root, "use.ts")).imports[0].target
+    else {
+        panic!(
+            "expected a declared boundary, got {:?}",
+            graph.module(named(&graph, &root, "use.ts")).imports[0].target
+        );
+    };
+    assert!(
+        path.ends_with("surface.d.ts"),
+        "the refusal should name the declaration file, got {}",
+        path.display()
+    );
+}
+
+#[test]
+fn a_module_that_imports_values_from_a_declaration_file_has_no_place_in_the_order() {
+    let root = project(
+        "declaration-file-order",
+        &[
+            ("surface.d.ts", "export declare const port: number;\n"),
+            (
+                "use.ts",
+                "import { port } from \"./surface.js\";\nexport const used = port;\n",
+            ),
+        ],
+    );
+
+    let graph = ModuleGraph::build(&root, &entries(&root, &["use.ts"]));
+    let order = graph.evaluation_order();
+
+    assert!(order.evaluated.is_empty());
+    assert_eq!(rules_of(&order.findings), vec!["unsupported-module-order"]);
+}
+
+#[test]
+fn an_import_type_of_a_declaration_file_is_refused_because_the_type_is_not_verified_either() {
+    let root = project(
+        "declaration-file-type-only",
+        &[
+            (
+                "surface.d.ts",
+                "export interface Shape {\n  size: number;\n}\n",
+            ),
+            (
+                "use.ts",
+                "import type { Shape } from \"./surface.js\";\nexport const used: number = 1;\n",
+            ),
+        ],
+    );
+
+    let graph = ModuleGraph::build(&root, &entries(&root, &["use.ts"]));
+    let order = graph.evaluation_order();
+
+    assert_eq!(
+        rules_of(graph.findings()),
+        vec!["unsupported-declared-boundary"]
+    );
+    assert_eq!(order.evaluated.len(), 1);
 }
 
 #[test]

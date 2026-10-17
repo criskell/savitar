@@ -6,8 +6,26 @@ use oxc_resolver::{
 
 pub enum Resolved {
     File(PathBuf),
-    InsidePackage,
+    BehindADeclaredBoundary(DeclaredBoundary),
     Nowhere,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclaredBoundary {
+    APackage,
+    ADeclarationFile(PathBuf),
+}
+
+impl DeclaredBoundary {
+    #[must_use]
+    pub fn said(&self) -> String {
+        match self {
+            Self::APackage => "a package in `node_modules`".to_string(),
+            Self::ADeclarationFile(path) => {
+                format!("the declaration file `{}`", path.display())
+            }
+        }
+    }
 }
 
 pub struct SpecifierResolver {
@@ -61,7 +79,10 @@ impl SpecifierResolver {
         };
         let path = resolution.into_path_buf();
         if reaches_into_a_package(&path) {
-            return Resolved::InsidePackage;
+            return Resolved::BehindADeclaredBoundary(DeclaredBoundary::APackage);
+        }
+        if holds_declarations_only(&path) {
+            return Resolved::BehindADeclaredBoundary(DeclaredBoundary::ADeclarationFile(path));
         }
         Resolved::File(path.canonicalize().unwrap_or(path))
     }
@@ -70,4 +91,14 @@ impl SpecifierResolver {
 fn reaches_into_a_package(path: &Path) -> bool {
     path.components()
         .any(|component| matches!(component, Component::Normal(name) if name == "node_modules"))
+}
+
+#[must_use]
+pub fn holds_declarations_only(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    [".d.ts", ".d.tsx", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
