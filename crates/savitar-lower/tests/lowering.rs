@@ -1,10 +1,11 @@
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 use savitar_diagnostics::{SourceFile, Span};
 
 use savitar_ir::{BinaryOp, Constant, Rvalue, Statement, Terminator, verify};
 
-use savitar_lower::{ModuleStanding, Ran, lower, lower_in_order};
+use savitar_lower::{ModuleStanding, Standing, lower, lower_in_order};
 
 use savitar_typeinfo::{Answer, TypeProvider};
 
@@ -12046,7 +12047,7 @@ fn an_initializer_reading_an_imported_name_is_refused_when_nothing_places_the_ot
     assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
     assert_eq!(report.diagnostics[0].rule, "unsupported-import-unchecked");
     assert!(report.initializer.is_none());
-    assert!(!report.publishes_its_names);
+    assert!(report.published.is_empty(), "{:?}", report.published);
 }
 
 #[test]
@@ -12057,7 +12058,10 @@ fn an_initializer_reading_an_imported_name_lowers_when_the_other_module_ran_and_
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note("./settings.ts", Ran::BeforeAndPublished);
+    standing.note(
+        "./settings.ts",
+        Standing::RanBeforeBinding(BTreeSet::from(["port".to_string()])),
+    );
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12075,7 +12079,7 @@ fn an_initializer_reading_an_imported_name_lowers_when_the_other_module_ran_and_
         "{:?}",
         reads_of(&initializer.function)
     );
-    assert!(report.publishes_its_names);
+    assert!(report.published.contains("label"));
 }
 
 #[test]
@@ -12087,7 +12091,7 @@ fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_is_n
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note("./settings.ts", Ran::NotBefore);
+    standing.note("./settings.ts", Standing::DidNotRunBefore);
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12104,7 +12108,7 @@ fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_publ
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note("./settings.ts", Ran::WithoutPublishing);
+    standing.note("./settings.ts", Standing::RanBeforeBinding(BTreeSet::new()));
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12169,7 +12173,7 @@ fn a_module_whose_initializer_is_refused_publishes_no_names() {
 
     assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
     assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
-    assert!(!report.publishes_its_names);
+    assert!(report.published.is_empty(), "{:?}", report.published);
 }
 
 #[test]
@@ -12184,11 +12188,11 @@ fn a_module_whose_function_alone_is_refused_still_publishes_its_names() {
 
     assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
     assert_eq!(report.diagnostics[0].rule, "unsupported-function");
-    assert!(report.publishes_its_names);
+    assert!(report.published.contains("port"));
 }
 
 #[test]
-fn a_module_with_a_statement_it_cannot_lower_publishes_no_names() {
+fn a_module_with_a_statement_it_cannot_lower_still_publishes_what_it_bound_before_it() {
     let source = "export const port = 8080;\n\nif (port > 0) {\n}\n";
     let mut table = TypeTable::new();
     let provider = ByName::new(source, vec![]);
@@ -12198,7 +12202,96 @@ fn a_module_with_a_statement_it_cannot_lower_publishes_no_names() {
 
     assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
     assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
-    assert!(!report.publishes_its_names);
+    assert!(report.published.contains("port"));
+}
+
+#[test]
+fn a_module_publishes_no_name_it_binds_after_a_statement_it_cannot_lower() {
+    let source = "if (true) {\n}\n\nexport const port = 8080;\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(report.published.is_empty(), "{:?}", report.published);
+}
+
+#[test]
+fn a_module_with_a_statement_it_cannot_lower_still_publishes_the_function_it_declares() {
+    let source = "if (true) {\n}\n\nexport function chosen(): number {\n  return 8080;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("chosen", returning(&mut table, number))]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(
+        report.published.contains("chosen"),
+        "a function declaration binds before any module-level code runs, so a refusal \
+         further down does not unbind it; the published names were {:?}",
+        report.published
+    );
+}
+
+#[test]
+fn a_module_publishes_no_name_that_a_statement_it_cannot_lower_writes_to() {
+    let source = "export let port = 8080;\n\nport = 9090;\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-statement");
+    assert!(report.published.is_empty(), "{:?}", report.published);
+}
+
+#[test]
+fn a_module_whose_initializer_is_refused_publishes_not_even_the_function_it_declares() {
+    let source =
+        "export function chosen(): number {\n  return 1;\n}\n\nexport const port = chosen();\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("chosen", returning(&mut table, number))]);
+    let file = SourceFile::new("settings.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(report.published.is_empty(), "{:?}", report.published);
+}
+
+#[test]
+fn an_initializer_reading_a_name_the_other_module_does_not_bind_is_refused_by_that_name() {
+    let source = "import { port } from \"./settings.ts\";\n\nexport const label = port;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
+    let file = SourceFile::new("server.ts", source);
+    let mut standing = ModuleStanding::alone();
+    standing.note(
+        "./settings.ts",
+        Standing::RanBeforeBinding(BTreeSet::from(["host".to_string()])),
+    );
+
+    let report = lower_in_order(&file, &provider, &mut table, &standing);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-import-unpublished");
+    assert!(
+        report.diagnostics[0].message.contains("binds no `port`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    assert!(report.initializer.is_none());
 }
 
 #[test]

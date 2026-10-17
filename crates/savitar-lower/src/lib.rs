@@ -27,7 +27,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
 use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
-pub use standing::{ModuleStanding, Ran};
+pub use standing::{ModuleStanding, Ran, Standing};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ pub struct LowerReport {
     pub functions: Vec<Function>,
     pub initializer: Option<ModuleInitializer>,
     pub diagnostics: Vec<Diagnostic>,
-    pub publishes_its_names: bool,
+    pub published: BTreeSet<String>,
 }
 
 #[derive(Debug)]
@@ -505,8 +505,8 @@ fn unordered_read(
     span: oxc_span::Span,
 ) -> Option<Diagnostic> {
     let at = span_of(span);
-    match standing.of(specifier) {
-        Ran::BeforeAndPublished => None,
+    match standing.of(specifier, exported) {
+        Ran::BeforeAndBoundTheName => None,
         Ran::NotBefore => Some(
             Diagnostic::unsupported(
                 "unsupported-import-order",
@@ -519,15 +519,17 @@ fn unordered_read(
                 "the initializer of this module would read a name that nothing has bound yet",
             ),
         ),
-        Ran::WithoutPublishing => Some(
+        Ran::WithoutBindingTheName => Some(
             Diagnostic::unsupported(
                 "unsupported-import-unpublished",
                 at,
                 format!(
-                    "`{exported}` comes from `{specifier}`, whose module-level code Savitar refuses, so nothing binds the name"
+                    "`{specifier}` runs before this module and binds no `{exported}`, so this read points where nothing is bound"
                 ),
             )
-            .with_help("the refusal in that module goes before this module can read what it exports"),
+            .with_help(
+                "either the module-level code that would bind it is refused there, or that module forwards the name instead of binding it",
+            ),
         ),
         Ran::Unchecked => Some(
             Diagnostic::unsupported(
@@ -562,7 +564,7 @@ pub fn lower_in_order(
             functions: Vec::new(),
             initializer: None,
             diagnostics: Vec::new(),
-            publishes_its_names: false,
+            published: BTreeSet::new(),
         };
     }
 
@@ -577,7 +579,8 @@ pub fn lower_in_order(
     };
     let mut hoisted: Vec<Hoisted> = Vec::new();
     let mut binds: Vec<Binds<'_>> = Vec::new();
-    let mut publishes_its_names = true;
+    let mut refused_before: Option<usize> = None;
+    let mut rebound_by_refused_code: BTreeSet<String> = BTreeSet::new();
 
     for statement in &parsed.program.body {
         match at_module_level(statement) {
@@ -593,7 +596,12 @@ pub fn lower_in_order(
             AtModuleLevel::Initializes(declaration) => binds.push(Binds::Variables(declaration)),
             AtModuleLevel::CarriesNoCode => {}
             AtModuleLevel::NotLowered(form) => {
-                publishes_its_names = false;
+                if refused_before.is_none() {
+                    refused_before = Some(binds.len());
+                }
+                rebound_by_refused_code.extend(assigned::names_written_through_closures(
+                    std::slice::from_ref(statement),
+                ));
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
             }
         }
@@ -605,19 +613,49 @@ pub fn lower_in_order(
             None => None,
             Some(Ok(initializer)) => Some(initializer),
             Some(Err(problems)) => {
-                publishes_its_names = false;
                 diagnostics.extend(problems);
                 None
             }
         };
+    let published = if initializer.is_some() {
+        names_the_module_publishes(&hoisted, &binds, refused_before, &rebound_by_refused_code)
+    } else {
+        BTreeSet::new()
+    };
 
     diagnostics.sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
     LowerReport {
         functions,
         initializer,
         diagnostics,
-        publishes_its_names,
+        published,
     }
+}
+
+fn names_the_module_publishes(
+    hoisted: &[Hoisted],
+    binds: &[Binds<'_>],
+    refused_before: Option<usize>,
+    rebound_by_refused_code: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let bound_before_any_refusal = refused_before.unwrap_or(binds.len());
+    let mut published: BTreeSet<String> = hoisted.iter().map(|one| one.name.clone()).collect();
+    for binding in &binds[..bound_before_any_refusal] {
+        match binding {
+            Binds::AClass { name, .. } => {
+                published.insert(name.clone());
+            }
+            Binds::Variables(declaration) => {
+                for declarator in &declaration.declarations {
+                    published.extend(names_bound_by(&declarator.id));
+                }
+            }
+        }
+    }
+    for name in rebound_by_refused_code {
+        published.remove(name);
+    }
+    published
 }
 
 #[derive(Clone, Copy)]

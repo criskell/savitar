@@ -1,11 +1,11 @@
 use std::process::ExitCode;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::{SourceFile, render};
-use savitar_lower::{LowerReport, ModuleStanding, Ran};
+use savitar_lower::{LowerReport, ModuleStanding, Standing};
 use savitar_modules::{Carries, ModuleGraph, ModuleId, Order, Target};
 use savitar_typeinfo::TypeProvider;
 use savitar_typeinfo_tsapi::TsApi;
@@ -70,8 +70,7 @@ fn standing_of(
     graph: &ModuleGraph,
     order: &Order,
     id: ModuleId,
-    lowered: &BTreeSet<ModuleId>,
-    published: &BTreeSet<ModuleId>,
+    published: &BTreeMap<ModuleId, BTreeSet<String>>,
 ) -> ModuleStanding {
     let mut standing = ModuleStanding::alone();
     let place = order.position_of(id);
@@ -84,16 +83,11 @@ fn standing_of(
         };
         let other = *other;
         let ran = match (place, order.position_of(other)) {
-            (Some(place), Some(before)) if before < place => {
-                if !lowered.contains(&other) {
-                    Ran::Unchecked
-                } else if published.contains(&other) {
-                    Ran::BeforeAndPublished
-                } else {
-                    Ran::WithoutPublishing
-                }
-            }
-            _ => Ran::NotBefore,
+            (Some(place), Some(before)) if before < place => match published.get(&other) {
+                None => Standing::NotChecked,
+                Some(names) => Standing::RanBeforeBinding(names.clone()),
+            },
+            _ => Standing::DidNotRunBefore,
         };
         standing.note(&import.specifier, ran);
     }
@@ -123,8 +117,7 @@ fn lower_in_evaluation_order(
 ) -> Vec<Option<LowerReport>> {
     let mut reports: Vec<Option<LowerReport>> = paths.iter().map(|_| None).collect();
     let of_index: Vec<Option<ModuleId>> = absolute.iter().map(|path| graph.id_of(path)).collect();
-    let mut lowered: BTreeSet<ModuleId> = BTreeSet::new();
-    let mut published: BTreeSet<ModuleId> = BTreeSet::new();
+    let mut published: BTreeMap<ModuleId, BTreeSet<String>> = BTreeMap::new();
 
     let mut visit: Vec<usize> = (0..paths.len()).collect();
     visit.sort_by_key(|&index| {
@@ -135,17 +128,14 @@ fn lower_in_evaluation_order(
 
     for index in visit {
         let standing = match of_index[index] {
-            Some(id) => standing_of(graph, order, id, &lowered, &published),
+            Some(id) => standing_of(graph, order, id, &published),
             None => ModuleStanding::alone(),
         };
         let Some(report) = lower_one(&paths[index], provider, table, &standing) else {
             continue;
         };
         if let Some(id) = of_index[index] {
-            lowered.insert(id);
-            if report.publishes_its_names {
-                published.insert(id);
-            }
+            published.insert(id, report.published.clone());
         }
         reports[index] = Some(report);
     }
