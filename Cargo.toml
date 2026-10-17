@@ -12,6 +12,7 @@ rust-version = "1.90"
 savitar-diagnostics = { path = "crates/savitar-diagnostics" }
 savitar-types = { path = "crates/savitar-types" }
 savitar-ir = { path = "crates/savitar-ir" }
+savitar-analysis = { path = "crates/savitar-analysis" }
 savitar-lower = { path = "crates/savitar-lower" }
 savitar-typeinfo = { path = "crates/savitar-typeinfo" }
 savitar-typeinfo-tsapi = { path = "crates/savitar-typeinfo-tsapi" }

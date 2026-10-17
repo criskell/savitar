@@ -1,0 +1,17 @@
+[package]
+name = "savitar-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Whole-program facts read off savitar-ir; the call graph says what a call reaches and says when it does not know"
+
+[dependencies]
+savitar-diagnostics.workspace = true
+savitar-ir.workspace = true
+
+[dev-dependencies]
+savitar-types.workspace = true
+
+[lints]
+workspace = true
