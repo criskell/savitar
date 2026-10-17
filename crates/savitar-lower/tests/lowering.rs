@@ -9236,6 +9236,101 @@ fn writing_a_readonly_field_inside_the_constructor_of_its_class_is_allowed() {
 }
 
 #[test]
+fn writing_a_readonly_field_in_the_constructor_of_a_derived_class_is_refused() {
+    let source = "class Counter extends Base {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("which class declares it"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_mutable_field_in_the_constructor_of_a_derived_class_still_lowers() {
+    let source = "class Counter extends Base {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn the_receiver_keeps_its_identity_inside_a_loop_so_a_readonly_write_there_is_still_allowed() {
+    let source = "class Counter {\n  constructor(start: number) {\n    while (start > 0) {\n      this.held = start;\n      start = start - 1;\n    }\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    assert_eq!(verify(&report.functions[0]), vec![]);
+}
+
+#[test]
+fn writing_a_readonly_field_of_another_object_inside_the_constructor_is_refused() {
+    let source = "class Counter {\n  constructor(other: Counter, start: number) {\n    other.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, true);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("other", Answer::Known(shape)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+}
+
+#[test]
 fn writing_a_readonly_field_from_a_method_that_is_not_the_constructor_is_still_refused() {
     let source =
         "class Counter {\n  reset(start: number): void {\n    this.held = start;\n  }\n}\n";

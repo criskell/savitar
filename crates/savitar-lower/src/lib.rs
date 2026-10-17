@@ -377,7 +377,7 @@ struct Context<'a> {
     current: BlockId,
     enclosing: Vec<Breakable>,
     shadowed: Vec<Key>,
-    constructing: Option<ValueId>,
+    constructing: Option<(ValueId, types::Writing)>,
 }
 
 fn span_of(span: oxc_span::Span) -> Span {
@@ -498,9 +498,15 @@ fn lower_class(
     for element in &class.body.body {
         match element {
             ClassElement::MethodDefinition(method) => {
-                if let Some(outcome) =
-                    lower_method(file, provider, table, id.name.as_str(), id.span, method)
-                {
+                if let Some(outcome) = lower_method(
+                    file,
+                    provider,
+                    table,
+                    id.name.as_str(),
+                    id.span,
+                    class.heritage.is_some(),
+                    method,
+                ) {
                     outcomes.push(outcome);
                 }
             }
@@ -535,6 +541,7 @@ fn lower_method(
     table: &mut TypeTable,
     class: &str,
     class_at: oxc_span::Span,
+    inherits: bool,
     method: &MethodDefinition<'_>,
 ) -> Option<Outcome> {
     let body = method.value.body.as_ref()?;
@@ -564,7 +571,7 @@ fn lower_method(
         name,
         signature_at: (!constructing).then_some(member.span),
         receiver: match (constructing, method.r#static) {
-            (true, _) => Receiver::UnderConstruction(class_at),
+            (true, _) => Receiver::UnderConstruction { class_at, inherits },
             (false, true) => Receiver::Detached,
             (false, false) => Receiver::Instance(class_at),
         },
@@ -578,19 +585,30 @@ fn lower_method(
 enum Receiver {
     Detached,
     Instance(oxc_span::Span),
-    UnderConstruction(oxc_span::Span),
+    UnderConstruction {
+        class_at: oxc_span::Span,
+        inherits: bool,
+    },
 }
 
 impl Receiver {
     const fn shape_at(self) -> Option<oxc_span::Span> {
         match self {
             Self::Detached => None,
-            Self::Instance(at) | Self::UnderConstruction(at) => Some(at),
+            Self::Instance(at) | Self::UnderConstruction { class_at: at, .. } => Some(at),
         }
     }
 
-    const fn constructs(self) -> bool {
-        matches!(self, Self::UnderConstruction(_))
+    const fn constructs(self) -> Option<types::Writing> {
+        match self {
+            Self::Detached | Self::Instance(_) => None,
+            Self::UnderConstruction { inherits: true, .. } => {
+                Some(types::Writing::WhileConstructingAnHeir)
+            }
+            Self::UnderConstruction {
+                inherits: false, ..
+            } => Some(types::Writing::WhileConstructing),
+        }
     }
 }
 
@@ -632,7 +650,7 @@ fn lower_function(
             "a written `this` parameter is not lowered yet",
         )]);
     }
-    if lowering.signature_at.is_none() && !lowering.receiver.constructs() {
+    if lowering.signature_at.is_none() && lowering.receiver.constructs().is_none() {
         return Err(vec![refuse(
             "unsupported-function",
             declaration.span,
@@ -665,9 +683,10 @@ fn lower_function(
         }
         let held = function.declare_parameter(shape);
         context.declare(THIS, Binding::written(held, shape));
-        if lowering.receiver.constructs() {
-            context.constructing = Some(held);
-        }
+        context.constructing = lowering
+            .receiver
+            .constructs()
+            .map(|writing| (held, writing));
     }
 
     let signature = match lowering.signature_at {
@@ -1258,10 +1277,9 @@ impl Context<'_> {
     ) -> Result<(), Vec<Diagnostic>> {
         let object = self.lower_expression(table, function, &member.object)?;
         let name = member.property.name.to_string();
-        let writing = if self.constructing == Some(object) {
-            types::Writing::WhileConstructing
-        } else {
-            types::Writing::Plainly
+        let writing = match self.constructing {
+            Some((receiver, writing)) if receiver == object => writing,
+            _ => types::Writing::Plainly,
         };
         let slots = self.field_slots(table, function.type_of(object), &name, member, writing)?;
         let agreed = match slots.as_slice() {

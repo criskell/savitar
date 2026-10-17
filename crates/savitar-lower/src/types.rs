@@ -503,6 +503,7 @@ pub enum SlotRefusal {
 pub enum Writing {
     Plainly,
     WhileConstructing,
+    WhileConstructingAnHeir,
 }
 
 pub fn field_slots(
@@ -555,10 +556,20 @@ pub fn field_slot(
                 "`{name}` is a method, and writing over a method is not lowered yet"
             )));
         }
-        if field.readonly && writing == Writing::Plainly {
-            return Err(SlotRefusal::Declined(format!(
-                "`{name}` is declared readonly and admits no write outside the constructor of its class"
-            )));
+        if field.readonly {
+            match writing {
+                Writing::WhileConstructing => {}
+                Writing::Plainly => {
+                    return Err(SlotRefusal::Declined(format!(
+                        "`{name}` is declared readonly and admits no write outside the constructor of its class"
+                    )));
+                }
+                Writing::WhileConstructingAnHeir => {
+                    return Err(SlotRefusal::Declined(format!(
+                        "`{name}` is declared readonly, and the shape of a derived class does not say which class declares it"
+                    )));
+                }
+            }
         }
         return Ok(field.type_id);
     }
