@@ -544,7 +544,7 @@ pub fn field_slot(
     name: &str,
     writing: Writing<'_>,
 ) -> Result<TypeId, SlotRefusal> {
-    let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
+    let TypeKind::Object { fields, indexes } = table.kind(object).clone() else {
         return Err(SlotRefusal::Shapeless(format!(
             "`{name}` is written on something with no declared shape"
         )));
@@ -572,9 +572,27 @@ pub fn field_slot(
         }
         return Ok(field.type_id);
     }
-    Err(SlotRefusal::Declined(format!(
-        "the shape declares no field `{name}`"
-    )))
+    index_slot(table, &indexes, name)
+}
+
+fn index_slot(
+    table: &mut TypeTable,
+    indexes: &[IndexSignature],
+    name: &str,
+) -> Result<TypeId, SlotRefusal> {
+    let key = table.intern(TypeKind::StringLiteral(name.to_string()));
+    let matched = indexes
+        .iter()
+        .find(|signature| signature.key == key || key_accepts(table, signature.key, key));
+    match matched {
+        Some(signature) if signature.readonly => Err(SlotRefusal::Declined(format!(
+            "`{name}` falls under a readonly index signature, which admits no write"
+        ))),
+        Some(signature) => Ok(signature.value),
+        None => Err(SlotRefusal::Declined(format!(
+            "the shape declares no field `{name}`"
+        ))),
+    }
 }
 
 pub fn element_slot(table: &mut TypeTable, array: TypeId, index: TypeId) -> Result<TypeId, String> {

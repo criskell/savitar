@@ -3205,7 +3205,7 @@ fn an_array_pattern_over_something_that_is_not_a_list_is_refused() {
 }
 
 #[test]
-fn writing_a_field_an_index_signature_would_cover_is_still_refused() {
+fn writing_a_field_an_index_signature_covers_takes_the_type_the_signature_declares() {
     let source = "function fill(out: Record<string, number>): void {\n  out.hits = 2;\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -3214,6 +3214,71 @@ fn writing_a_field_an_index_signature_would_cover_is_still_refused() {
         Vec::new(),
         vec![IndexSignature {
             key: text,
+            value: number,
+            readonly: false,
+        }],
+    );
+    let provider = ByName::new(source, vec![("out", Answer::Known(out))]);
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    let entry = function.entry().expect("a block");
+    let written = function
+        .block(entry)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::WriteField { name, value, .. } => Some((name.clone(), *value)),
+            _ => None,
+        })
+        .expect("the write should be lowered");
+    assert_eq!(written.0, "hits");
+    assert_eq!(function.type_of(written.1), number);
+}
+
+#[test]
+fn writing_a_field_a_readonly_index_signature_covers_is_refused() {
+    let source = "function fill(out: Frozen): void {\n  out.hits = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: text,
+            value: number,
+            readonly: true,
+        }],
+    );
+    let provider = ByName::new(source, vec![("out", Answer::Known(out))]);
+    let file = SourceFile::new("fill.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-write");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("readonly index signature"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn writing_a_field_no_index_signature_accepts_is_refused() {
+    let source = "function fill(out: Counted): void {\n  out.hits = 2;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let out = table.object_with_indexes(
+        Vec::new(),
+        vec![IndexSignature {
+            key: number,
             value: number,
             readonly: false,
         }],
