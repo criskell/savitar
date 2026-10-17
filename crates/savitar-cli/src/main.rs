@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use savitar_diagnostics::{SourceFile, render};
-use savitar_lower::{LowerReport, ModuleStanding, Standing};
+use savitar_diagnostics::{Diagnostic, SourceFile, Span, render};
+use savitar_lower::{LowerReport, ModuleStanding, Standing, TwoModulesForOneSpecifier};
 use savitar_modules::{Carries, ModuleGraph, ModuleId, Order, Target};
 use savitar_typeinfo::TypeProvider;
 use savitar_typeinfo_tsapi::TsApi;
@@ -71,8 +71,9 @@ fn standing_of(
     order: &Order,
     id: ModuleId,
     published: &BTreeMap<ModuleId, BTreeSet<String>>,
-) -> ModuleStanding {
+) -> (ModuleStanding, Vec<Diagnostic>) {
     let mut standing = ModuleStanding::alone();
+    let mut clashes = Vec::new();
     let place = order.position_of(id);
     for import in &graph.module(id).imports {
         if import.carries != Carries::Values {
@@ -89,9 +90,27 @@ fn standing_of(
             },
             _ => Standing::DidNotRunBefore,
         };
-        standing.note(&import.specifier, ran);
+        let resolved = graph.module(other).path.display().to_string();
+        if let Err(clash) = standing.note(&import.specifier, &resolved, ran) {
+            clashes.push(two_modules_for_one_specifier(import.span, &clash));
+        }
     }
-    standing
+    (standing, clashes)
+}
+
+fn two_modules_for_one_specifier(at: Span, clash: &TwoModulesForOneSpecifier) -> Diagnostic {
+    let specifier = &clash.specifier;
+    let first = &clash.first;
+    let second = &clash.second;
+    Diagnostic::error(
+        "two-modules-for-one-specifier",
+        at,
+        format!(
+            "`{specifier}` resolves to `{first}` and to `{second}` in this module, so the \
+             evidence of evaluation order cannot say which one ran"
+        ),
+    )
+    .with_help("the order evidence is looked up by the text the module writes, so that text has to name one module")
 }
 
 fn lower_one(
@@ -127,13 +146,17 @@ fn lower_in_evaluation_order(
     });
 
     for index in visit {
-        let standing = match of_index[index] {
+        let (standing, clashes) = match of_index[index] {
             Some(id) => standing_of(graph, order, id, &published),
-            None => ModuleStanding::alone(),
+            None => (ModuleStanding::alone(), Vec::new()),
         };
-        let Some(report) = lower_one(&paths[index], provider, table, &standing) else {
+        let Some(mut report) = lower_one(&paths[index], provider, table, &standing) else {
             continue;
         };
+        report.diagnostics.extend(clashes);
+        report
+            .diagnostics
+            .sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.rule));
         if let Some(id) = of_index[index] {
             published.insert(id, report.published.clone());
         }

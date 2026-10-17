@@ -27,7 +27,7 @@ use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
 use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
-pub use standing::{ModuleStanding, Ran, Standing};
+pub use standing::{ModuleStanding, Ran, Standing, TwoModulesForOneSpecifier};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
 #[derive(Debug)]

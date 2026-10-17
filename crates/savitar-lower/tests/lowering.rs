@@ -12058,10 +12058,13 @@ fn an_initializer_reading_an_imported_name_lowers_when_the_other_module_ran_and_
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note(
-        "./settings.ts",
-        Standing::RanBeforeBinding(BTreeSet::from(["port".to_string()])),
-    );
+    standing
+        .note(
+            "./settings.ts",
+            "/project/settings.ts",
+            Standing::RanBeforeBinding(BTreeSet::from(["port".to_string()])),
+        )
+        .expect("the first note of a specifier is never a clash");
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12091,7 +12094,13 @@ fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_is_n
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note("./settings.ts", Standing::DidNotRunBefore);
+    standing
+        .note(
+            "./settings.ts",
+            "/project/settings.ts",
+            Standing::DidNotRunBefore,
+        )
+        .expect("the first note of a specifier is never a clash");
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12108,7 +12117,13 @@ fn an_initializer_reading_an_imported_name_is_refused_when_the_other_module_publ
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note("./settings.ts", Standing::RanBeforeBinding(BTreeSet::new()));
+    standing
+        .note(
+            "./settings.ts",
+            "/project/settings.ts",
+            Standing::RanBeforeBinding(BTreeSet::new()),
+        )
+        .expect("the first note of a specifier is never a clash");
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
@@ -12325,10 +12340,13 @@ fn an_initializer_reading_a_name_the_other_module_does_not_bind_is_refused_by_th
     let provider = ByName::new(source, vec![("port", Answer::Known(number))]);
     let file = SourceFile::new("server.ts", source);
     let mut standing = ModuleStanding::alone();
-    standing.note(
-        "./settings.ts",
-        Standing::RanBeforeBinding(BTreeSet::from(["host".to_string()])),
-    );
+    standing
+        .note(
+            "./settings.ts",
+            "/project/settings.ts",
+            Standing::RanBeforeBinding(BTreeSet::from(["host".to_string()])),
+        )
+        .expect("the first note of a specifier is never a clash");
 
     let report = lower_in_order(&file, &provider, &mut table, &standing);
 
