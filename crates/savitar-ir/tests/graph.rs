@@ -311,3 +311,87 @@ fn a_jump_to_a_block_that_does_not_exist_is_caught() {
     ));
     assert_eq!(verify(&function), vec![Malformation::MissingBlock(missing)]);
 }
+
+#[test]
+fn a_captured_value_counts_as_defined_on_entry() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("outer#0");
+
+    let captured = function.declare_capture("base", number);
+    let one = function.fresh_value(number);
+    let raised = function.fresh_value(number);
+    function.add_block(block(
+        vec![
+            Statement::Assign {
+                target: one,
+                value: Rvalue::Constant(Constant::Number(1.0f64.to_bits())),
+                span: nowhere(),
+            },
+            Statement::Assign {
+                target: raised,
+                value: Rvalue::Binary {
+                    op: BinaryOp::Add,
+                    left: captured,
+                    right: one,
+                },
+                span: nowhere(),
+            },
+        ],
+        Terminator::Return(Some(raised)),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+    assert_eq!(function.captures().len(), 1);
+    assert_eq!(function.captures()[0].name, "base");
+    assert_eq!(function.captures()[0].value, captured);
+}
+
+#[test]
+fn making_a_closure_uses_the_values_it_captures() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("outer");
+
+    let base = function.declare_parameter(number);
+    let made = function.fresh_value(number);
+    function.add_block(block(
+        vec![Statement::Assign {
+            target: made,
+            value: Rvalue::Closure {
+                function: "outer#0".to_string(),
+                captured: vec![base],
+            },
+            span: nowhere(),
+        }],
+        Terminator::Return(Some(made)),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}
+
+#[test]
+fn making_a_closure_over_a_value_that_is_not_defined_is_caught() {
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let mut function = Function::new("outer");
+
+    let made = function.fresh_value(number);
+    let missing = function.fresh_value(number);
+    function.add_block(block(
+        vec![Statement::Assign {
+            target: made,
+            value: Rvalue::Closure {
+                function: "outer#0".to_string(),
+                captured: vec![missing],
+            },
+            span: nowhere(),
+        }],
+        Terminator::Return(Some(made)),
+    ));
+
+    assert_eq!(
+        verify(&function),
+        vec![Malformation::ValueNeverDefined(missing)]
+    );
+}

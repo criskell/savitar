@@ -59,6 +59,12 @@ pub fn verify(function: &Function) -> Vec<Malformation> {
         }
         definition_index.insert(*parameter, 0);
     }
+    for capture in function.captures() {
+        if defined_in.insert(capture.value, entry).is_some() {
+            found.push(Malformation::ValueDefinedTwice(capture.value));
+        }
+        definition_index.insert(capture.value, 0);
+    }
     for (id, block) in function.blocks() {
         for parameter in &block.parameters {
             if defined_in.insert(*parameter, id).is_some() {
@@ -202,6 +208,7 @@ fn rvalue_uses(value: &Rvalue) -> Vec<ValueId> {
             used.extend(arguments.iter().copied());
             used
         }
+        Rvalue::Closure { captured, .. } => captured.clone(),
     }
 }
 

@@ -67,6 +67,12 @@ pub enum UnaryOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capture {
+    pub name: String,
+    pub value: ValueId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rvalue {
     Parameter(u32),
     Global(String),
@@ -113,6 +119,10 @@ pub enum Rvalue {
     New {
         callee: ValueId,
         arguments: Vec<ValueId>,
+    },
+    Closure {
+        function: String,
+        captured: Vec<ValueId>,
     },
 }
 
@@ -180,6 +190,7 @@ pub struct Block {
 pub struct Function {
     name: String,
     parameters: Vec<ValueId>,
+    captures: Vec<Capture>,
     blocks: Vec<Block>,
     value_types: Vec<TypeId>,
 }
@@ -190,6 +201,7 @@ impl Function {
         Self {
             name: name.into(),
             parameters: Vec::new(),
+            captures: Vec::new(),
             blocks: Vec::new(),
             value_types: Vec::new(),
         }
@@ -215,6 +227,20 @@ impl Function {
     #[must_use]
     pub fn parameters(&self) -> &[ValueId] {
         &self.parameters
+    }
+
+    pub fn declare_capture(&mut self, name: impl Into<String>, ty: TypeId) -> ValueId {
+        let id = self.fresh_value(ty);
+        self.captures.push(Capture {
+            name: name.into(),
+            value: id,
+        });
+        id
+    }
+
+    #[must_use]
+    pub fn captures(&self) -> &[Capture] {
+        &self.captures
     }
 
     #[must_use]
