@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::VariableDeclarationKind;
 use oxc_ast::ast::{
-    Argument, AssignmentTarget, BindingPattern, Declaration, Expression, ForStatementInit,
-    ForStatementLeft, FunctionBody, ObjectPropertyKind, SimpleAssignmentTarget,
-    Statement as AstStatement, VariableDeclarator,
+    Argument, AssignmentTarget, BindingPattern, Class, ClassElement, Declaration, Expression,
+    ForStatementInit, ForStatementLeft, FunctionBody, MethodDefinition, MethodDefinitionKind,
+    ObjectPropertyKind, PropertyKey, SimpleAssignmentTarget, Statement as AstStatement,
+    VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
@@ -401,25 +402,14 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
     let mut diagnostics = Vec::new();
 
     for statement in &parsed.program.body {
-        let declaration = match statement {
-            AstStatement::FunctionDeclaration(declaration) => declaration,
-            AstStatement::ExportDeclaration(export) => match &export.declaration {
-                Declaration::FunctionDeclaration(declaration) => declaration,
-                _ => continue,
-            },
-            _ => continue,
-        };
-        let Some(body) = &declaration.body else {
+        let Some(declared) = declared_at_module_level(statement) else {
             continue;
         };
-        let name = declaration
-            .id
-            .as_ref()
-            .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
-
-        match lower_function(file, provider, table, &name, declaration, body) {
-            Ok(function) => functions.push(function),
-            Err(problems) => diagnostics.extend(problems),
+        for outcome in lower_declared(file, provider, table, declared) {
+            match outcome {
+                Ok(function) => functions.push(function),
+                Err(problems) => diagnostics.extend(problems),
+            }
         }
     }
 
@@ -428,6 +418,122 @@ pub fn lower(file: &SourceFile, provider: &dyn TypeProvider, table: &mut TypeTab
         functions,
         diagnostics,
     }
+}
+
+#[derive(Clone, Copy)]
+enum Declared<'a> {
+    Standalone(&'a oxc_ast::ast::Function<'a>),
+    Class(&'a Class<'a>),
+}
+
+fn declared_at_module_level<'a>(statement: &'a AstStatement<'a>) -> Option<Declared<'a>> {
+    match statement {
+        AstStatement::FunctionDeclaration(declaration) => Some(Declared::Standalone(declaration)),
+        AstStatement::ClassDeclaration(class) => Some(Declared::Class(class)),
+        AstStatement::ExportDeclaration(export) => match &export.declaration {
+            Declaration::FunctionDeclaration(declaration) => {
+                Some(Declared::Standalone(declaration))
+            }
+            Declaration::ClassDeclaration(class) => Some(Declared::Class(class)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+type Outcome = Result<Function, Vec<Diagnostic>>;
+
+fn lower_declared(
+    file: &SourceFile,
+    provider: &dyn TypeProvider,
+    table: &mut TypeTable,
+    declared: Declared<'_>,
+) -> Vec<Outcome> {
+    match declared {
+        Declared::Standalone(declaration) => {
+            let Some(body) = declaration.body.as_ref() else {
+                return Vec::new();
+            };
+            let name = declaration
+                .id
+                .as_ref()
+                .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
+            vec![lower_function(
+                file,
+                provider,
+                table,
+                &name,
+                declaration,
+                body,
+            )]
+        }
+        Declared::Class(class) => lower_class(class),
+    }
+}
+
+fn lower_class(class: &Class<'_>) -> Vec<Outcome> {
+    let Some(id) = class.id.as_ref() else {
+        return vec![Err(vec![refuse(
+            "unsupported-class",
+            class.span,
+            "a class with no name is not lowered yet, because its shape is asked for by name",
+        )])];
+    };
+    let mut outcomes = Vec::new();
+    for element in &class.body.body {
+        match element {
+            ClassElement::MethodDefinition(method) => {
+                if let Some(outcome) = lower_method(id.name.as_str(), method) {
+                    outcomes.push(outcome);
+                }
+            }
+            ClassElement::StaticBlock(block) => outcomes.push(Err(vec![refuse(
+                "unsupported-class-member",
+                block.span,
+                "a static initialisation block is not lowered yet",
+            )])),
+            ClassElement::AccessorProperty(accessor) => outcomes.push(Err(vec![refuse(
+                "unsupported-class-member",
+                accessor.span,
+                "an `accessor` field is not lowered yet",
+            )])),
+            ClassElement::PropertyDefinition(property) => {
+                if property.value.is_some() {
+                    outcomes.push(Err(vec![refuse(
+                        "unsupported-class-member",
+                        property.span,
+                        "a field initialiser outside the constructor is not lowered yet",
+                    )]));
+                }
+            }
+            ClassElement::TSIndexSignature(_) => {}
+        }
+    }
+    outcomes
+}
+
+fn lower_method(class: &str, method: &MethodDefinition<'_>) -> Option<Outcome> {
+    method.value.body.as_ref()?;
+    let member = match &method.key {
+        PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+        _ => {
+            return Some(Err(vec![refuse(
+                "unsupported-class-member",
+                method.span,
+                "a computed or private member name is not lowered yet",
+            )]));
+        }
+    };
+    let what = match method.kind {
+        MethodDefinitionKind::Constructor => "a constructor body",
+        MethodDefinitionKind::Method => "a method body",
+        MethodDefinitionKind::Get | MethodDefinitionKind::Set => "an accessor body",
+    };
+    Some(Err(vec![refuse(
+        "unsupported-class-member",
+        method.span,
+        format!("{what} is not lowered yet: `{class}.{member}`"),
+    )]))
 }
 
 fn empty_block() -> Block {

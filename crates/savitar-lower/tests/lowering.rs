@@ -9120,3 +9120,194 @@ fn a_for_with_no_test_still_runs_its_update_through_the_latch() {
         "the latch jumps straight back to the header, because there is no test to branch on"
     );
 }
+
+#[test]
+fn a_method_body_is_refused_with_its_position_rather_than_skipped() {
+    let source = "class Middleware {\n  describe(): string {\n    return \"here\";\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("middleware.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("`Middleware.describe`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (2, 3));
+}
+
+#[test]
+fn a_constructor_body_is_refused_with_its_position_rather_than_skipped() {
+    let source =
+        "class Logger {\n  constructor(prefix: string) {\n    this.prefix = prefix;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("`Logger.constructor`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (2, 3));
+}
+
+#[test]
+fn an_exported_class_is_reached_through_its_export() {
+    let source = "export class Counter {\n  increment(): number {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("`Counter.increment`"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_abstract_method_signature_is_no_body_to_lower() {
+    let source = "abstract class Middleware {\n  abstract name(): string;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("abstract.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn an_overload_signature_in_a_class_is_no_body_to_lower() {
+    let source = "class Reader {\n  read(at: number): string;\n  read(at: string): string;\n  read(at: unknown): string {\n    return \"x\";\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("reader.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (4, 3));
+}
+
+#[test]
+fn a_field_with_an_initialiser_is_refused_rather_than_skipped() {
+    let source = "class Counter {\n  value: number = 0;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("field.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("field initialiser"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_field_with_no_initialiser_is_no_body_to_lower() {
+    let source = "class Counter {\n  private value: number;\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("declared.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+}
+
+#[test]
+fn a_static_initialisation_block_is_refused_rather_than_skipped() {
+    let source = "class Counter {\n  static {\n    const at = 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("block.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("static initialisation block"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_accessor_is_refused_rather_than_skipped() {
+    let source = "class Counter {\n  get value(): number {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("accessor.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0].message.contains("accessor"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_computed_member_name_is_refused_rather_than_skipped() {
+    let source =
+        "const key = \"run\";\nclass Counter {\n  [key](): number {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("computed.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("computed or private"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_class_with_no_name_is_refused_because_its_shape_is_asked_for_by_name() {
+    let source = "export default class {\n  run(): number {\n    return 1;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let provider = ByName::new(source, vec![]);
+    let file = SourceFile::new("nameless.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+}
