@@ -93,6 +93,23 @@ struct Measured {
     gaps: Vec<String>,
     initializers: usize,
     dead_ends: Vec<String>,
+    confusions: Vec<String>,
+    unanswered: Vec<String>,
+}
+
+#[derive(PartialEq, Eq)]
+enum Refusal {
+    ALanguageGap,
+    TheCompilerConfusingItself,
+    TheProviderAnsweringNothing,
+}
+
+fn what_a_refusal_means(rule: &str) -> Refusal {
+    match rule {
+        "malformed-ir" => Refusal::TheCompilerConfusingItself,
+        "no-type-answer" => Refusal::TheProviderAnsweringNothing,
+        _ => Refusal::ALanguageGap,
+    }
 }
 
 fn measure(directory: &Path, binary: &OsString) -> Measured {
@@ -128,6 +145,8 @@ fn measure(directory: &Path, binary: &OsString) -> Measured {
         gaps,
         initializers: 0,
         dead_ends: Vec::new(),
+        confusions: Vec::new(),
+        unanswered: Vec::new(),
     }
 }
 
@@ -201,6 +220,8 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
     let mut gaps: Vec<String> = Vec::new();
     let mut initializers = 0usize;
     let mut dead_ends: Vec<String> = Vec::new();
+    let mut confusions: Vec<String> = Vec::new();
+    let mut unanswered: Vec<String> = Vec::new();
 
     for path in &files {
         let text = std::fs::read_to_string(path).expect("the file should be readable");
@@ -227,13 +248,19 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         }
         for diagnostic in &report.diagnostics {
             let at = file.line_col(diagnostic.span.start);
-            gaps.push(format!(
-                "{}:{}:{} {}",
+            let said = format!(
+                "{}:{}:{} [{}] {}",
                 file.name(),
                 at.line,
                 at.column,
+                diagnostic.rule,
                 diagnostic.message
-            ));
+            );
+            match what_a_refusal_means(diagnostic.rule) {
+                Refusal::ALanguageGap => gaps.push(said),
+                Refusal::TheCompilerConfusingItself => confusions.push(said),
+                Refusal::TheProviderAnsweringNothing => unanswered.push(said),
+            }
         }
     }
 
@@ -244,6 +271,8 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         gaps,
         initializers,
         dead_ends,
+        confusions,
+        unanswered,
     }
 }
 
@@ -284,6 +313,42 @@ fn the_number_of_functions_lowered_never_falls() {
         &lowering_gap_ceiling_path(&corpus),
         measured.gaps.len(),
         &measured.gaps,
+    );
+}
+
+#[test]
+fn no_refusal_in_the_corpus_says_the_compiler_confused_itself() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = lower_corpus(&corpus, &binary);
+    assert!(
+        measured.confusions.is_empty(),
+        "{} refusals say the lowering produced code it cannot stand behind, and a bug has no budget:\n{}",
+        measured.confusions.len(),
+        measured.confusions.join("\n")
+    );
+}
+
+#[test]
+fn no_refusal_in_the_corpus_says_the_provider_answered_nothing() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = lower_corpus(&corpus, &binary);
+    assert!(
+        measured.unanswered.is_empty(),
+        "{} refusals say the provider has no type at a position the corpus reaches, which is a project or provider problem and not a language gap:\n{}",
+        measured.unanswered.len(),
+        measured.unanswered.join("\n")
     );
 }
 
