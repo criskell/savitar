@@ -1386,3 +1386,118 @@ fn a_declaration_in_an_unopened_file_still_reaches_the_fused_type() {
 
     std::fs::remove_dir_all(&project).ok();
 }
+
+const NEVER_OPENED: &str = concat!(
+    "export const limit = 8;\n",
+    "export function under(count: number): boolean {\n",
+    "  return count < limit;\n",
+    "}\n",
+);
+
+#[test]
+fn a_position_in_a_file_the_snapshot_never_opened_still_answers() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_of(&[
+        ("opened.ts", "export const here = 1;\n"),
+        ("closed.ts", NEVER_OPENED),
+    ]);
+    let opened = project.join("opened.ts");
+    let closed = project.join("closed.ts");
+    let api = TsApi::start(&binary, &project, &[opened.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let path = closed.to_str().expect("utf-8 path");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(NEVER_OPENED, "const limit"), 0),
+    );
+    let Answer::Known(limit) = answer else {
+        panic!("expected a known type for `limit` in the unopened file, got {answer:?}");
+    };
+    assert_eq!(
+        *table.kind(limit),
+        TypeKind::NumberLiteral(8.0_f64.to_bits()),
+        "a position in a file outside the open list must answer, or the CLI cannot lower the graph"
+    );
+
+    let answer = api.type_at(
+        &mut table,
+        path,
+        Span::new(position_in(NEVER_OPENED, "function under"), 0),
+    );
+    let Answer::Known(under) = answer else {
+        panic!("expected a known type for `under` in the unopened file, got {answer:?}");
+    };
+    let TypeKind::Function {
+        parameters,
+        returns,
+        ..
+    } = table.kind(under).clone()
+    else {
+        panic!("`under` should arrive as a function");
+    };
+    assert_eq!(parameters.len(), 1);
+    assert_eq!(*table.kind(returns), TypeKind::Boolean);
+
+    std::fs::remove_dir_all(&project).ok();
+}
+
+fn scratch_project_including_only(folder: &str, files: &[(&str, &str)]) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock before the epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("savitar-outside-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(dir.join(folder)).expect("could not create the scratch project");
+    std::fs::write(
+        dir.join("tsconfig.json"),
+        format!("{{ \"compilerOptions\": {{ \"strict\": true }}, \"include\": [\"{folder}\"] }}"),
+    )
+    .expect("could not write tsconfig.json");
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).expect("could not write a fixture file");
+    }
+    dir
+}
+
+#[test]
+fn a_position_in_a_file_the_project_excludes_reports_a_file_the_provider_cannot_find() {
+    let Some(binary) = provider_binary() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let project = scratch_project_including_only(
+        "src",
+        &[
+            ("src/opened.ts", "export const here = 1;\n"),
+            ("outside.ts", NEVER_OPENED),
+        ],
+    );
+    let opened = project.join("src/opened.ts");
+    let outside = project.join("outside.ts");
+    let api = TsApi::start(&binary, &project, &[opened.as_path()])
+        .expect("the provider should start and create a snapshot");
+    let mut table = TypeTable::new();
+
+    let answer = api.type_at(
+        &mut table,
+        outside.to_str().expect("utf-8 path"),
+        Span::new(position_in(NEVER_OPENED, "const limit"), 0),
+    );
+    let Answer::Unsupported(reason) = answer else {
+        panic!("a file the tsconfig leaves out should not be typed, got {answer:?}");
+    };
+    assert!(
+        reason.contains("source file not found"),
+        "the provider names the file it cannot find; it said: {reason}"
+    );
+
+    std::fs::remove_dir_all(&project).ok();
+}
