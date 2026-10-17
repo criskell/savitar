@@ -16,15 +16,25 @@ pub enum ModuleName {
     AWholeModule { specifier: String },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhatTheFileHolds {
+    CheckedCode,
+    DeclarationsWithNoCodeBehindThem,
+}
+
+#[derive(Debug)]
 pub struct ModuleNames {
     held: BTreeMap<String, ModuleName>,
+    holds: WhatTheFileHolds,
 }
 
 impl ModuleNames {
     #[must_use]
-    pub fn of(body: &[AstStatement<'_>]) -> Self {
-        let mut names = Self::default();
+    pub fn of(body: &[AstStatement<'_>], holds: WhatTheFileHolds) -> Self {
+        let mut names = Self {
+            held: BTreeMap::new(),
+            holds,
+        };
         for statement in body {
             match statement {
                 AstStatement::ImportDeclaration(declaration) => names.take_import(declaration),
@@ -78,11 +88,19 @@ impl ModuleNames {
         let Some(id) = class.id.as_ref() else {
             return;
         };
-        if class.declare {
+        if self.nothing_is_behind(class.declare) {
             self.put(id.name.as_str(), ModuleName::DeclaredWithNoCodeBehindIt);
         } else {
             self.put(id.name.as_str(), ModuleName::AClassBoundWhereDeclared);
         }
+    }
+
+    const fn nothing_is_behind(&self, written_declare: bool) -> bool {
+        written_declare
+            || matches!(
+                self.holds,
+                WhatTheFileHolds::DeclarationsWithNoCodeBehindThem
+            )
     }
 
     fn take_declaration(&mut self, declaration: &Declaration<'_>) {
@@ -95,9 +113,14 @@ impl ModuleNames {
     }
 
     fn take_variables(&mut self, declaration: &VariableDeclaration<'_>) {
+        let held = if self.nothing_is_behind(declaration.declare) {
+            ModuleName::DeclaredWithNoCodeBehindIt
+        } else {
+            ModuleName::BoundByTheInitializer
+        };
         for declarator in &declaration.declarations {
             for name in names_bound_by(&declarator.id) {
-                self.put(&name, ModuleName::BoundByTheInitializer);
+                self.put(&name, held.clone());
             }
         }
     }

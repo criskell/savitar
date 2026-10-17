@@ -108,7 +108,9 @@ fn what_a_refusal_means(rule: &str) -> Refusal {
     match rule {
         "malformed-ir" | "flow-invented-a-path" => Refusal::TheCompilerConfusingItself,
         "no-type-answer" => Refusal::TheProviderAnsweringNothing,
-        "unsupported-declared-boundary" => Refusal::ALanguageGap,
+        "unsupported-declared-boundary" | "unsupported-ambient-declaration" => {
+            Refusal::ALanguageGap
+        }
         _ => Refusal::ALanguageGap,
     }
 }
@@ -294,6 +296,10 @@ fn the_id_that_says_the_flow_invented_a_path_is_registered_as_a_bug_and_not_a_la
     assert!(
         what_a_refusal_means("unsupported-declared-boundary") == Refusal::ALanguageGap,
         "a boundary that declares without checked code behind it is an open language gap and keeps its budget"
+    );
+    assert!(
+        what_a_refusal_means("unsupported-ambient-declaration") == Refusal::ALanguageGap,
+        "a declaration with no code behind it is an open language gap and keeps its budget"
     );
 }
 

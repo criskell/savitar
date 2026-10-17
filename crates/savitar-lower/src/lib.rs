@@ -27,7 +27,7 @@ use savitar_ir::{
 use savitar_typeinfo::{Answer, TypeProvider};
 use savitar_types::{Field, TypeId, TypeKind, TypeTable};
 
-use names::{ModuleName, ModuleNames, is_a_package_specifier, names_bound_by};
+use names::{ModuleName, ModuleNames, WhatTheFileHolds, is_a_package_specifier, names_bound_by};
 pub use standing::{ModuleStanding, Ran, Standing, TwoModulesForOneSpecifier};
 pub use types::{binary_result, element_result, field_result, unary_result};
 
@@ -577,7 +577,16 @@ pub fn lower_in_order(
 
     let mut functions = Vec::new();
     let mut diagnostics = Vec::new();
-    let module_names = ModuleNames::of(&parsed.program.body);
+    let holds = if source_type.is_typescript_definition() {
+        WhatTheFileHolds::DeclarationsWithNoCodeBehindThem
+    } else {
+        WhatTheFileHolds::CheckedCode
+    };
+    let module_names = ModuleNames::of(&parsed.program.body, holds);
+    let declares = WhatTheModuleDeclares {
+        names: &module_names,
+        holds,
+    };
     let surroundings = Surroundings {
         file,
         provider,
@@ -590,7 +599,7 @@ pub fn lower_in_order(
     let mut rebound_by_refused_code: BTreeSet<String> = BTreeSet::new();
 
     for statement in &parsed.program.body {
-        match at_module_level(statement) {
+        match at_module_level(statement, declares) {
             AtModuleLevel::Lowered(declared) => {
                 note_what_a_declaration_binds(declared, &mut hoisted, &mut binds);
                 for outcome in lower_declared(surroundings, table, declared) {
@@ -614,6 +623,16 @@ pub fn lower_in_order(
                 }
                 rebound_by_refused_code.extend(names_a_refused_statement_could_rebind(statement));
                 diagnostics.push(refuse_at_module_level(statement_span(statement), form));
+            }
+            AtModuleLevel::Declares(form) => {
+                if refused_before.is_none() {
+                    refused_before = Some(binds.len());
+                }
+                rebound_by_refused_code.extend(names_a_refused_statement_could_rebind(statement));
+                diagnostics.push(refuse_a_declaration_with_nothing_behind_it(
+                    statement_span(statement),
+                    form,
+                ));
             }
         }
     }
@@ -743,13 +762,75 @@ enum AtModuleLevel<'a> {
     CarriesNoCode,
     NotLowered(&'static str),
     Forwards(&'static str),
+    Declares(&'static str),
 }
 
-fn initializes_or_refuses<'a>(declaration: &'a VariableDeclaration<'a>) -> AtModuleLevel<'a> {
+#[derive(Clone, Copy)]
+struct WhatTheModuleDeclares<'a> {
+    names: &'a ModuleNames,
+    holds: WhatTheFileHolds,
+}
+
+impl WhatTheModuleDeclares<'_> {
+    const fn every_declaration_is_ambient(self) -> bool {
+        matches!(
+            self.holds,
+            WhatTheFileHolds::DeclarationsWithNoCodeBehindThem
+        )
+    }
+
+    fn nothing_is_behind_this_function(self, declaration: &oxc_ast::ast::Function<'_>) -> bool {
+        if declaration.body.is_some() {
+            return false;
+        }
+        declaration.id.as_ref().is_none_or(|id| {
+            self.names.get(id.name.as_str()) != Some(&ModuleName::AHoistedFunction)
+        })
+    }
+
+    fn nothing_is_behind_this_class(self, class: &Class<'_>) -> bool {
+        class.declare || self.every_declaration_is_ambient()
+    }
+
+    fn nothing_is_behind_these_variables(self, declaration: &VariableDeclaration<'_>) -> bool {
+        declaration.declare || self.every_declaration_is_ambient()
+    }
+}
+
+fn initializes_or_refuses<'a>(
+    declaration: &'a VariableDeclaration<'a>,
+    declares: WhatTheModuleDeclares<'_>,
+) -> AtModuleLevel<'a> {
+    if declares.nothing_is_behind_these_variables(declaration) {
+        return AtModuleLevel::Declares("a variable declared with no initialiser behind it");
+    }
     if declaration.kind == VariableDeclarationKind::Var {
         return AtModuleLevel::NotLowered("a `var` declaration");
     }
     AtModuleLevel::Initializes(declaration)
+}
+
+fn lowered_or_declares<'a>(
+    declaration: &'a oxc_ast::ast::Function<'a>,
+    declares: WhatTheModuleDeclares<'_>,
+) -> AtModuleLevel<'a> {
+    if declaration.body.is_some() {
+        return AtModuleLevel::Lowered(Declared::Standalone(declaration));
+    }
+    if declares.nothing_is_behind_this_function(declaration) {
+        return AtModuleLevel::Declares("a function declared with no body");
+    }
+    AtModuleLevel::CarriesNoCode
+}
+
+fn lowered_or_declares_a_class<'a>(
+    class: &'a Class<'a>,
+    declares: WhatTheModuleDeclares<'_>,
+) -> AtModuleLevel<'a> {
+    if declares.nothing_is_behind_this_class(class) {
+        return AtModuleLevel::Declares("a class declared with no code behind it");
+    }
+    AtModuleLevel::Lowered(Declared::Class(class))
 }
 
 fn every_forwarded_name_is_a_type(declaration: &oxc_ast::ast::ExportFromDeclaration<'_>) -> bool {
@@ -772,6 +853,21 @@ fn refuse_a_forwarded_name(span: oxc_span::Span, form: &'static str) -> Diagnost
     )
 }
 
+fn refuse_a_declaration_with_nothing_behind_it(
+    span: oxc_span::Span,
+    form: &'static str,
+) -> Diagnostic {
+    Diagnostic::unsupported(
+        "unsupported-ambient-declaration",
+        span_of(span),
+        format!("{form} binds no name, because nothing this module emits stands behind it"),
+    )
+    .with_help(
+        "a declared boundary is not a verified boundary: Savitar takes a name only where \
+         checked code binds it, so the declaration is refused where it is written",
+    )
+}
+
 fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnostic {
     Diagnostic::unsupported(
         "unsupported-module-statement",
@@ -784,19 +880,24 @@ fn refuse_at_module_level(span: oxc_span::Span, form: &'static str) -> Diagnosti
     )
 }
 
-fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
+fn at_module_level<'a>(
+    statement: &'a AstStatement<'a>,
+    declares: WhatTheModuleDeclares<'_>,
+) -> AtModuleLevel<'a> {
     match statement {
         AstStatement::FunctionDeclaration(declaration) => {
-            AtModuleLevel::Lowered(Declared::Standalone(declaration))
+            lowered_or_declares(declaration, declares)
         }
-        AstStatement::ClassDeclaration(class) => AtModuleLevel::Lowered(Declared::Class(class)),
-        AstStatement::ExportDeclaration(export) => declared_by_export(&export.declaration),
+        AstStatement::ClassDeclaration(class) => lowered_or_declares_a_class(class, declares),
+        AstStatement::ExportDeclaration(export) => {
+            declared_by_export(&export.declaration, declares)
+        }
         AstStatement::ExportDefaultDeclaration(export) => match &export.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(declaration) => {
-                AtModuleLevel::Lowered(Declared::Standalone(declaration))
+                lowered_or_declares(declaration, declares)
             }
             ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-                AtModuleLevel::Lowered(Declared::Class(class))
+                lowered_or_declares_a_class(class, declares)
             }
             ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => AtModuleLevel::CarriesNoCode,
             _ => AtModuleLevel::NotLowered("an `export default` of a value"),
@@ -823,21 +924,26 @@ fn at_module_level<'a>(statement: &'a AstStatement<'a>) -> AtModuleLevel<'a> {
                 AtModuleLevel::Forwards("a re-export of everything another module exports")
             }
         }
-        AstStatement::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
+        AstStatement::VariableDeclaration(declaration) => {
+            initializes_or_refuses(declaration, declares)
+        }
         other => AtModuleLevel::NotLowered(module_level_form(other)),
     }
 }
 
-fn declared_by_export<'a>(declaration: &'a Declaration<'a>) -> AtModuleLevel<'a> {
+fn declared_by_export<'a>(
+    declaration: &'a Declaration<'a>,
+    declares: WhatTheModuleDeclares<'_>,
+) -> AtModuleLevel<'a> {
     match declaration {
-        Declaration::FunctionDeclaration(declaration) => {
-            AtModuleLevel::Lowered(Declared::Standalone(declaration))
-        }
-        Declaration::ClassDeclaration(class) => AtModuleLevel::Lowered(Declared::Class(class)),
+        Declaration::FunctionDeclaration(declaration) => lowered_or_declares(declaration, declares),
+        Declaration::ClassDeclaration(class) => lowered_or_declares_a_class(class, declares),
         Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
             AtModuleLevel::CarriesNoCode
         }
-        Declaration::VariableDeclaration(declaration) => initializes_or_refuses(declaration),
+        Declaration::VariableDeclaration(declaration) => {
+            initializes_or_refuses(declaration, declares)
+        }
         Declaration::TSEnumDeclaration(_) => AtModuleLevel::NotLowered("an enum declaration"),
         Declaration::TSExternalModuleDeclaration(_) => {
             AtModuleLevel::NotLowered("a `declare module` declaration")

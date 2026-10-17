@@ -69,6 +69,10 @@ fn returning(table: &mut TypeTable, returns: savitar_types::TypeId) -> Answer {
     Answer::Known(table.function(Vec::new(), returns))
 }
 
+fn rules_of(diagnostics: &[savitar_diagnostics::Diagnostic]) -> Vec<&str> {
+    diagnostics.iter().map(|one| one.rule).collect()
+}
+
 const ADD: &str = "function add(left: number, right: number): number {\n  const sum = left + right;\n  return sum;\n}\n";
 
 #[test]
@@ -10677,9 +10681,13 @@ fn an_arrow_in_an_object_literal_takes_the_signature_the_field_declares() {
 }
 
 fn walked(source: &str) -> savitar_lower::LowerReport {
+    walked_as("module.ts", source)
+}
+
+fn walked_as(name: &str, source: &str) -> savitar_lower::LowerReport {
     let mut table = TypeTable::new();
     let provider = ByName::new(source, Vec::new());
-    let file = SourceFile::new("module.ts", source);
+    let file = SourceFile::new(name.to_string(), source);
     lower(&file, &provider, &mut table)
 }
 
@@ -12808,14 +12816,21 @@ fn reading_a_name_declared_with_no_code_behind_it_is_refused_by_name() {
     let report = lower(&file, &provider, &mut table);
 
     assert!(report.initializer.is_none());
-    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
-    assert_eq!(report.diagnostics[0].rule, "unsupported-ambient-name");
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec![
+            "unsupported-ambient-declaration",
+            "unsupported-ambient-name"
+        ],
+        "{:?}",
+        report.diagnostics
+    );
     assert!(
-        report.diagnostics[0]
+        report.diagnostics[1]
             .message
             .contains("declared without code behind it"),
         "{}",
-        report.diagnostics[0].message
+        report.diagnostics[1].message
     );
 }
 
@@ -12840,6 +12855,129 @@ fn an_overload_signature_does_not_stop_the_implementation_from_binding_the_name(
 #[test]
 fn an_interface_alone_still_binds_no_name_and_needs_no_initializer() {
     let report = walked("export interface Shape {\n  size: number;\n}\n");
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert!(report.initializer.is_none());
+}
+
+#[test]
+fn an_ambient_function_is_refused_where_it_is_declared_and_not_only_where_it_is_read() {
+    let report = walked("declare function clock(): number;\n");
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec!["unsupported-ambient-declaration"],
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.functions.is_empty());
+    assert!(report.initializer.is_none());
+    assert!(report.published.is_empty());
+}
+
+#[test]
+fn an_ambient_class_is_refused_where_it_is_declared() {
+    let report = walked("declare class Widget {\n  size: number;\n}\n");
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec!["unsupported-ambient-declaration"],
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.published.is_empty());
+}
+
+#[test]
+fn an_ambient_variable_is_refused_as_a_declaration_and_not_as_a_missing_initialiser() {
+    let report = walked("declare const port: number;\n");
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec!["unsupported-ambient-declaration"],
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.published.is_empty());
+}
+
+#[test]
+fn a_top_level_declaration_with_no_initialiser_is_still_refused_as_a_missing_initialiser() {
+    let report = walked("let port: number;\n");
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec!["unsupported-module-statement"],
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn an_overload_signature_is_not_mistaken_for_an_ambient_declaration() {
+    let source = "function pick(): void;\nfunction pick(): void {\n}\n";
+    let report = walked(source);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn a_bodyless_function_no_declaration_in_the_module_implements_is_refused() {
+    let report = walked("function pick(): void;\n");
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec!["unsupported-ambient-declaration"],
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn a_declaration_file_is_refused_rather_than_called_sound_with_nothing_proved() {
+    let source = "export declare function go(n: number): number;\nexport declare class Holder {\n  size: number;\n}\n";
+    let report = walked_as("surface.d.ts", source);
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec![
+            "unsupported-ambient-declaration",
+            "unsupported-ambient-declaration"
+        ],
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.functions.is_empty());
+    assert!(report.published.is_empty());
+}
+
+#[test]
+fn a_declaration_file_refuses_a_declaration_that_omits_the_declare_keyword() {
+    let report = walked_as(
+        "surface.d.ts",
+        "export function go(n: number): number;\nexport class Holder {\n  size: number;\n}\nexport const label: string;\n",
+    );
+
+    assert_eq!(
+        rules_of(&report.diagnostics),
+        vec![
+            "unsupported-ambient-declaration",
+            "unsupported-ambient-declaration",
+            "unsupported-ambient-declaration"
+        ],
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(report.published.is_empty());
+}
+
+#[test]
+fn an_interface_in_a_declaration_file_still_carries_no_code_and_is_not_refused() {
+    let report = walked_as(
+        "surface.d.ts",
+        "export interface Shape {\n  size: number;\n}\nexport type Pair = [number, number];\n",
+    );
 
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
     assert!(report.initializer.is_none());
