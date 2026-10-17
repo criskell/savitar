@@ -17,5 +17,8 @@ oxc_parser.workspace = true
 oxc_span.workspace = true
 oxc_syntax = "0.154.0"
 
+[dev-dependencies]
+savitar-typeinfo-tsapi.workspace = true
+
 [lints]
 workspace = true

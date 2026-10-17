@@ -597,6 +597,7 @@ dependencies = [
  "savitar-diagnostics",
  "savitar-ir",
  "savitar-typeinfo",
+ "savitar-typeinfo-tsapi",
  "savitar-types",
 ]
 
