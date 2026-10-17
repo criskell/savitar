@@ -10708,3 +10708,60 @@ fn an_arrow_returned_from_the_function_that_made_it_lowers_because_its_capture_i
     };
     assert_eq!(report.functions[0].type_of(returned), signature);
 }
+
+#[test]
+fn capturing_a_name_narrowed_by_a_field_fact_is_refused_because_the_closure_outlives_the_call() {
+    let source = "function use(frame: Frame): number {\n  if (frame.kind === \"binary\") {\n    const read: Resolver = () => frame.size;\n    return read();\n  }\n  return 0;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let tags = frame_tags(&mut table);
+    let shapes = frames(&mut table, tags, false);
+    let signature = resolver(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, number)),
+            ("frame", Answer::Known(shapes.union)),
+            ("kind", Answer::Known(shapes.tags)),
+            ("read", Answer::Known(signature)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-capture");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("fact about one of its fields"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn an_arrow_in_an_object_literal_takes_the_signature_the_field_declares() {
+    let source = "function use(base: number): Handlers {\n  return { answer: () => base };\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let signature = resolver(&mut table);
+    let handlers = table.object(vec![named_field("answer", signature, false)]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("use", returning(&mut table, handlers)),
+            ("base", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("use.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 2);
+    let made = &report.functions[1];
+    assert_eq!(made.captures().len(), 1);
+    assert_eq!(made.captures()[0].name, "base");
+}

@@ -1081,6 +1081,15 @@ impl Context<'_> {
                 ),
             )]);
         }
+        if binding.narrowed_by_a_field {
+            return Err(vec![refuse(
+                "unsupported-capture",
+                span,
+                format!(
+                    "`{name}` is narrowed here by a fact about one of its fields, and a call could falsify that fact while this closure still holds the narrowed value"
+                ),
+            )]);
+        }
         let outer = binding.value_or_refuse(name, span)?;
         let declared = capturing.holder.type_of(outer);
         let inner = function.declare_capture(name, declared);
