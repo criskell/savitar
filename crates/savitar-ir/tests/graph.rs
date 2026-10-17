@@ -535,3 +535,17 @@ fn reading_a_module_binding_or_an_import_uses_no_other_value() {
 
     assert_eq!(verify(&function), vec![]);
 }
+
+#[test]
+fn a_declared_binding_names_a_name_and_uses_no_value() {
+    let mut function = Function::new("module");
+    function.add_block(block(
+        vec![Statement::BindDeclared {
+            name: "handle".to_string(),
+            span: nowhere(),
+        }],
+        Terminator::Return(None),
+    ));
+
+    assert_eq!(verify(&function), vec![]);
+}

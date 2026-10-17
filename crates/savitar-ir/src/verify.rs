@@ -195,6 +195,7 @@ fn statement_uses(statement: &Statement) -> Vec<ValueId> {
             used
         }
         Statement::BindModule { value, .. } => vec![*value],
+        Statement::BindDeclared { .. } => Vec::new(),
     }
 }
 

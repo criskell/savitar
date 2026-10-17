@@ -161,6 +161,10 @@ pub enum Statement {
         value: ValueId,
         span: Span,
     },
+    BindDeclared {
+        name: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
