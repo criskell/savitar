@@ -9121,6 +9121,23 @@ fn a_for_with_no_test_still_runs_its_update_through_the_latch() {
     );
 }
 
+fn constructing_shape(
+    table: &mut TypeTable,
+    parameters: Vec<savitar_types::TypeId>,
+    instance: savitar_types::TypeId,
+) -> savitar_types::TypeId {
+    let taken = parameters
+        .into_iter()
+        .map(|type_id| savitar_types::Parameter {
+            type_id,
+            rest: false,
+            optional: false,
+        })
+        .collect();
+    let form = table.function(taken, instance);
+    table.constructor(vec![form])
+}
+
 fn held_field(table: &mut TypeTable, readonly: bool) -> savitar_types::TypeId {
     let number = table.intern(TypeKind::Number);
     table.object(vec![Field {
@@ -9236,15 +9253,17 @@ fn writing_a_readonly_field_inside_the_constructor_of_its_class_is_allowed() {
 }
 
 #[test]
-fn writing_a_readonly_field_in_the_constructor_of_a_derived_class_is_refused() {
-    let source = "class Counter extends Base {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+fn writing_a_readonly_field_a_base_class_declares_is_refused_in_the_constructor_of_the_heir() {
+    let source = "class Counter extends Base {\n  constructor(start: number) {\n    super();\n    this.held = start;\n  }\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
     let shape = held_field(&mut table, true);
+    let base = constructing_shape(&mut table, Vec::new(), shape);
     let provider = ByName::new(
         source,
         vec![
             ("Counter", Answer::Known(shape)),
+            ("Base", Answer::Known(base)),
             ("start", Answer::Known(number)),
         ],
     );
@@ -9258,22 +9277,48 @@ fn writing_a_readonly_field_in_the_constructor_of_a_derived_class_is_refused() {
     assert!(
         report.diagnostics[0]
             .message
-            .contains("which class declares it"),
+            .contains("declared readonly by a base class"),
         "{}",
         report.diagnostics[0].message
     );
 }
 
 #[test]
-fn writing_a_mutable_field_in_the_constructor_of_a_derived_class_still_lowers() {
-    let source = "class Counter extends Base {\n  constructor(start: number) {\n    this.held = start;\n  }\n}\n";
+fn writing_a_readonly_field_the_derived_class_declares_itself_lowers_in_its_constructor() {
+    let source = "class Counter extends Base {\n  constructor(start: number) {\n    super();\n    this.held = start;\n  }\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
-    let shape = held_field(&mut table, false);
+    let shape = held_field(&mut table, true);
+    let nothing = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), nothing);
     let provider = ByName::new(
         source,
         vec![
             ("Counter", Answer::Known(shape)),
+            ("Base", Answer::Known(base)),
+            ("start", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("counter.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+}
+
+#[test]
+fn writing_a_mutable_field_in_the_constructor_of_a_derived_class_still_lowers() {
+    let source = "class Counter extends Base {\n  constructor(start: number) {\n    super();\n    this.held = start;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let shape = held_field(&mut table, false);
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Counter", Answer::Known(shape)),
+            ("Base", Answer::Known(base)),
             ("start", Answer::Known(number)),
         ],
     );
@@ -9426,8 +9471,256 @@ fn this_in_a_static_method_is_refused_because_nothing_binds_it() {
 }
 
 #[test]
-fn super_in_a_constructor_is_refused_by_name_rather_than_guessed() {
+fn a_base_constructor_call_lowers_to_a_base_construction_on_the_receiver() {
     let source = "class Logger extends Middleware {\n  constructor() {\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    let function = &report.functions[0];
+    assert_eq!(function.name(), "Logger.constructor");
+    assert_eq!(verify(function), vec![]);
+
+    let receiver = function.parameters()[0];
+    let entry = function.entry().expect("a block");
+    let constructed = function
+        .block(entry)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::ConstructBase {
+                base_class,
+                object,
+                arguments,
+                ..
+            } => Some((base_class.clone(), *object, arguments.clone())),
+            _ => None,
+        })
+        .expect("the base construction should be lowered");
+    assert_eq!(constructed.0, "Middleware");
+    assert_eq!(constructed.1, receiver);
+    assert!(constructed.2.is_empty());
+}
+
+#[test]
+fn an_argument_to_a_base_constructor_is_proved_against_the_parameters_of_the_base() {
+    let source = "class Logger extends Middleware {\n  constructor(prefix: string) {\n    super(prefix);\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, vec![text], shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+            ("prefix", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(report.functions.len(), 1);
+    let function = &report.functions[0];
+    let entry = function.entry().expect("a block");
+    let passed = function
+        .block(entry)
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::ConstructBase { arguments, .. } => Some(arguments.clone()),
+            _ => None,
+        })
+        .expect("the base construction should be lowered");
+    assert_eq!(passed.len(), 1);
+    assert_eq!(table.kind(function.type_of(passed[0])), &TypeKind::String);
+}
+
+#[test]
+fn an_argument_to_a_base_constructor_that_the_base_does_not_take_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor(prefix: string) {\n    super(prefix);\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let number = table.intern(TypeKind::Number);
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, vec![number], shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+            ("prefix", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (3, 5));
+}
+
+#[test]
+fn a_base_constructor_call_that_is_not_the_first_statement_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor(prefix: string) {\n    const kept = prefix;\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let text = table.intern(TypeKind::String);
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+            ("prefix", Answer::Known(text)),
+            ("kept", Answer::Known(text)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("first statement"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_derived_constructor_that_never_calls_the_base_constructor_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor() {\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+}
+
+#[test]
+fn calling_the_base_constructor_twice_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor() {\n    super();\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert!(
+        report.diagnostics[0].message.contains("more than once"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (4, 5));
+}
+
+#[test]
+fn a_base_constructor_call_in_a_method_is_refused() {
+    let source = "class Logger extends Middleware {\n  reset(): void {\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let nothing = table.intern(TypeKind::Void);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+            ("reset", returning(&mut table, nothing)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("inside a constructor"),
+        "{}",
+        report.diagnostics[0].message
+    );
+    let at = file.line_col(report.diagnostics[0].span.start);
+    assert_eq!((at.line, at.column), (3, 5));
+}
+
+#[test]
+fn a_base_constructor_call_used_as_a_value_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor() {\n    super();\n    const made = super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let base = constructing_shape(&mut table, Vec::new(), shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0].message.contains("yields no value"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn a_base_class_that_is_not_a_name_is_refused_rather_than_constructed_by_guess() {
+    let source =
+        "class Logger extends mixin(Middleware) {\n  constructor() {\n    super();\n  }\n}\n";
     let mut table = TypeTable::new();
     let shape = table.object(Vec::new());
     let provider = ByName::new(source, vec![("Logger", Answer::Known(shape))]);
@@ -9437,13 +9730,40 @@ fn super_in_a_constructor_is_refused_by_name_rather_than_guessed() {
 
     assert!(report.functions.is_empty());
     assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class");
     assert!(
-        report.diagnostics[0].message.contains("`super`"),
+        report.diagnostics[0].message.contains("not a name"),
         "{}",
         report.diagnostics[0].message
     );
-    let at = file.line_col(report.diagnostics[0].span.start);
-    assert_eq!((at.line, at.column), (3, 5));
+}
+
+#[test]
+fn a_base_name_that_answers_no_construct_signature_is_refused() {
+    let source = "class Logger extends Middleware {\n  constructor() {\n    super();\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let shape = table.object(Vec::new());
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Logger", Answer::Known(shape)),
+            ("Middleware", Answer::Known(shape)),
+        ],
+    );
+    let file = SourceFile::new("logger.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("no way to construct"),
+        "{}",
+        report.diagnostics[0].message
+    );
 }
 
 #[test]

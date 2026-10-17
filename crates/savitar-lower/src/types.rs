@@ -500,17 +500,16 @@ pub enum SlotRefusal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Writing {
+pub enum Writing<'a> {
     Plainly,
-    WhileConstructing,
-    WhileConstructingAnHeir,
+    WhileConstructing { inherited: &'a [String] },
 }
 
 pub fn field_slots(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
-    writing: Writing,
+    writing: Writing<'_>,
 ) -> Result<Vec<TypeId>, SlotRefusal> {
     let TypeKind::Union(members) = table.kind(object).clone() else {
         return field_slot(table, object, name, writing).map(|slot| vec![slot]);
@@ -543,7 +542,7 @@ pub fn field_slot(
     table: &mut TypeTable,
     object: TypeId,
     name: &str,
-    writing: Writing,
+    writing: Writing<'_>,
 ) -> Result<TypeId, SlotRefusal> {
     let TypeKind::Object { fields, .. } = table.kind(object).clone() else {
         return Err(SlotRefusal::Shapeless(format!(
@@ -558,15 +557,15 @@ pub fn field_slot(
         }
         if field.readonly {
             match writing {
-                Writing::WhileConstructing => {}
+                Writing::WhileConstructing { inherited } if !inherited.contains(&field.name) => {}
+                Writing::WhileConstructing { .. } => {
+                    return Err(SlotRefusal::Declined(format!(
+                        "`{name}` is declared readonly by a base class, and only the constructor of the class that declares it may write it"
+                    )));
+                }
                 Writing::Plainly => {
                     return Err(SlotRefusal::Declined(format!(
                         "`{name}` is declared readonly and admits no write outside the constructor of its class"
-                    )));
-                }
-                Writing::WhileConstructingAnHeir => {
-                    return Err(SlotRefusal::Declined(format!(
-                        "`{name}` is declared readonly, and the shape of a derived class does not say which class declares it"
                     )));
                 }
             }
@@ -843,6 +842,30 @@ pub fn constructible_forms(table: &TypeTable, signature: TypeId) -> Result<Vec<T
         TypeKind::Constructor(forms) => Ok(forms.clone()),
         _ => Err("this value declares no way to construct it".to_string()),
     }
+}
+
+pub fn fields_of_what_is_constructed(
+    table: &TypeTable,
+    forms: &[TypeId],
+) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = Vec::new();
+    for &form in forms {
+        let TypeKind::Function { returns, .. } = table.kind(form) else {
+            return Err("a construct signature the provider gives no parameters for".to_string());
+        };
+        let TypeKind::Object { fields, .. } = table.kind(*returns) else {
+            return Err(
+                "a construct signature whose instance has no declared shape, so which fields it declares is unknown"
+                    .to_string(),
+            );
+        };
+        for field in fields {
+            if !names.contains(&field.name) {
+                names.push(field.name.clone());
+            }
+        }
+    }
+    Ok(names)
 }
 
 pub fn fits_call_with(
