@@ -924,14 +924,17 @@ pub fn fits_call_with(
 }
 
 pub fn argument_types(
-    table: &TypeTable,
+    table: &mut TypeTable,
     callee: TypeId,
     given: usize,
 ) -> Result<Vec<TypeId>, String> {
-    let TypeKind::Function { parameters, .. } = table.kind(callee) else {
+    let TypeKind::Function { parameters, .. } = table.kind(callee).clone() else {
         return Err("this value is not callable".to_string());
     };
-    let rest = parameters.last().filter(|parameter| parameter.rest);
+    let rest = parameters
+        .last()
+        .filter(|parameter| parameter.rest)
+        .cloned();
     let fixed = parameters.len() - usize::from(rest.is_some());
     if given < fixed {
         let left_out = parameters[given..fixed]
@@ -950,20 +953,27 @@ pub fn argument_types(
         return Ok(parameters
             .iter()
             .take(given)
-            .map(|parameter| parameter.type_id)
+            .map(|parameter| slot_of_parameter(table, parameter))
             .collect());
     };
-    let (TypeKind::Array(element) | TypeKind::ReadonlyArray(element)) = table.kind(rest.type_id)
+    let (TypeKind::Array(element) | TypeKind::ReadonlyArray(element)) = *table.kind(rest.type_id)
     else {
         return Err("a rest parameter whose type is not an array is not lowered yet".to_string());
     };
     let mut wanted: Vec<TypeId> = parameters
         .iter()
         .take(fixed)
-        .map(|parameter| parameter.type_id)
+        .map(|parameter| slot_of_parameter(table, parameter))
         .collect();
-    wanted.resize(given, *element);
+    wanted.resize(given, element);
     Ok(wanted)
+}
+
+fn slot_of_parameter(table: &mut TypeTable, parameter: &savitar_types::Parameter) -> TypeId {
+    if parameter.optional {
+        return table.optional(parameter.type_id);
+    }
+    parameter.type_id
 }
 
 pub fn widen(table: &mut TypeTable, id: TypeId) -> TypeId {

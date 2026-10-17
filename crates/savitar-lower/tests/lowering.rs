@@ -8496,7 +8496,7 @@ fn a_call_that_omits_the_argument_a_default_fills_is_lowered() {
 }
 
 #[test]
-fn passing_undefined_where_a_default_waits_is_refused_although_the_entry_admits_undefined() {
+fn passing_undefined_where_a_default_waits_is_lowered_like_omitting_the_argument() {
     let source = "function callIt(): number {\n  return given(undefined);\n}\n";
     let mut table = TypeTable::new();
     let number = table.intern(TypeKind::Number);
@@ -8509,11 +8509,35 @@ fn passing_undefined_where_a_default_waits_is_refused_although_the_entry_admits_
 
     let report = lower(&file, &provider, &mut table);
 
-    assert!(report.functions.is_empty());
-    assert_eq!(
-        report.diagnostics[0].rule, "unsupported-argument",
-        "the signature carries the parameter type without undefined, and the call proof reads it"
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
+}
+
+#[test]
+fn passing_undefined_where_the_parameter_is_required_is_still_refused() {
+    let source = "function callIt(): number {\n  return given(undefined);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = Answer::Known(table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: false,
+        }],
+        number,
+    ));
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
     );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-argument");
 }
 
 #[test]
@@ -11084,4 +11108,113 @@ fn an_arrow_in_an_object_literal_takes_the_signature_the_field_declares() {
     let made = &report.functions[1];
     assert_eq!(made.captures().len(), 1);
     assert_eq!(made.captures()[0].name, "base");
+}
+
+fn two_optional_overloads(table: &mut TypeTable) -> Answer {
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let counting = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: true,
+        }],
+        number,
+    );
+    let naming = table.function(
+        vec![savitar_types::Parameter {
+            type_id: text,
+            rest: false,
+            optional: true,
+        }],
+        text,
+    );
+    Answer::Known(table.overloaded(vec![counting, naming]))
+}
+
+#[test]
+fn omitting_the_argument_of_two_optional_overloads_that_disagree_is_refused_as_ambiguous() {
+    let source = "function callIt(): number {\n  return given();\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = two_optional_overloads(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("more than one of the declared forms"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn passing_undefined_to_two_optional_overloads_that_disagree_is_refused_where_omitting_it_is() {
+    let source = "function callIt(): number {\n  return given(undefined);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let given = two_optional_overloads(&mut table);
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.functions.is_empty());
+    assert_eq!(report.diagnostics[0].rule, "unsupported-call");
+    assert!(
+        report.diagnostics[0]
+            .message
+            .contains("more than one of the declared forms"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
+
+#[test]
+fn passing_undefined_picks_the_only_optional_overload_that_takes_it() {
+    let source = "function callIt(): number {\n  return given(undefined);\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let counting = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: true,
+        }],
+        number,
+    );
+    let naming = table.function(
+        vec![savitar_types::Parameter {
+            type_id: text,
+            rest: false,
+            optional: false,
+        }],
+        text,
+    );
+    let given = Answer::Known(table.overloaded(vec![counting, naming]));
+    let provider = ByName::new(
+        source,
+        vec![("callIt", returning(&mut table, number)), ("given", given)],
+    );
+    let file = SourceFile::new("callIt.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let function = &report.functions[0];
+    assert_eq!(verify(function), vec![]);
+    assert_eq!(function.type_of(returned_value(function)), number);
 }
