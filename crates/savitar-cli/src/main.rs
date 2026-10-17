@@ -78,15 +78,15 @@ fn main() -> ExitCode {
         return usage();
     }
 
-    let mut with_types = false;
-    let mut with_ir = false;
+    let mut report_coverage = false;
+    let mut report_lowering = false;
     let mut paths: Vec<String> = Vec::new();
     for argument in args {
         if argument == "--types" {
-            with_types = true;
+            report_coverage = true;
         } else if argument == "--ir" {
-            with_types = true;
-            with_ir = true;
+            report_coverage = true;
+            report_lowering = true;
         } else {
             paths.push(argument);
         }
@@ -102,18 +102,15 @@ fn main() -> ExitCode {
         .iter()
         .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)))
         .collect();
-    let mut provider = None;
-    if with_types {
-        let root = project_root(&absolute);
-        let open: Vec<&Path> = absolute.iter().map(PathBuf::as_path).collect();
-        match TsApi::start(&provider_binary(), &root, &open) {
-            Ok(api) => provider = Some(api),
-            Err(error) => {
-                eprintln!("savitar: {error}");
-                return ExitCode::FAILURE;
-            }
+    let root = project_root(&absolute);
+    let open: Vec<&Path> = absolute.iter().map(PathBuf::as_path).collect();
+    let api = match TsApi::start(&provider_binary(), &root, &open) {
+        Ok(api) => api,
+        Err(error) => {
+            eprintln!("savitar: {error}");
+            return ExitCode::FAILURE;
         }
-    }
+    };
     let mut table = TypeTable::new();
 
     for path in &paths {
@@ -134,34 +131,43 @@ fn main() -> ExitCode {
         }
         print!("{}", render(&file, &report.diagnostics));
 
-        if let Some(api) = &provider {
-            let types = savitar_sound::check_types(&file, api, &mut table);
-            findings += types.diagnostics.len();
-            if types.diagnostics.iter().any(|d| d.severity.rejects()) {
-                rejected = true;
-            }
-            print!("{}", render(&file, &types.diagnostics));
+        let types = savitar_sound::check_types(&file, &api, &mut table);
+        findings += types.diagnostics.len();
+        if types.diagnostics.iter().any(|d| d.severity.rejects()) {
+            rejected = true;
+        }
+        print!("{}", render(&file, &types.diagnostics));
+        if report_coverage {
             println!(
                 "savitar: {} of {} bindings typed ({}%)",
                 types.coverage.known,
                 types.coverage.total(),
                 types.coverage.percent_known()
             );
+        }
 
-            if with_ir {
-                let lowered = savitar_lower::lower(&file, api, &mut table);
-                print!("{}", render(&file, &lowered.diagnostics));
-                println!(
-                    "savitar: {} function(s) lowered, {} refused",
-                    lowered.functions.len(),
-                    lowered.diagnostics.len()
-                );
-            }
+        let lowered = savitar_lower::lower(&file, &api, &mut table);
+        findings += lowered.diagnostics.len();
+        if lowered.diagnostics.iter().any(|d| d.severity.rejects()) {
+            rejected = true;
+        }
+        print!("{}", render(&file, &lowered.diagnostics));
+        if report_lowering {
+            println!(
+                "savitar: {} function(s) lowered, {} refused",
+                lowered.functions.len(),
+                lowered.diagnostics.len()
+            );
         }
     }
 
     if findings == 0 {
         println!("savitar: {} file(s) sound", paths.len());
+    } else {
+        println!(
+            "savitar: {findings} finding(s) in {} file(s); not sound",
+            paths.len()
+        );
     }
 
     if rejected {
