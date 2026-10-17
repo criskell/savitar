@@ -47,3 +47,13 @@ export function describeAll(commands: readonly Command[]): string[] {
   }
   return lines;
 }
+
+export function retriesFor(command: Command): number {
+  switch (command.kind) {
+    case "ping":
+      return 3;
+    case "publish":
+      return 1;
+  }
+  return 0;
+}
