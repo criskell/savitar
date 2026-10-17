@@ -13645,3 +13645,34 @@ fn a_constructor_reading_a_module_name_is_refused_when_the_module_initialiser_co
         report.diagnostics[0].message
     );
 }
+
+#[test]
+fn a_computed_static_member_name_in_a_derived_class_is_refused_rather_than_skipped() {
+    let source = "class Derived extends Base {\n  static declare [\"tally\"]: number;\n}\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let text = table.intern(TypeKind::String);
+    let either = table.union(vec![number, text]);
+    let nothing = table.object(Vec::new());
+    let wide_statics = table.object(vec![a_slot("tally", either, false)]);
+    let base = constructing_shape_with_statics(&mut table, nothing, wide_statics);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(nothing)),
+            ("Base", Answer::Known(base)),
+            ("tally", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class-member");
+    assert!(
+        report.diagnostics[0].message.contains("computed"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}

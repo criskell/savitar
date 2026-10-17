@@ -1463,38 +1463,43 @@ struct DeclaredStatic<'a> {
     readonly: bool,
 }
 
-fn statics_declared_by<'a>(class: &'a Class<'_>) -> Vec<DeclaredStatic<'a>> {
+fn statics_declared_by<'a>(
+    class: &'a Class<'_>,
+) -> Result<Vec<DeclaredStatic<'a>>, Vec<Diagnostic>> {
     let mut declared = Vec::new();
     for element in &class.body.body {
-        match element {
-            ClassElement::PropertyDefinition(property) if property.r#static => {
-                if let PropertyKey::StaticIdentifier(key) = &property.key {
-                    declared.push(DeclaredStatic {
-                        name: key.name.as_str(),
-                        at: key.span,
-                        optional: property.optional,
-                        method: false,
-                        readonly: property.readonly,
-                    });
-                }
-            }
+        let (key, span, optional, method, readonly) = match element {
+            ClassElement::PropertyDefinition(property) if property.r#static => (
+                &property.key,
+                property.span,
+                property.optional,
+                false,
+                property.readonly,
+            ),
             ClassElement::MethodDefinition(method)
                 if method.r#static && method.kind == MethodDefinitionKind::Method =>
             {
-                if let PropertyKey::StaticIdentifier(key) = &method.key {
-                    declared.push(DeclaredStatic {
-                        name: key.name.as_str(),
-                        at: key.span,
-                        optional: method.optional,
-                        method: true,
-                        readonly: false,
-                    });
-                }
+                (&method.key, method.span, method.optional, true, false)
             }
-            _ => {}
-        }
+            _ => continue,
+        };
+        let PropertyKey::StaticIdentifier(key) = key else {
+            return Err(vec![refuse(
+                "unsupported-class-member",
+                span,
+                "a computed or private static member name is not lowered yet, and without the \
+                 name there is nothing to relate to the static side of the base",
+            )]);
+        };
+        declared.push(DeclaredStatic {
+            name: key.name.as_str(),
+            at: key.span,
+            optional,
+            method,
+            readonly,
+        });
     }
-    declared
+    Ok(declared)
 }
 
 fn static_members_fit_the_base(
@@ -1503,7 +1508,7 @@ fn static_members_fit_the_base(
     class: &Class<'_>,
     base: BaseClass<'_>,
 ) -> Result<(), Vec<Diagnostic>> {
-    let declared = statics_declared_by(class);
+    let declared = statics_declared_by(class)?;
     if declared.is_empty() {
         return Ok(());
     }
