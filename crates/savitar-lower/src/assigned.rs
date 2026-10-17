@@ -31,6 +31,9 @@ fn walk_statement(statement: &Statement<'_>, found: &mut BTreeSet<String>) {
                 walk_statement(inner, found);
             }
         }
+        Statement::LabeledStatement(statement) => {
+            walk_statement(&statement.body, found);
+        }
         Statement::IfStatement(statement) => {
             walk_expression(&statement.test, found);
             walk_statement(&statement.consequent, found);

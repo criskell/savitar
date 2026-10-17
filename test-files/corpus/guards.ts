@@ -160,3 +160,30 @@ export function logLevel(entry: LogEntry): string {
 export function logWidth(entry: LogEntry): number {
   return textLength(entry.line);
 }
+
+export interface Alarm {
+  page: boolean;
+  log: boolean;
+  count: number;
+}
+
+export function alarmFor(level: string): Alarm {
+  let page = false;
+  let log = false;
+  let count = 0;
+  switch (level) {
+    case "fatal":
+      page = true;
+      count += 1;
+    case "error":
+      log = true;
+      count += 1;
+      break;
+    case "warn":
+      log = true;
+      break;
+    default:
+      break;
+  }
+  return { page: page, log: log, count: count };
+}

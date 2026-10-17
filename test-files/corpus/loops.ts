@@ -68,3 +68,104 @@ export function backoff(attempts: number, ceiling: number): number {
   } while (tried < attempts);
   return waited;
 }
+
+export interface Route {
+  method: string;
+  segments: readonly string[];
+}
+
+export function matchRoute(
+  routes: readonly Route[],
+  method: string,
+  path: readonly string[]
+): number {
+  let matched = -1;
+  let index = 0;
+  candidates: for (const route of routes) {
+    if (route.method !== method) {
+      index += 1;
+      continue candidates;
+    }
+    if (route.segments.length !== path.length) {
+      index += 1;
+      continue candidates;
+    }
+    for (let at = 0; at < route.segments.length; at += 1) {
+      const wanted = route.segments[at];
+      const given = path[at];
+      if (wanted === undefined || given === undefined) {
+        index += 1;
+        continue candidates;
+      }
+      if (wanted !== given && wanted !== "*") {
+        index += 1;
+        continue candidates;
+      }
+    }
+    matched = index;
+    break candidates;
+  }
+  return matched;
+}
+
+export function statusFor(line: LogLine, fallback: number): number {
+  let status = fallback;
+  decide: {
+    if (line.level === "error") {
+      status = 500;
+      break decide;
+    }
+    if (line.level === "warn") {
+      status = 429;
+      break decide;
+    }
+    status = 200;
+  }
+  return status;
+}
+
+export function retryDelay(attempts: readonly number[], ceiling: number): number {
+  let delay = 1;
+  for (const attempt of attempts) {
+    if (attempt < 0) {
+      const delay = ceiling * 2;
+      if (delay > ceiling) {
+        break;
+      }
+    }
+    delay = delay * 2;
+    if (delay >= ceiling) {
+      delay = ceiling;
+      break;
+    }
+  }
+  return delay;
+}
+
+export function drainUntil(queue: readonly string[], stop: string): number {
+  let index = 0;
+  for (;;) {
+    const next = queue[index];
+    if (next === undefined) {
+      break;
+    }
+    index += 1;
+    if (next === stop) {
+      break;
+    }
+  }
+  return index;
+}
+
+export function nextSlot(used: readonly boolean[], from: number): number {
+  let at = from;
+  for (;;) {
+    if (at >= used.length) {
+      return -1;
+    }
+    if (used[at] === false) {
+      return at;
+    }
+    at += 1;
+  }
+}
