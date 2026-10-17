@@ -1313,6 +1313,17 @@ fn inherited_members_fit_the_base(
     let inherited = types::shapes_of_what_is_constructed(table, base.forms)
         .map_err(|reason| vec![refuse("unsupported-class-member", base.at, reason)])?;
     for shape in inherited {
+        if savitar_types::mentions_a_type_parameter(table, shape) {
+            return Err(vec![refuse(
+                "unsupported-class",
+                base.at,
+                format!(
+                    "`{}` is a generic base, and the position of its name answers the \
+                     uninstantiated shape, so what this class inherits cannot be related to it",
+                    base.name
+                ),
+            )]);
+        }
         if !savitar_types::assignable(table, derived, shape) {
             return Err(vec![refuse_unsound_inheritance(class_at, base.name)]);
         }

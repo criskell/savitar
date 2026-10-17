@@ -13130,3 +13130,31 @@ fn an_array_of_a_narrower_element_is_taken_as_an_argument_for_a_readonly_array()
 
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 }
+
+#[test]
+fn a_generic_base_is_refused_rather_than_related_to_its_uninstantiated_shape() {
+    let source = "class Derived extends Base {\n  double(): number {\n    return 0;\n  }\n}\n";
+    let mut table = TypeTable::new();
+    let held = table.fresh_type_parameter();
+    let base_shape = table.object(vec![a_slot("value", held, false)]);
+    let derived_shape = table.object(vec![a_slot("value", held, false)]);
+    let base = constructing_shape(&mut table, Vec::new(), base_shape);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("Derived", Answer::Known(derived_shape)),
+            ("Base", Answer::Known(base)),
+        ],
+    );
+    let file = SourceFile::new("derived.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-class");
+    assert!(
+        report.diagnostics[0].message.contains("generic base"),
+        "{}",
+        report.diagnostics[0].message
+    );
+}
