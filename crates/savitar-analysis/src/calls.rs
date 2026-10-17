@@ -19,7 +19,6 @@ pub enum Opaque {
     AValueThatDefinesItself,
     AValueNothingInThisBodyDefines,
     ABodyThisRunDoesNotHold(String),
-    TheConstructorOfTheBaseClass(String),
 }
 
 impl fmt::Display for Opaque {
@@ -45,12 +44,6 @@ impl fmt::Display for Opaque {
             }
             Self::ABodyThisRunDoesNotHold(name) => {
                 write!(formatter, "`{name}`, whose body this run does not hold")
-            }
-            Self::TheConstructorOfTheBaseClass(name) => {
-                write!(
-                    formatter,
-                    "the constructor of the base class `{name}`, which the graph does not reach by name"
-                )
             }
         }
     }
@@ -139,9 +132,17 @@ pub struct CallGraph<'a> {
 impl<'a> CallGraph<'a> {
     #[must_use]
     pub fn over(bodies: impl IntoIterator<Item = &'a Function>) -> Self {
-        Self {
-            bodies: bodies.into_iter().map(|body| (body.name(), body)).collect(),
+        let held: Vec<&'a Function> = bodies.into_iter().collect();
+        let mut bodies: BTreeMap<&'a str, &'a Function> = BTreeMap::new();
+        for body in &held {
+            bodies.insert(body.name(), body);
         }
+        for body in &held {
+            if let Some(class) = body.the_class_it_constructs() {
+                bodies.entry(class).or_insert(body);
+            }
+        }
+        Self { bodies }
     }
 
     #[must_use]
@@ -234,9 +235,7 @@ pub fn calls_in(function: &Function) -> Vec<CallSite> {
                 Statement::ConstructBase {
                     base_class, span, ..
                 } => found.push(CallSite {
-                    callee: Callee::NotAName(Opaque::TheConstructorOfTheBaseClass(
-                        base_class.clone(),
-                    )),
+                    callee: Callee::Named(base_class.clone()),
                     at: *span,
                 }),
                 _ => {}

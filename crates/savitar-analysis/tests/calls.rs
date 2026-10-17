@@ -66,19 +66,32 @@ impl Builder {
     }
 }
 
-#[test]
-fn constructing_the_base_class_is_a_call_the_graph_does_not_know() {
-    let mut table = TypeTable::new();
-    let mut inherits = Builder::named("Derived.constructor", &mut table);
+fn constructing(class: &str, table: &mut TypeTable) -> Function {
+    let mut built = Builder::named(&format!("{class}.constructor"), table);
+    built.function.constructs(class);
+    built.assign(Rvalue::Constant(Constant::Number(0_u64)));
+    built.done()
+}
+
+fn inheriting_from(class: &str, base: &str, table: &mut TypeTable) -> Function {
+    let mut inherits = Builder::named(&format!("{class}.constructor"), table);
+    inherits.function.constructs(class);
     let receiver = inherits.function.declare_parameter(inherits.any);
     let span = at(inherits.next_span);
+    inherits.next_span += 1;
     inherits.statements.push(Statement::ConstructBase {
-        base_class: "Transport".to_string(),
+        base_class: base.to_string(),
         object: receiver,
         arguments: Vec::new(),
         span,
     });
-    let inherits = inherits.done();
+    inherits.done()
+}
+
+#[test]
+fn constructing_the_base_class_is_a_call_the_graph_reaches_by_the_name_of_that_class() {
+    let mut table = TypeTable::new();
+    let inherits = inheriting_from("Derived", "Transport", &mut table);
 
     let sites = savitar_analysis::calls_in(&inherits);
     assert_eq!(
@@ -86,18 +99,88 @@ fn constructing_the_base_class_is_a_call_the_graph_does_not_know() {
         1,
         "`super()` runs a body, so it is a call site and not a statement the graph may skip"
     );
-    assert_eq!(
-        sites[0].callee,
-        Callee::NotAName(Opaque::TheConstructorOfTheBaseClass(
-            "Transport".to_string()
-        ))
-    );
+    assert_eq!(sites[0].callee, Callee::Named("Transport".to_string()));
+}
 
+#[test]
+fn a_base_constructor_this_run_does_not_hold_is_still_the_worst_case() {
+    let mut table = TypeTable::new();
+    let inherits = inheriting_from("Derived", "Transport", &mut table);
+
+    let sites = savitar_analysis::calls_in(&inherits);
     let graph = CallGraph::over([&inherits]);
+
+    let Reach::ACalleeIsNotKnown { callee, .. } = graph.what_a_call_reaches(&sites[0]) else {
+        panic!("a base whose body this run does not hold cannot be cleared");
+    };
+    assert_eq!(
+        callee,
+        Opaque::ABodyThisRunDoesNotHold("Transport".to_string())
+    );
+}
+
+#[test]
+fn a_constructor_bound_to_its_class_is_the_body_the_graph_walks_for_a_construction() {
+    let mut table = TypeTable::new();
+    let transport = constructing("Transport", &mut table);
+    let inherits = inheriting_from("Derived", "Transport", &mut table);
+
+    let sites = savitar_analysis::calls_in(&inherits);
+    let graph = CallGraph::over([&inherits, &transport]);
+
     assert!(
-        !graph
+        graph.holds("Transport"),
+        "the class name reaches the body that constructs it"
+    );
+    assert!(
+        graph
             .what_a_call_reaches(&sites[0])
-            .proves_no_module_name_is_touched()
+            .proves_no_module_name_is_touched(),
+        "a base constructor that touches no module name is decided, not ignored"
+    );
+}
+
+#[test]
+fn a_base_constructor_that_reads_a_module_name_is_reported_through_the_class_name() {
+    let mut table = TypeTable::new();
+    let mut transport = Builder::named("Transport.constructor", &mut table);
+    transport.function.constructs("Transport");
+    transport.assign(Rvalue::ModuleBinding("limit".to_string()));
+    let transport = transport.done();
+    let inherits = inheriting_from("Derived", "Transport", &mut table);
+
+    let sites = savitar_analysis::calls_in(&inherits);
+    let graph = CallGraph::over([&inherits, &transport]);
+
+    let Reach::AModuleNameIsTouched { touch, .. } = graph.what_a_call_reaches(&sites[0]) else {
+        panic!("the read in the base constructor should be reported");
+    };
+    assert_eq!(
+        touch,
+        ModuleTouch::ANameOfThisModuleIsRead("limit".to_string())
+    );
+}
+
+#[test]
+fn a_body_named_after_a_class_wins_over_the_constructor_bound_to_that_name() {
+    let mut table = TypeTable::new();
+    let mut declared = Builder::named("Transport", &mut table);
+    declared.assign(Rvalue::ModuleBinding("limit".to_string()));
+    let declared = declared.done();
+    let constructor = constructing("Transport", &mut table);
+
+    let graph = CallGraph::over([&constructor, &declared]);
+    let site = CallSite {
+        callee: Callee::Named("Transport".to_string()),
+        at: at(1),
+    };
+
+    let Reach::AModuleNameIsTouched { touch, .. } = graph.what_a_call_reaches(&site) else {
+        panic!("a body that carries the name itself is the one the graph walks");
+    };
+    assert_eq!(
+        touch,
+        ModuleTouch::ANameOfThisModuleIsRead("limit".to_string())
     );
 }
 

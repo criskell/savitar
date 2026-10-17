@@ -13574,3 +13574,74 @@ fn a_derived_class_declaring_a_static_the_base_never_declared_is_not_related_to_
 
     assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
 }
+
+const CONSTRUCTED_WHILE_THE_MODULE_INITIALISES: &str = "class Config {\n  private held: number;\n\n  constructor(port: number) {\n    this.held = port;\n  }\n}\n\nconst shared = new Config(8080);\n";
+
+#[test]
+fn constructing_a_class_while_the_module_initialises_is_decided_by_the_graph() {
+    let source = CONSTRUCTED_WHILE_THE_MODULE_INITIALISES;
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let instance = table.object(vec![a_slot("held", number, false)]);
+    let form = table.function(
+        vec![savitar_types::Parameter {
+            type_id: number,
+            rest: false,
+            optional: false,
+        }],
+        instance,
+    );
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("class Config", Answer::Known(instance)),
+            ("new Config", Answer::Known(constructs)),
+            ("port", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let constructor = report
+        .functions
+        .iter()
+        .find(|function| function.name() == "Config.constructor")
+        .expect("the constructor should lower");
+    assert_eq!(
+        constructor.the_class_it_constructs(),
+        Some("Config"),
+        "the name a construction resolves to has to reach the body that runs"
+    );
+}
+
+#[test]
+fn a_constructor_reading_a_module_name_is_refused_when_the_module_initialiser_constructs_it() {
+    let source = "class Config {\n  private held: number;\n\n  constructor() {\n    this.held = fallback;\n  }\n}\n\nconst shared = new Config();\n\nconst fallback = 8080;\n";
+    let mut table = TypeTable::new();
+    let number = table.intern(TypeKind::Number);
+    let instance = table.object(vec![a_slot("held", number, false)]);
+    let form = table.function(Vec::new(), instance);
+    let constructs = constructor_with_no_statics(&mut table, vec![form]);
+    let provider = ByName::new(
+        source,
+        vec![
+            ("class Config", Answer::Known(instance)),
+            ("new Config", Answer::Known(constructs)),
+            ("fallback", Answer::Known(number)),
+        ],
+    );
+    let file = SourceFile::new("module.ts", source);
+
+    let report = lower(&file, &provider, &mut table);
+
+    assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(report.diagnostics[0].rule, "unsupported-module-initializer");
+    assert!(
+        report.diagnostics[0].message.contains("`fallback`"),
+        "the refusal names the module name the constructor reads, not a target it cannot resolve: {}",
+        report.diagnostics[0].message
+    );
+}

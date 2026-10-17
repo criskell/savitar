@@ -1200,6 +1200,7 @@ fn lower_declared(
                 .map_or_else(|| "anonymous".to_string(), |id| id.name.to_string());
             let lowering = Lowering {
                 name,
+                constructs: None,
                 signature: declaration
                     .id
                     .as_ref()
@@ -1347,6 +1348,7 @@ fn lower_method<'a>(
     let constructing = method.kind == MethodDefinitionKind::Constructor;
     let lowering = Lowering {
         name,
+        constructs: constructing.then(|| class.to_string()),
         signature: if constructing {
             Signature::NoPositionAnswersOne
         } else {
@@ -1734,6 +1736,7 @@ impl Body<'_> {
 
 struct Lowering<'a> {
     name: String,
+    constructs: Option<String>,
     signature: Signature,
     receiver: Receiver<'a>,
     code: Code<'a>,
@@ -1806,6 +1809,9 @@ fn lower_function<'a>(
     }
 
     let mut function = Function::new(&lowering.name);
+    if let Some(class) = lowering.constructs.as_deref() {
+        function.constructs(class);
+    }
     let entry = function.add_block(empty_block(at));
     let mut context = Context {
         file: surroundings.file,
@@ -2228,6 +2234,7 @@ impl Context<'_> {
         }
         let lowering = Lowering {
             name: name.clone(),
+            constructs: None,
             signature: Signature::Declared(signature),
             receiver: Receiver::Detached,
             code,

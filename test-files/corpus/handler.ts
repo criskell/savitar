@@ -179,3 +179,5 @@ export function tally(values: readonly number[]): Map<number, number> {
   }
   return seen;
 }
+
+export const sharedTable = new RouteTable("/api");

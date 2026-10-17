@@ -209,6 +209,7 @@ pub struct Block {
 #[derive(Debug)]
 pub struct Function {
     name: String,
+    constructs: Option<String>,
     parameters: Vec<ValueId>,
     captures: Vec<Capture>,
     blocks: Vec<Block>,
@@ -220,6 +221,7 @@ impl Function {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            constructs: None,
             parameters: Vec::new(),
             captures: Vec::new(),
             blocks: Vec::new(),
@@ -230,6 +232,15 @@ impl Function {
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn constructs(&mut self, class: impl Into<String>) {
+        self.constructs = Some(class.into());
+    }
+
+    #[must_use]
+    pub fn the_class_it_constructs(&self) -> Option<&str> {
+        self.constructs.as_deref()
     }
 
     pub fn fresh_value(&mut self, ty: TypeId) -> ValueId {
