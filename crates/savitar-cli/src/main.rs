@@ -253,7 +253,14 @@ fn main() -> ExitCode {
 
     let graph = ModuleGraph::build(&root, &absolute);
     let order = graph.evaluation_order();
-    for finding in graph.findings().iter().chain(order.findings.iter()) {
+    let declared = savitar_modules::types_declared_behind_no_edge(&root);
+    let at_the_entry_surface = savitar_modules::refusals_on_the_entry_surface(&graph, &declared);
+    for finding in graph
+        .findings()
+        .iter()
+        .chain(order.findings.iter())
+        .chain(at_the_entry_surface.iter())
+    {
         let module = graph.module(finding.module);
         let Ok(text) = std::fs::read_to_string(&module.path) else {
             continue;

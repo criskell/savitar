@@ -483,3 +483,83 @@ fn a_declaration_file_given_to_the_command_is_not_announced_as_sound() {
         "the run must fail; the output was:\n{printed}"
     );
 }
+
+const A_SERVICE_PACKAGE_JSON: &str = "{ \"name\": \"service\", \"version\": \"1.0.0\", \
+                                      \"private\": true, \"type\": \"module\" }\n";
+
+#[test]
+fn a_handler_typed_by_an_interface_no_checked_code_declares_is_not_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let project = laid_out(
+        "entry-surface-declared-type",
+        &[
+            ("package.json", A_SERVICE_PACKAGE_JSON),
+            (
+                "ambient.d.ts",
+                "interface Incoming {\n  path: string;\n  weight: number;\n}\n",
+            ),
+            (
+                "handler.ts",
+                "export function weightOf(incoming: Incoming): number {\n  return incoming.weight;\n}\n",
+            ),
+        ],
+    );
+
+    let output = check_laid_out(&project, &bench.provider, "handler.ts");
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("unsupported-declared-type-on-the-entry-surface"),
+        "a declared type an unchecked caller supplies must be refused by name; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("handler.ts:1:26"),
+        "the refusal must carry file, line and column; the output was:\n{printed}"
+    );
+    assert!(
+        printed.contains("not sound"),
+        "nothing proves the incoming value has that shape; the output was:\n{printed}"
+    );
+    assert!(
+        !output.status.success(),
+        "the run must fail; the output was:\n{printed}"
+    );
+}
+
+#[test]
+fn a_handler_typed_only_by_checked_code_and_the_standard_library_is_announced_as_sound() {
+    let Some(bench) = bench() else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+    let project = laid_out(
+        "entry-surface-checked-type",
+        &[
+            ("package.json", A_SERVICE_PACKAGE_JSON),
+            (
+                "ambient.d.ts",
+                "interface Incoming {\n  path: string;\n  weight: number;\n}\n",
+            ),
+            (
+                "handler.ts",
+                "export interface Checked {\n  weight: number;\n}\n\nexport function weightOf(checked: Checked): number {\n  return checked.weight;\n}\n\nexport function tally(values: readonly number[]): Map<number, number> {\n  return new Map<number, number>();\n}\n",
+            ),
+        ],
+    );
+
+    let output = check_laid_out(&project, &bench.provider, "handler.ts");
+    let printed = stdout_of(&output);
+
+    assert!(
+        printed.contains("file(s) sound"),
+        "a declared boundary in the project refuses nothing on its own, and the standard library \
+         stays trusted; the output was:\n{printed}"
+    );
+    assert!(
+        output.status.success(),
+        "the run must pass; the output was:\n{printed}"
+    );
+}
