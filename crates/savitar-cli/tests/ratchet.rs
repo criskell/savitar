@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use savitar_diagnostics::SourceFile;
+use savitar_ir::{Dominance, Function, Terminator};
 use savitar_lower::lower;
 use savitar_sound::{Coverage, check_types};
 use savitar_typeinfo_tsapi::TsApi;
@@ -47,7 +48,11 @@ fn module_initializer_floor_path(corpus: &Path) -> PathBuf {
     corpus.join("module-initializer-floor.txt")
 }
 
-fn assert_ceiling(ceiling_file: &Path, measured: &Measured, counted: usize) {
+fn dead_end_floor_path(corpus: &Path) -> PathBuf {
+    corpus.join("unreachable-terminator-floor.txt")
+}
+
+fn assert_ceiling(ceiling_file: &Path, counted: usize, listed: &[String]) {
     let ceiling: usize = std::fs::read_to_string(ceiling_file)
         .expect("the ceiling should be recorded")
         .trim()
@@ -56,13 +61,16 @@ fn assert_ceiling(ceiling_file: &Path, measured: &Measured, counted: usize) {
 
     assert!(
         counted <= ceiling,
-        "the gaps rose from {ceiling} to {counted}; they are:\n{}",
-        measured.gaps.join("\n")
+        "the ceiling in {} rose from {ceiling} to {counted}; it counts:\n{}",
+        ceiling_file.display(),
+        listed.join("\n")
     );
 
     if counted < ceiling {
         panic!(
-            "the gaps fell from {ceiling} to {counted}.\nLower it: echo {counted} > {}",
+            "the ceiling in {} fell from {ceiling} to {counted}; it counts:\n{}\nLower it: echo {counted} > {}",
+            ceiling_file.display(),
+            listed.join("\n"),
             ceiling_file.display()
         );
     }
@@ -72,6 +80,7 @@ struct Measured {
     coverage: Coverage,
     gaps: Vec<String>,
     initializers: usize,
+    dead_ends: Vec<String>,
 }
 
 fn measure(directory: &Path, binary: &OsString) -> Measured {
@@ -106,14 +115,21 @@ fn measure(directory: &Path, binary: &OsString) -> Measured {
         coverage,
         gaps,
         initializers: 0,
+        dead_ends: Vec::new(),
     }
 }
 
 fn assert_ratchet(directory: &Path, measured: &Measured, counted: usize) {
-    assert_floor(&floor_path(directory), measured, counted);
+    let mut listed = vec![format!(
+        "{} of {} bindings are known",
+        measured.coverage.known,
+        measured.coverage.total()
+    )];
+    listed.extend(measured.gaps.iter().cloned());
+    assert_floor(&floor_path(directory), counted, &listed);
 }
 
-fn assert_floor(floor_file: &Path, measured: &Measured, counted: usize) {
+fn assert_floor(floor_file: &Path, counted: usize, listed: &[String]) {
     let floor: usize = std::fs::read_to_string(floor_file)
         .expect("the floor should be recorded")
         .trim()
@@ -122,18 +138,36 @@ fn assert_floor(floor_file: &Path, measured: &Measured, counted: usize) {
 
     assert!(
         counted >= floor,
-        "the ratchet fell from {floor} to {counted} of {}; the gaps are:\n{}",
-        measured.coverage.total(),
-        measured.gaps.join("\n")
+        "the floor in {} fell from {floor} to {counted}; it counts:\n{}",
+        floor_file.display(),
+        listed.join("\n")
     );
 
     if counted > floor {
         panic!(
-            "the ratchet rose from {floor} to {counted} of {}.\nRaise it: echo {counted} > {}",
-            measured.coverage.total(),
+            "the floor in {} rose from {floor} to {counted}; it counts:\n{}\nRaise it: echo {counted} > {}",
+            floor_file.display(),
+            listed.join("\n"),
             floor_file.display()
         );
     }
+}
+
+fn dead_ends_of(file: &str, function: &Function) -> Vec<String> {
+    let dominance = Dominance::of(function);
+    function
+        .blocks()
+        .filter(|(id, block)| {
+            matches!(block.terminator, Terminator::Unreachable) && dominance.reachable(*id)
+        })
+        .map(|(id, _)| {
+            format!(
+                "{file}: `{}` block {} is reached and ends unreachable",
+                function.name(),
+                id.index()
+            )
+        })
+        .collect()
 }
 
 fn assert_every_binding_is_answered(measured: &Measured) {
@@ -154,6 +188,7 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
     let mut coverage = Coverage::default();
     let mut gaps: Vec<String> = Vec::new();
     let mut initializers = 0usize;
+    let mut dead_ends: Vec<String> = Vec::new();
 
     for path in &files {
         let text = std::fs::read_to_string(path).expect("the file should be readable");
@@ -162,6 +197,9 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         let report = lower(&file, &api, &mut table);
         coverage.known += report.functions.len();
         coverage.unsupported += report.diagnostics.len();
+        for function in &report.functions {
+            dead_ends.extend(dead_ends_of(file.name(), function));
+        }
         if let Some(initializer) = report.initializer.as_ref() {
             initializers += 1;
             assert_eq!(
@@ -170,6 +208,10 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
                 "the module initializer of {} should be valid code",
                 file.name()
             );
+            dead_ends.extend(dead_ends_of(file.name(), &initializer.function));
+            for closure in &initializer.closures {
+                dead_ends.extend(dead_ends_of(file.name(), closure));
+            }
         }
         for diagnostic in &report.diagnostics {
             let at = file.line_col(diagnostic.span.start);
@@ -183,10 +225,13 @@ fn lower_corpus(directory: &Path, binary: &OsString) -> Measured {
         }
     }
 
+    dead_ends.sort();
+
     Measured {
         coverage,
         gaps,
         initializers,
+        dead_ends,
     }
 }
 
@@ -220,13 +265,30 @@ fn the_number_of_functions_lowered_never_falls() {
     let measured = lower_corpus(&corpus, &binary);
     assert_floor(
         &lowering_floor_path(&corpus),
-        &measured,
         measured.coverage.known,
+        &measured.gaps,
     );
     assert_ceiling(
         &lowering_gap_ceiling_path(&corpus),
-        &measured,
         measured.gaps.len(),
+        &measured.gaps,
+    );
+}
+
+#[test]
+fn the_number_of_reached_blocks_that_end_unreachable_never_changes() {
+    let root = workspace_root();
+    let corpus = root.join("test-files/corpus");
+    let Some(binary) = provider_binary(&root) else {
+        eprintln!("skipped: node_modules/.bin/tsc-rs is not installed");
+        return;
+    };
+
+    let measured = lower_corpus(&corpus, &binary);
+    assert_floor(
+        &dead_end_floor_path(&corpus),
+        measured.dead_ends.len(),
+        &measured.dead_ends,
     );
 }
 
@@ -242,8 +304,8 @@ fn the_number_of_module_initializers_lowered_never_falls() {
     let measured = lower_corpus(&corpus, &binary);
     assert_floor(
         &module_initializer_floor_path(&corpus),
-        &measured,
         measured.initializers,
+        &measured.gaps,
     );
 }
 
